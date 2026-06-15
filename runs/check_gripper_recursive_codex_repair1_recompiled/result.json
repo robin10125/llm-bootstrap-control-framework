@@ -1,0 +1,13 @@
+{
+  "interface": "recursive_units",
+  "task": "lift",
+  "seed": 0,
+  "success": false,
+  "score": 0.1022,
+  "total_return": -2.8731,
+  "final_object_x": -0.03931787237524986,
+  "final_object_y": 0.015449284575879574,
+  "final_object_z": 0.024992719292640686,
+  "max_object_z": 0.0352,
+  "errors": ""
+}

@@ -1,0 +1,189 @@
+{
+  "interface": "recursive_units",
+  "action_shape": [
+    25,
+    5
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "set_base_target",
+        "duration_s": 0.4,
+        "steps": 4
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.35,
+        "steps": 3
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "monitor",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.25,
+        "steps": 2
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.55,
+        "steps": 6
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.4,
+        "steps": 4
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.5,
+        "steps": 5
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.5,
+        "steps": 5
+      }
+    ],
+    "target_steps": 25,
+    "recursive_units": true,
+    "recursive_trace": {
+      "top_trace": [
+        {
+          "level": "task",
+          "command": "Lift the object from its start position above the table and maintain a stable opposed thumb-index grasp until the object remains controlled above the height threshold."
+        }
+      ],
+      "phase_schedule": [
+        {
+          "phase": "approach",
+          "intent": "Move the palm/base laterally over the object while keeping thumb and index open for clearance.",
+          "min_duration_s": 0.35
+        },
+        {
+          "phase": "descend_precontact",
+          "intent": "Lower the palm toward the object to establish a centered pre-grasp without pushing it sideways.",
+          "min_duration_s": 0.35
+        },
+        {
+          "phase": "close_to_contact",
+          "intent": "Flex thumb and index toward each other around the object until contact or near-closed timed grasp is reached.",
+          "min_duration_s": 0.45
+        },
+        {
+          "phase": "settle_verify",
+          "intent": "Hold the closed grasp briefly so opposing contacts stabilize before lifting.",
+          "min_duration_s": 0.25
+        },
+        {
+          "phase": "lift_transport",
+          "intent": "Retract/raise the palm vertically while maintaining the closed opposed grasp so the object rises above 0.075 m.",
+          "min_duration_s": 0.8
+        },
+        {
+          "phase": "hold_control",
+          "intent": "Keep palm steady above the table and maintain finger closure to prevent slip.",
+          "min_duration_s": 0.3
+        }
+      ],
+      "unit_traces": {
+        "base": [
+          {
+            "level": "unit",
+            "command": "End with palm centered over object start xy, then retract upward after grasp to moderately high base_z while keeping xy steady and holding controlled."
+          },
+          {
+            "level": "joint",
+            "command": "Move base_x to -0.0394 and base_y to -0.0383 at current/precontact height."
+          },
+          {
+            "level": "joint",
+            "command": "Hold base position while appendage units close and contact settles."
+          },
+          {
+            "level": "joint",
+            "command": "Lift by changing only base_z to -0.05 while holding base_x=-0.0394 and base_y=-0.0383."
+          },
+          {
+            "level": "joint",
+            "command": "Hold final base pose to keep object controlled."
+          }
+        ],
+        "thumb": [
+          {
+            "level": "unit",
+            "command": "Relative to final centered palm pose, move thumb actuator from g_right=0.06 toward strong opposing closure around g_right=0.005..0.015 and maintain inward pressure during lift/hold."
+          },
+          {
+            "level": "joint",
+            "command": "Use only g_right: keep clear during approach/precontact, close progressively to 0.010, wait for settle, then hold 0.010 through lift and stabilization."
+          }
+        ],
+        "index": [
+          {
+            "level": "unit",
+            "command": "Relative to the final centered palm pose, move from open g_left=0.06 toward strong flexion/near closed, about g_left=0.005 to 0.015, and maintain contact during lift and hold."
+          },
+          {
+            "level": "joint",
+            "command": "Command only index joint g_left: close from 0.06 to 0.010, wait for contact/settle, then keep g_left at 0.010 during lift/hold."
+          }
+        ]
+      }
+    }
+  },
+  "action_min": -0.9999999403953552,
+  "action_max": 0.0
+}

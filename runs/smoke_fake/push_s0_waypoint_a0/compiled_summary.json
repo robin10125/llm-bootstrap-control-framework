@@ -1,0 +1,13 @@
+{
+  "interface": "waypoint",
+  "action_shape": [
+    30,
+    5
+  ],
+  "metadata": {
+    "source": "local waypoint compiler",
+    "task": "push"
+  },
+  "action_min": -1.0,
+  "action_max": 1.0
+}

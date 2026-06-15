@@ -1,0 +1,43 @@
+{
+  "task": {
+    "name": "lift",
+    "goal": "raise the object above the table and keep it controlled",
+    "seed": 0,
+    "episode_seconds": 3.0,
+    "object_start": [
+      0.0082,
+      -0.0138,
+      0.025
+    ],
+    "target_xy": null,
+    "metadata": {
+      "height_threshold": 0.07500000037252903
+    }
+  },
+  "interface": "script_dsl",
+  "seed": 0,
+  "attempt": 0,
+  "llm": {
+    "source": "mock",
+    "ok": true,
+    "error": null
+  },
+  "validation": {
+    "ok": true,
+    "errors": [],
+    "warnings": []
+  },
+  "result": {
+    "interface": "script_dsl",
+    "task": "lift",
+    "seed": 0,
+    "success": true,
+    "score": 1.8,
+    "total_return": 1.04,
+    "final_object_x": 0.008217701688408852,
+    "final_object_y": -0.013812797144055367,
+    "final_object_z": 0.10499999672174454,
+    "max_object_z": 0.105,
+    "errors": ""
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "interface": "hybrid",
+  "action_shape": [
+    30,
+    5
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "call_controller",
+        "duration_s": 0.45,
+        "steps": 4
+      },
+      {
+        "op": "call_appendage_agent",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "call_appendage_agent",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "call_controller",
+        "duration_s": 0.45,
+        "steps": 4
+      },
+      {
+        "op": "call_controller",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 1.1,
+        "steps": 11
+      },
+      {
+        "op": "call_controller",
+        "duration_s": 0.3,
+        "steps": 3
+      }
+    ],
+    "target_steps": 30,
+    "hybrid": true
+  },
+  "action_min": -1.0,
+  "action_max": 1.0
+}

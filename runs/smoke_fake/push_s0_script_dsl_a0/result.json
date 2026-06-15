@@ -1,0 +1,46 @@
+{
+  "task": {
+    "name": "push",
+    "goal": "move the object along the table to the target xy",
+    "seed": 0,
+    "episode_seconds": 3.0,
+    "object_start": [
+      0.0082,
+      -0.0138,
+      0.025
+    ],
+    "target_xy": [
+      -0.0439,
+      -0.0745
+    ],
+    "metadata": {
+      "xy_tolerance": 0.045
+    }
+  },
+  "interface": "script_dsl",
+  "seed": 0,
+  "attempt": 0,
+  "llm": {
+    "source": "mock",
+    "ok": true,
+    "error": null
+  },
+  "validation": {
+    "ok": true,
+    "errors": [],
+    "warnings": []
+  },
+  "result": {
+    "interface": "script_dsl",
+    "task": "push",
+    "seed": 0,
+    "success": false,
+    "score": 0.1,
+    "total_return": 0.91,
+    "final_object_x": 0.0030056023970246315,
+    "final_object_y": -0.019881900399923325,
+    "final_object_z": 0.09000000357627869,
+    "max_object_z": 0.09,
+    "errors": ""
+  }
+}

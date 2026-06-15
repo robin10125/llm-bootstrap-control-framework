@@ -1,0 +1,35 @@
+{
+  "interface": "latent_stub",
+  "action_shape": [
+    30,
+    5
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "latent_decode",
+        "duration_s": 0.4,
+        "steps": 4
+      },
+      {
+        "op": "latent_decode",
+        "duration_s": 0.5,
+        "steps": 5
+      },
+      {
+        "op": "latent_decode",
+        "duration_s": 0.4,
+        "steps": 4
+      },
+      {
+        "op": "latent_decode",
+        "duration_s": 0.3,
+        "steps": 3
+      }
+    ],
+    "target_steps": 30,
+    "latent_stub": true
+  },
+  "action_min": -1.0,
+  "action_max": 1.0
+}

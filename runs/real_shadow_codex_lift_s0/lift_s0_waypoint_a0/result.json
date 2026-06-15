@@ -1,0 +1,43 @@
+{
+  "task": {
+    "name": "lift",
+    "goal": "raise the object above the table and keep it controlled",
+    "seed": 0,
+    "episode_seconds": 2.5,
+    "object_start": [
+      -0.0394,
+      -0.0383,
+      0.025
+    ],
+    "target_xy": null,
+    "metadata": {
+      "height_threshold": 0.07496613748371601
+    }
+  },
+  "interface": "waypoint",
+  "seed": 0,
+  "attempt": 0,
+  "llm": {
+    "source": "codex",
+    "ok": true,
+    "error": null
+  },
+  "validation": {
+    "ok": true,
+    "errors": [],
+    "warnings": []
+  },
+  "result": {
+    "interface": "waypoint",
+    "task": "lift",
+    "seed": 0,
+    "success": false,
+    "score": 0.0003,
+    "total_return": -23.7696,
+    "final_object_x": -0.03941716253757477,
+    "final_object_y": -0.038328565657138824,
+    "final_object_z": 0.02499271184206009,
+    "max_object_z": 0.025,
+    "errors": ""
+  }
+}

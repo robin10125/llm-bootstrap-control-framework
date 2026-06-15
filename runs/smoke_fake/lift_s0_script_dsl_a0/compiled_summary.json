@@ -1,0 +1,49 @@
+{
+  "interface": "script_dsl",
+  "action_shape": [
+    30,
+    5
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "set_impedance",
+        "duration_s": 0.05,
+        "steps": 1
+      },
+      {
+        "op": "move_frame",
+        "duration_s": 0.5,
+        "steps": 5
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.12,
+        "steps": 1
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.12,
+        "steps": 1
+      },
+      {
+        "op": "seek_contact",
+        "duration_s": 0.45,
+        "steps": 4
+      },
+      {
+        "op": "maintain_contact",
+        "duration_s": 0.35,
+        "steps": 3
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.8,
+        "steps": 8
+      }
+    ],
+    "target_steps": 30
+  },
+  "action_min": -0.5999999642372131,
+  "action_max": 1.0
+}

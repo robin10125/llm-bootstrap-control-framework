@@ -1,0 +1,2 @@
+interface,task,seed,success,score,total_return,final_object_x,final_object_y,final_object_z,max_object_z,errors
+recursive_units,lift,0,False,0.0002,-0.5787,-0.039416491985321045,-0.03832869604229927,0.02499270997941494,0.025,

@@ -1,0 +1,2 @@
+interface,task,seed,success,score,total_return,final_object_x,final_object_y,final_object_z,max_object_z,errors,task_metrics
+recursive_units,lift,0,True,1.8,0.96,0.008217701688408852,-0.013812797144055367,0.10499999672174454,0.105,,"{""height_margin"": 0.03, ""height_threshold"": 0.075, ""lift_delta"": 0.08, ""max_object_z"": 0.105, ""metric"": ""height"", ""score_note"": ""score is shaped progress, not absolute object height""}"

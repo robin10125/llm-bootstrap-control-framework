@@ -1,0 +1,151 @@
+{
+  "interface": "recursive_units",
+  "action_shape": [
+    25,
+    5
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_targets",
+        "duration_s": 0.4,
+        "steps": 4
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.35,
+        "steps": 3
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.35,
+        "steps": 3
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "monitor",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "wait",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.2,
+        "steps": 2
+      },
+      {
+        "op": "set_joint_targets",
+        "duration_s": 0.5,
+        "steps": 5
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "set_joint_target",
+        "duration_s": 0.3,
+        "steps": 3
+      },
+      {
+        "op": "monitor",
+        "duration_s": 0.3,
+        "steps": 3
+      }
+    ],
+    "target_steps": 25,
+    "recursive_units": true,
+    "recursive_trace": {
+      "top_trace": [
+        {
+          "level": "task",
+          "command": "Lift the object from its start position above the table to above the height threshold while maintaining a stable opposing pinch grip."
+        }
+      ],
+      "unit_traces": {
+        "base": [
+          {
+            "level": "unit",
+            "command": "End with the palm centered over the object's start xy position near x=-0.0394, y=-0.0383, then retracted upward/high enough after grasp so the object is lifted above z=0.075 and remains controlled."
+          },
+          {
+            "level": "joint",
+            "command": "Set base_x to -0.0394 and base_y to -0.0383 to center the palm over the object start xy."
+          },
+          {
+            "level": "joint",
+            "command": "Lower base_z toward the object/contact region before grasp."
+          },
+          {
+            "level": "joint",
+            "command": "Hold base position while non-base appendages grasp and contact settles."
+          },
+          {
+            "level": "joint",
+            "command": "Retract base_z upward to a high negative target while maintaining base_x/base_y so the grasped object lifts above z=0.075."
+          },
+          {
+            "level": "joint",
+            "command": "Hold the lifted base pose to keep the object controlled."
+          }
+        ],
+        "thumb": [
+          {
+            "level": "unit",
+            "command": "Relative to the final palm/base pose, keep the thumb flexed inward from open to a firm near-closed opposing pinch against the object, maintaining grip during lift."
+          },
+          {
+            "level": "joint",
+            "command": "Use thumb joint g_right only: start open/clear, flex inward to near-closed pinch, wait for contact/settle, then hold the near-closed target through lift and stabilization."
+          }
+        ],
+        "index": [
+          {
+            "level": "unit",
+            "command": "Relative to the final palm/base pose, keep the index flexed inward from open to a firm near-closed opposing pinch against the object, matching the thumb to stabilize and control the object."
+          },
+          {
+            "level": "joint",
+            "command": "Drive index joint g_left inward to near-closed flexion and hold it for stable opposing contact."
+          }
+        ]
+      }
+    }
+  },
+  "action_min": -1.0,
+  "action_max": 1.0
+}

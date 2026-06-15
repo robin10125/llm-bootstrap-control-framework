@@ -1,0 +1,74 @@
+{
+  "interface": "script_dsl",
+  "action_shape": [
+    100,
+    23
+  ],
+  "metadata": {
+    "trace": [
+      {
+        "op": "set_impedance",
+        "duration_s": 0.025,
+        "steps": 1
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.35,
+        "steps": 14
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.3,
+        "steps": 12
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.3,
+        "steps": 12
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.3,
+        "steps": 12
+      },
+      {
+        "op": "set_appendage_joints",
+        "duration_s": 0.25,
+        "steps": 10
+      },
+      {
+        "op": "seek_contact",
+        "duration_s": 0.55,
+        "steps": 22
+      },
+      {
+        "op": "maintain_contact",
+        "duration_s": 0.2,
+        "steps": 8
+      },
+      {
+        "op": "set_base_target",
+        "duration_s": 0.65,
+        "steps": 26
+      },
+      {
+        "op": "maintain_contact",
+        "duration_s": 0.45,
+        "steps": 18
+      },
+      {
+        "op": "monitor",
+        "duration_s": 0.35,
+        "steps": 14
+      },
+      {
+        "op": "track_relative_pose",
+        "duration_s": 0.6,
+        "steps": 24
+      }
+    ],
+    "target_steps": 100
+  },
+  "action_min": -1.0,
+  "action_max": 1.0
+}

@@ -1,0 +1,44 @@
+{
+  "task": {
+    "name": "lift",
+    "goal": "raise the object above the table and keep it controlled",
+    "seed": 0,
+    "episode_seconds": 0.5,
+    "object_start": [
+      -0.0394,
+      -0.0383,
+      0.025
+    ],
+    "target_xy": null,
+    "metadata": {
+      "height_threshold": 0.07498264610767365
+    }
+  },
+  "interface": "recursive_units",
+  "seed": 0,
+  "attempt": 0,
+  "llm": {
+    "source": "mock",
+    "ok": true,
+    "error": null,
+    "metadata": {}
+  },
+  "validation": {
+    "ok": true,
+    "errors": [],
+    "warnings": []
+  },
+  "result": {
+    "interface": "recursive_units",
+    "task": "lift",
+    "seed": 0,
+    "success": false,
+    "score": 0.0002,
+    "total_return": -0.5787,
+    "final_object_x": -0.039416491985321045,
+    "final_object_y": -0.03832869604229927,
+    "final_object_z": 0.02499270997941494,
+    "max_object_z": 0.025,
+    "errors": ""
+  }
+}
