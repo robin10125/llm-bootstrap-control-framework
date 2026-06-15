@@ -1,3 +1,0 @@
-interface,task,seed,success,score,total_return,final_object_x,final_object_y,final_object_z,max_object_z,errors
-recursive_units,lift,0,False,0.0002,-3.183,-0.03941647708415985,-0.03833186626434326,0.024992680177092552,0.025,
-recursive_units,lift,0,False,0.0002,-3.1827,-0.03941591829061508,-0.03833029791712761,0.02499275468289852,0.025,

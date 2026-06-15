@@ -1,4 +1,0 @@
-interface,task,seed,success,score,total_return,final_object_x,final_object_y,final_object_z,max_object_z,errors
-waypoint,lift,0,False,0.0003,-23.7696,-0.03941716253757477,-0.038328565657138824,0.02499271184206009,0.025,
-script_dsl,lift,0,False,0.0003,-20.9307,-0.03941767290234566,-0.038329996168613434,0.024992715567350388,0.025,
-hybrid,lift,0,False,0.0,0.0,-0.03941714018583298,-0.038328565657138824,0.02496613748371601,0.02496613748371601,block 1 has unknown op 'parallel'; block 3 has unknown op 'parallel'; block 4 has unknown op 'parallel'
