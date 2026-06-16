@@ -73,10 +73,10 @@ def _joint_meaning(name: str, lo: float, hi: float, open_value: float | None = N
         }
     if name == "base_z":
         return {
-            f"{lo:.4f}..{q1:.4f}": "base/palm is high or retracted",
-            f"{q1:.4f}..{q2:.4f}": "base/palm is moderately high",
-            f"{q2:.4f}..{q3:.4f}": "base/palm is moderately lowered",
-            f"{q3:.4f}..{hi:.4f}": "base/palm is low toward the table/object",
+            f"{lo:.4f}..{q1:.4f}": "base/palm is low toward the table/object",
+            f"{q1:.4f}..{q2:.4f}": "base/palm is moderately lowered",
+            f"{q2:.4f}..{q3:.4f}": "base/palm is moderately high",
+            f"{q3:.4f}..{hi:.4f}": "base/palm is high or retracted",
         }
     if open_value is not None and close_value is not None and close_value < open_value:
         return {

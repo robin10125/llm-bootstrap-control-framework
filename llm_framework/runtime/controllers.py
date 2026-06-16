@@ -63,9 +63,72 @@ def latent_decode_target(env: Any, token: str, gain: float, current: np.ndarray,
             target[idx["base_x"]] = world_object_xy[0]
             target[idx["base_y"]] = world_object_xy[1]
     elif token in {"raise", "stabilize_height"} and "base_z" in idx:
-        # In the Shadow/gripper scene, lower base_z is a higher palm.
-        target[idx["base_z"]] = min(target[idx["base_z"]], 0.0)
+        # In the Shadow scene, higher base_z raises/retracts the palm.
+        target[idx["base_z"]] = max(target[idx["base_z"]], 0.10)
     return np.clip(target, *ctrl_limits(env))
+
+
+def frame_target_to_base(env: Any, world: Any, current: np.ndarray, block: dict[str, Any]) -> np.ndarray:
+    """Convert an actual world-frame palm/grasp target into raw base actuator targets."""
+    idx = actuator_index(env)
+    target = np.asarray(current, dtype=np.float32).copy()
+    if not {"base_x", "base_y", "base_z"} <= idx.keys():
+        return target
+
+    desired = _desired_world_position(world, block)
+    if desired is None:
+        return target
+
+    frame = str(block.get("frame", block.get("target_frame", "grasp_site"))).lower()
+    frame_pos = _frame_position(world, frame)
+    if frame_pos is None:
+        return target
+
+    base_origin = np.asarray([world.base_q[0], world.base_q[1], world.base_q[2]], dtype=float)
+    frame_offset = frame_pos - base_origin
+    base_target = desired - frame_offset
+    for axis, name in enumerate(("base_x", "base_y", "base_z")):
+        target[idx[name]] = float(base_target[axis])
+    return target
+
+
+def _desired_world_position(world: Any, block: dict[str, Any]) -> np.ndarray | None:
+    raw = block.get("target", {})
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        pos = np.asarray(raw, dtype=float)
+        if len(pos) >= 3:
+            return pos[:3]
+    if not isinstance(raw, dict):
+        raw = {}
+    if raw.get("object") == "object" or block.get("object") == "object":
+        offset = np.asarray(raw.get("offset", block.get("offset", [0.0, 0.0, 0.0])), dtype=float)
+        if offset.shape[0] < 3:
+            offset = np.pad(offset, (0, 3 - offset.shape[0]))
+        return np.asarray(world.object_pos, dtype=float) + offset[:3]
+    if "pos" in raw:
+        pos = np.asarray(raw["pos"], dtype=float)
+    elif "position" in raw:
+        pos = np.asarray(raw["position"], dtype=float)
+    else:
+        pos = np.asarray([
+            raw.get("x", block.get("x")),
+            raw.get("y", block.get("y")),
+            raw.get("z", block.get("z")),
+        ], dtype=object)
+    if len(pos) < 3 or any(v is None for v in pos[:3]):
+        return None
+    return np.asarray(pos[:3], dtype=float)
+
+
+def _frame_position(world: Any, frame: str) -> np.ndarray | None:
+    if frame in {"base", "base_q", "base_origin", "raw_base"}:
+        return np.asarray(world.base_q[:3], dtype=float)
+    derived = getattr(world, "derived", {}) or {}
+    if frame in {"palm", "palm_body", "rh_palm"} and "palm_pos" in derived:
+        return np.asarray(derived["palm_pos"], dtype=float)
+    if frame in {"grasp", "grasp_site", "grasp_frame"} and "grasp_site_pos" in derived:
+        return np.asarray(derived["grasp_site_pos"], dtype=float)
+    return None
 
 
 def _device_get(value: Any) -> Any:
@@ -75,4 +138,3 @@ def _device_get(value: Any) -> Any:
         return jax.device_get(value)
     except Exception:
         return value
-

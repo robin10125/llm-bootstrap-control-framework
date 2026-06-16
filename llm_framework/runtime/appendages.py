@@ -37,19 +37,8 @@ def appendage_joint_map(env: Any) -> dict[str, list[str]]:
         if not matched and name not in groups["hand"]:
             groups["hand"].append(name)
 
-    # Friendly aliases for simple grippers and fake envs.
-    fingerish = [n for n in names if "finger" in n.lower() or n.startswith("g_")]
-    if fingerish:
-        groups.setdefault("index", [])
-        groups.setdefault("thumb", [])
-        if not groups["index"]:
-            groups["index"] = fingerish[:1]
-        if not groups["thumb"]:
-            groups["thumb"] = fingerish[1:2] or fingerish[:1]
-
     return {k: v for k, v in groups.items() if v}
 
 
 def appendage_names(env: Any) -> list[str]:
     return sorted(appendage_joint_map(env))
-

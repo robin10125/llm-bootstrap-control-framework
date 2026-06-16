@@ -53,6 +53,23 @@ def world_from_env_state(env: Any, state: Any) -> WorldState:
         appendages=appendage_joint_map(env),
         fingertip_pos=fingertips,
     )
+    derived = derived_context(world)
+    try:
+        palm_pos = np.asarray(get(data.xpos[env.palm_bid]), dtype=np.float32)
+        derived["palm_pos"] = palm_pos.round(4).tolist()
+        derived["object_to_palm_distance"] = round(float(np.linalg.norm(object_pos - palm_pos)), 4)
+        derived["object_to_palm_xy_distance"] = round(float(np.linalg.norm(object_pos[:2] - palm_pos[:2])), 4)
+    except Exception:
+        pass
+    try:
+        grasp_pos = np.asarray(get(data.site_xpos[env.grasp_sid]), dtype=np.float32)
+        derived["grasp_site_pos"] = grasp_pos.round(4).tolist()
+        derived["object_to_grasp_site_distance"] = round(float(np.linalg.norm(object_pos - grasp_pos)), 4)
+        derived["object_to_grasp_site_xy_distance"] = round(float(np.linalg.norm(object_pos[:2] - grasp_pos[:2])), 4)
+    except Exception:
+        pass
+    if len(world.base_q) >= 2 and len(object_pos) >= 2:
+        derived["object_to_base_xy_distance"] = round(float(np.linalg.norm(object_pos[:2] - world.base_q[:2])), 4)
     try:
         ctrl_open = np.asarray(get(env.ctrl_open), dtype=np.float32)
         ctrl_close = np.asarray(get(env.ctrl_close), dtype=np.float32)
@@ -73,7 +90,7 @@ def world_from_env_state(env: Any, state: Any) -> WorldState:
         actuator_names=world.actuator_names,
         appendages=world.appendages,
         joint_schema=joint_schema_for_state(world, ctrl_open=open_by_name, ctrl_close=close_by_name),
-        derived=derived_context(world),
+        derived=derived,
         fingertip_pos=world.fingertip_pos,
         contacts=world.contacts,
         history=world.history,

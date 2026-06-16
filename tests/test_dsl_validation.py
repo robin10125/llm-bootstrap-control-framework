@@ -26,6 +26,16 @@ def test_parser_accepts_fenced_json() -> None:
     assert program.source["blocks"][0]["op"] == "wait"
 
 
+def test_parser_repairs_single_extra_close_before_required_field() -> None:
+    program = parse_json_program(
+        '{"reflection": {}, "recursive_trace": {}},"generated_primitives": {},'
+        '"blocks": [{"op": "wait", "duration_s": 0.1}]}',
+        interface="recursive_units",
+    )
+
+    assert program.source["blocks"][0]["op"] == "wait"
+
+
 def test_forbidden_nested_appendage_primitive_is_rejected() -> None:
     program = CandidateProgram(
         interface="hybrid",

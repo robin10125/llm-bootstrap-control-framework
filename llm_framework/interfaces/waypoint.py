@@ -62,44 +62,10 @@ class WaypointInterface:
         return ValidationResult(not errors, tuple(errors))
 
     def compile(self, program: CandidateProgram, ctx: TaskContext, state: WorldState, env: Any) -> CompiledPolicy:
-        if getattr(env, "is_fake_env", False):
-            targets = _compile_waypoints_locally(program.source, env)
-            source = "local waypoint compiler"
-        else:
-            comp = waypoint_compiler(env)
-            targets = comp.compile(program.source, env)
-            source = "bootstrapping.WaypointCompiler"
+        comp = waypoint_compiler(env)
+        targets = comp.compile(program.source, env)
         return CompiledPolicy(
             interface=self.name,
             action_stream=targets_to_actions(env, targets),
-            metadata={"source": source, "task": ctx.name},
+            metadata={"source": "bootstrapping.WaypointCompiler", "task": ctx.name},
         )
-
-
-def _compile_waypoints_locally(plan: dict[str, Any], env: Any):
-    import numpy as np
-
-    waypoints = plan["waypoints"]
-    idx = {env.model.actuator(i).name: i for i in range(env.nu)}
-    targets = np.repeat(np.asarray(env.ctrl_open, dtype=np.float32)[None, :], env.horizon, axis=0)
-    times = np.arange(env.horizon) * float(env.cfg.control_dt)
-    ts = np.asarray([float(w["t"]) for w in waypoints], dtype=float)
-    vecs = []
-    for point in waypoints:
-        vec = np.asarray(env.ctrl_open, dtype=np.float32).copy()
-        pos = point["pos"]
-        for axis, value in zip(("x", "y", "z"), pos, strict=True):
-            name = f"base_{axis}"
-            if name in idx:
-                vec[idx[name]] = float(value)
-        frac_open = float(np.clip(point["open"], 0.0, 1.0))
-        shaped = frac_open * np.asarray(env.ctrl_open) + (1.0 - frac_open) * np.asarray(env.ctrl_close)
-        for i in getattr(env, "hand_act_ids", []):
-            vec[i] = shaped[i]
-        vecs.append(vec)
-    order = np.argsort(ts)
-    ts = ts[order]
-    vecs = np.asarray(vecs, dtype=np.float32)[order]
-    for d in range(env.nu):
-        targets[:, d] = np.interp(times, ts, vecs[:, d])
-    return targets

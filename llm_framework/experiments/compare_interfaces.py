@@ -6,8 +6,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from llm_framework.adapters.bootstrapping_env import make_bootstrapping_env
-from llm_framework.adapters.fake_env import make_fake_env
 from llm_framework.core.metrics import summarize, write_json, write_metrics_csv
 from llm_framework.core.state import RolloutResult, SafetyLimits
 from llm_framework.core.tasks import build_task_context
@@ -29,7 +30,7 @@ def main() -> int:
         env_overrides["episode_seconds"] = args.episode_seconds
     if args.control_dt is not None:
         env_overrides["control_dt"] = args.control_dt
-    env = make_fake_env(**env_overrides) if args.env == "fake" else make_bootstrapping_env(args.env, **env_overrides)
+    env = make_bootstrapping_env(args.env, **env_overrides)
     interfaces = [interface_by_name(name.strip()) for name in args.interfaces.split(",") if name.strip()]
     tasks = [name.strip() for name in args.tasks.split(",") if name.strip()]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -57,6 +58,10 @@ def main() -> int:
                     tag = f"{task_name}_s{seed}_{interface.name}_a{attempt}"
                     run_dir = out_dir / tag
                     run_dir.mkdir(parents=True, exist_ok=True)
+                    write_json(run_dir / "context.json", {
+                        "task": ctx.compact(),
+                        "world": world.compact(),
+                    })
                     prompt = interface.build_prompt(ctx, world)
                     (run_dir / "prompt.md").write_text(prompt)
                     completion = complete_for_interface(
@@ -101,6 +106,7 @@ def main() -> int:
                         except Exception as exc:  # keep the compare run going
                             result = error_result(interface.name, ctx.name, seed, ctx.object_start, f"{type(exc).__name__}: {exc}")
                     record["result"] = result.row()
+                    record["result_metadata"] = result.metadata
                     write_json(run_dir / "result.json", record)
                     results.append(result)
                     manifest["runs"].append({"tag": tag, "result": result.row()})
@@ -133,6 +139,7 @@ def main() -> int:
 
 def compile_and_rollout(interface, program, ctx, world, env, seed: int, run_dir: Path) -> RolloutResult:
     compiled = interface.compile(program, ctx, world, env)
+    np.save(run_dir / "action_stream.npy", compiled.action_stream)
     write_json(run_dir / "compiled_summary.json", {
         "interface": compiled.interface,
         "action_shape": list(compiled.action_stream.shape),
@@ -175,6 +182,7 @@ def run_repairs(args, interface, program, result, ctx, world, env, seed: int, ou
             "seed": seed,
             "repair_attempt": repair_idx + 1,
             "parent_result": prev_result.row(),
+            "parent_result_metadata": prev_result.metadata,
             "llm": {
                 "source": completion.source,
                 "ok": completion.ok,
@@ -202,6 +210,7 @@ def run_repairs(args, interface, program, result, ctx, world, env, seed: int, ou
             except Exception as exc:
                 repair_result = error_result(interface.name, ctx.name, seed, ctx.object_start, f"{type(exc).__name__}: {exc}")
         record["result"] = repair_result.row()
+        record["result_metadata"] = repair_result.metadata
         write_json(repair_dir / "result.json", record)
         out.append((repair_tag, repair_result))
         prev_result = repair_result
@@ -211,8 +220,6 @@ def run_repairs(args, interface, program, result, ctx, world, env, seed: int, ou
 
 
 def reset_env(env: Any, seed: int):
-    if getattr(env, "is_fake_env", False):
-        return env.reset(seed)
     import jax
 
     return env.reset(jax.random.PRNGKey(seed))
@@ -247,7 +254,7 @@ def report_markdown(summary: dict[str, Any], results: list[RolloutResult]) -> st
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", default="shadow", choices=["shadow", "gripper", "fake"])
+    parser.add_argument("--env", default="shadow", choices=["shadow"])
     parser.add_argument("--interfaces", default="waypoint,script_dsl,hybrid,latent_stub")
     parser.add_argument("--backend", default="mock", choices=["mock", "codex", "claude-code", "anthropic"])
     parser.add_argument("--llm-model", default=None)

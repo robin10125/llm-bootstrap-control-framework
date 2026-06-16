@@ -16,10 +16,12 @@ def ensure_bootstrapping_path() -> None:
 
 
 def make_bootstrapping_env(name: str = "shadow", **overrides: Any):
+    if name != "shadow":
+        raise ValueError("llm-framework only supports the Shadow Hand embodiment; use name='shadow'")
     ensure_bootstrapping_path()
     from mjx_env import make_env
 
-    return make_env(name, **overrides)
+    return make_env("shadow", **overrides)
 
 
 def call_bootstrapping_llm(
@@ -41,4 +43,3 @@ def waypoint_compiler(env: Any):
     from waypoints import WaypointCompiler
 
     return WaypointCompiler(env)
-

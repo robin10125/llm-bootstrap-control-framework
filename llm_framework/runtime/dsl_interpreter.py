@@ -11,6 +11,7 @@ from llm_framework.runtime.controllers import (
     ctrl_limits,
     ctrl_open,
     duration_to_steps,
+    frame_target_to_base,
     hand_shape_target,
     latent_decode_target,
     repeat_target,
@@ -51,14 +52,20 @@ def compile_dsl(program: CandidateProgram, env: Any, world: WorldState) -> Compi
                 elif isinstance(target, dict) and axis in target and name in idx:
                     next_target[idx[name]] = float(target[axis])
             append(duration, next_target, op)
+        elif op == "set_frame_target":
+            next_target = frame_target_to_base(env, world, current, block)
+            append(duration, next_target, op)
         elif op == "move_frame":
-            target = block.get("target", {})
-            offset = np.asarray(target.get("offset", [0.0, 0.0, 0.0]), dtype=float)
-            if target.get("object") == "object" and {"base_x", "base_y"} <= idx.keys():
-                next_target[idx["base_x"]] = float(world.object_pos[0] + offset[0])
-                next_target[idx["base_y"]] = float(world.object_pos[1] + offset[1])
-                if "base_z" in idx and len(offset) > 2:
-                    next_target[idx["base_z"]] = float(offset[2])
+            if "frame" in block:
+                next_target = frame_target_to_base(env, world, current, block)
+            else:
+                target = block.get("target", {})
+                offset = np.asarray(target.get("offset", [0.0, 0.0, 0.0]), dtype=float)
+                if target.get("object") == "object" and {"base_x", "base_y"} <= idx.keys():
+                    next_target[idx["base_x"]] = float(world.object_pos[0] + offset[0])
+                    next_target[idx["base_y"]] = float(world.object_pos[1] + offset[1])
+                    if "base_z" in idx and len(offset) > 2:
+                        next_target[idx["base_z"]] = float(offset[2])
             append(duration, next_target, op)
         elif op == "track_relative_pose":
             offset = np.asarray(block.get("offset", [0.0, 0.0, 0.0]), dtype=float)
@@ -133,7 +140,10 @@ def compile_dsl(program: CandidateProgram, env: Any, world: WorldState) -> Compi
     return CompiledPolicy(
         interface=program.interface,
         action_stream=targets_to_actions(env, target_stream),
-        metadata={"trace": trace, "target_steps": int(target_stream.shape[0])},
+        metadata={
+            "trace": trace,
+            "target_steps": int(target_stream.shape[0]),
+        },
     )
 
 

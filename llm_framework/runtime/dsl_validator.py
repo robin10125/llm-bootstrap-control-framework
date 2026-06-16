@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from typing import Any
-
 from llm_framework.core.state import CandidateProgram, SafetyLimits, ValidationResult
 from llm_framework.runtime.dsl_macros import expand_generated_primitives
 
 
 COMMON_OPS = {
     "set_base_target",
+    "set_frame_target",
     "move_frame",
     "track_relative_pose",
     "set_joint_targets",

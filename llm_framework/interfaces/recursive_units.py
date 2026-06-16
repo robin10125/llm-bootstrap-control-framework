@@ -26,6 +26,14 @@ PHASE_ORDER = (
 )
 
 
+SCHEDULE_DIRECTIVE = (
+    "Use an explicit timed schedule for coordination. Put base/frame placement before "
+    "appendage closure, include short monitor or wait blocks after contact-seeking phases, "
+    "and only schedule transport after the planned contact/settle dwell. Do not use loops, "
+    "runtime conditionals, or task-named high-level primitives."
+)
+
+
 class RecursiveUnitsInterface(ScriptDSLInterface):
     """Recursive LLM planner: task -> unit commands -> joint/base commands -> final policy."""
 
@@ -189,13 +197,20 @@ def _top_prompt(ctx: TaskContext, state: WorldState) -> str:
     units = fundamental_units(state)
     return (
         "You are the top-level policy decomposition agent for a Shadow-style dexterous hand.\n"
+        "Work in actual world coordinates. The context includes object, palm, grasp_site, "
+        "and fingertip positions. For base motion, prefer `set_frame_target` with "
+        "`frame: \"grasp_site\"` or `frame: \"palm\"` and a world-coordinate target; "
+        "`set_base_target` is a raw slide-actuator command and should only be used when "
+        "you intentionally want raw base coordinates.\n"
         "Decompose the task into one command for EVERY fundamental unit listed below. "
         "Do not emit robot actions yet. The base command should describe the desired palm/base "
         "end state; finger/wrist commands should be relative to that base/palm end state.\n"
-        "Also produce a sequential phase schedule. For contact manipulation, prefer this "
-        "general order: approach over/near object, descend or pre-contact, close/flex until "
-        "touch or timed settle, verify contact or timed settle, then lift/transport. This "
-        "prevents units from moving away prematurely when exact checks are not obvious.\n"
+        "Also produce a sequential phase schedule. For coordinated manipulation, prefer this "
+        "general order: approach over/near the work area, descend or pre-contact, move "
+        "appendages toward constraint/contact/alignment, verify the coordination condition "
+        "or settle, then transport or continue. This prevents units from moving away "
+        "prematurely when exact checks are not obvious. "
+        f"{SCHEDULE_DIRECTIVE}\n"
         "Return ONLY JSON with this schema:\n"
         '{"trace":[{"level":"task","command":"..."}],'
         '"phase_schedule":[{"phase":"approach","intent":"...","min_duration_s":0.2}],'
@@ -210,16 +225,22 @@ def _top_prompt(ctx: TaskContext, state: WorldState) -> str:
 def _unit_prompt(ctx: TaskContext, state: WorldState, unit: str, command: str) -> str:
     return (
         f"You are the subagent for the `{unit}` fundamental unit only.\n"
+        "Use the actual world-coordinate frames in the context. If this unit is `base`, "
+        "prefer `set_frame_target` for palm/grasp_site placement so the command accounts "
+        "for the physical offset between the slide-base origin and the hand frame.\n"
         "Translate the supplied high-level unit command into lower-level commands until every "
         "command is a lowest-level actuator/base command. You may only command joints listed "
         "in this unit schema. Return the recursive trace and lowest-level blocks.\n"
-        "Allowed lowest-level ops: set_base_target, set_joint_target, set_joint_targets, "
-        "set_appendage_joints, wait, monitor, return. Do not use task-named primitives.\n"
-        "Every block must include a `phase` chosen from the phase schedule. If you cannot "
-        "define a reliable check, use a timed wait/monitor block in `verify_contact_or_settle`.\n"
+        "Allowed lowest-level ops: set_frame_target, set_base_target, set_joint_target, set_joint_targets, "
+        "set_appendage_joints, wait, monitor, return. Do not use task-named "
+        "primitives.\n"
+        "Every block must include a `phase` chosen from the phase schedule. "
+        f"{SCHEDULE_DIRECTIVE}\n"
         "Return ONLY JSON with schema:\n"
         '{"unit":"...","trace":[{"level":"unit","command":"..."},{"level":"joint","command":"..."}],'
-        '"blocks":[{"phase":"close_until_touch_or_settle","op":"set_joint_target","joint":"...","target":0.0,"duration_s":0.2}]}\n\n'
+        '"blocks":[{"phase":"close_until_touch_or_settle","op":"set_joint_target",'
+        '"joint":"...","target":0.0,"duration_s":0.1},'
+        '{"phase":"verify_contact_or_settle","op":"monitor","duration_s":0.1}]}\n\n'
         f"Task: {ctx.goal}\n"
         f"Unit command: {command}\n"
         f"Phase schedule: {json.dumps(_default_phase_schedule(ctx), indent=2)}\n"
@@ -233,6 +254,10 @@ def _compiler_prompt(ctx: TaskContext, state: WorldState, compiler_input: dict[s
     return (
         "You are the final compiler agent. Combine all unit policies into one executable JSON "
         "policy for the robot. Preserve recursive_trace. Use only lowest-level blocks. "
+        "Use actual world coordinates for base placement. Prefer `set_frame_target` with "
+        "`frame` equal to `grasp_site` or `palm` when moving the hand relative to the object; "
+        "this compiler will convert that desired frame pose into raw base actuator targets. "
+        "Use `set_base_target` only for deliberate raw slide coordinates.\n"
         "You may freely define useful generated primitives/macros in `generated_primitives` "
         "with any names you find useful, including contact-oriented names such as "
         "`close_until_touching`. If you invent a primitive, include its implementation as "
@@ -242,8 +267,9 @@ def _compiler_prompt(ctx: TaskContext, state: WorldState, compiler_input: dict[s
         "close_until_touch_or_settle -> verify_contact_or_settle -> lift_or_transport -> "
         "stabilize_or_release. This is more important than grouping by unit. Do not raise or "
         "transport the base before the close/touch and verify/settle phases have occurred. "
-        "Do not invent unsupported ops.\n"
-        "Allowed ops: set_base_target, set_joint_target, set_joint_targets, set_appendage_joints, "
+        "Do not invent unsupported ops. "
+        f"{SCHEDULE_DIRECTIVE}\n"
+        "Allowed ops: set_frame_target, set_base_target, set_joint_target, set_joint_targets, set_appendage_joints, "
         "wait, monitor, return.\n"
         'Return ONLY JSON: {"recursive_trace": {...}, "generated_primitives": {...}, "blocks": [...]}\n\n'
         f"Task: {ctx.goal}\n"
@@ -263,25 +289,38 @@ def _repair_prompt(ctx: TaskContext, state: WorldState, previous_program: dict[s
         "- Keep strict phase order: approach -> descend_or_precontact -> "
         "close_until_touch_or_settle -> verify_contact_or_settle -> lift_or_transport -> "
         "stabilize_or_release.\n"
-        "- If max_object_z did not increase, assume the object was not contacted or not held. "
-        "Do not lift/transport before a sufficiently deep descend, closure, and settle period.\n"
-        "- Use the joint schema for actuator direction. For base_z, high values lower the "
-        "palm toward the table/object and low/negative values raise/retract it.\n"
-        "- For gripper-like fingers, use closed_target/open_target from the schema; do not "
-        "guess that larger means more closed.\n"
-        "- If no reliable condition is available, use timed wait/monitor in "
-        "verify_contact_or_settle.\n\n"
-        "Allowed ops: set_base_target, set_joint_target, set_joint_targets, "
-        "set_appendage_joints, wait, monitor, return, or any generated primitive you define "
-        "in `generated_primitives`.\n"
+        "- If task metrics or rollout observations did not improve toward the requested "
+        "state, assume a required coordination condition was missed or lost. Adjust the "
+        "earlier scheduled base, appendage, contact, alignment, clearance, or stability "
+        "phase before later transport phases.\n"
+        "- There is no runtime conditional loop. Tune fixed phase durations, frame targets, "
+        "joint targets, and monitor/wait dwell times based on the previous rollout metrics.\n"
+        "- Use actual world coordinates for base placement. Prefer `set_frame_target` with "
+        "`frame` equal to `grasp_site` or `palm`; use raw `set_base_target` only if you "
+        "are intentionally commanding slide actuator coordinates.\n"
+        "- Use the joint schema for actuator direction. For base_z in the Shadow scene, "
+        "lower/negative values lower the palm toward the table/object and higher values "
+        "raise/retract it.\n"
+        "- For finger actuators, use closed_target/open_target from the schema; do not "
+        "guess actuator direction.\n"
+        f"- {SCHEDULE_DIRECTIVE}\n\n"
+        "Allowed ops: set_frame_target, set_base_target, set_joint_target, set_joint_targets, "
+        "set_appendage_joints, wait, monitor, return, or any generated "
+        "primitive you define in `generated_primitives`.\n"
         'Return ONLY JSON: {"reflection": {...}, "recursive_trace": {...}, "generated_primitives": {...}, "blocks": [...]}\n\n'
         f"Task: {ctx.goal}\n"
         f"Task context: {json.dumps(ctx.compact(), indent=2)}\n"
         f"Actuator schema: {json.dumps(state.joint_schema, indent=2)}\n"
         f"Derived context: {json.dumps(state.derived, indent=2)}\n"
-        f"Previous rollout result: {json.dumps(previous_result.row(), indent=2)}\n"
+        f"Previous rollout result: {json.dumps(_previous_result_payload(previous_result), indent=2)}\n"
         f"Previous program: {json.dumps(previous_program, indent=2)}\n"
     )
+
+
+def _previous_result_payload(previous_result: Any) -> dict[str, Any]:
+    row = previous_result.row() if hasattr(previous_result, "row") else {}
+    payload = {"row": row}
+    return payload
 
 
 def _unit_commands(top_obj: dict[str, Any], units: list[str], goal: str) -> dict[str, str]:
@@ -351,13 +390,13 @@ def _mock_unit_policy(unit: str, ctx: TaskContext, state: WorldState) -> dict[st
         return {
             "unit": unit,
             "trace": [
-                {"level": "unit", "command": "move palm/base over object, descend to contact height, then raise after contact settle"},
-                {"level": "base", "command": "set absolute base targets in scheduled phases"},
+                {"level": "unit", "command": "move grasp_site over object, descend to contact height, then raise after contact settle"},
+                {"level": "base", "command": "set actual world-frame grasp_site targets in scheduled phases"},
             ],
             "blocks": [
-                {"phase": "approach", "op": "set_base_target", "x": x, "y": y, "z": 0.0, "duration_s": 0.3},
-                {"phase": "descend_or_precontact", "op": "set_base_target", "x": x, "y": y, "z": 0.15, "duration_s": 0.4},
-                {"phase": "lift_or_transport", "op": "set_base_target", "x": x, "y": y, "z": 0.0, "duration_s": 0.5},
+                {"phase": "approach", "op": "set_frame_target", "frame": "grasp_site", "target": {"x": x, "y": y, "z": 0.10}, "duration_s": 0.3},
+                {"phase": "descend_or_precontact", "op": "set_frame_target", "frame": "grasp_site", "target": {"x": x, "y": y, "z": 0.04}, "duration_s": 0.4},
+                {"phase": "lift_or_transport", "op": "set_frame_target", "frame": "grasp_site", "target": {"x": x, "y": y, "z": 0.10}, "duration_s": 0.5},
             ],
         }
     joints = state.appendages.get(unit, [])
