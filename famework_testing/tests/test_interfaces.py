@@ -8,6 +8,8 @@ from llm_framework.core.state import RolloutResult, SafetyLimits, WorldState
 from llm_framework.core.tasks import build_task_context
 from llm_framework.interfaces.hybrid import HybridInterface
 from llm_framework.interfaces.latent import LatentStubInterface
+from llm_framework.interfaces.base import interface_by_name
+from llm_framework.interfaces.reasoned_bias import OptimalBiasGuidedInterface, OptimalBiasPlainInterface
 from llm_framework.interfaces.recursive_units import RecursiveUnitsInterface, _repair_prompt
 from llm_framework.interfaces.script_dsl import ScriptDSLInterface
 from llm_framework.llm.worker import complete_for_interface
@@ -297,6 +299,45 @@ def test_recursive_units_mock_returns_trace_and_compiles() -> None:
     compiled = interface.compile(program, ctx, world, env)
     assert compiled.action_stream.shape == (env.horizon, env.nu)
     assert compiled.metadata["recursive_units"] is True
+
+
+def test_optimal_bias_plain_mock_preserves_reasoning_trace_and_compiles() -> None:
+    env = FakeEnv()
+    world = fake_world()
+    ctx = build_task_context("lift", 0, world, episode_seconds=1.2)
+    interface = OptimalBiasPlainInterface()
+
+    completion = complete_for_interface(interface, ctx, world, backend="mock")
+
+    assert completion.ok
+    program = interface.parse(completion.text)
+    trace = program.source["recursive_trace"]
+    assert trace["reasoning_bias"]["style"] == "plain"
+    assert "reward_biases" in trace["reasoning_bias"]
+    validation = interface.validate(program, SafetyLimits(max_episode_seconds=1.2))
+    assert validation.ok, validation.errors
+    compiled = interface.compile(program, ctx, world, env)
+    assert compiled.interface == "optimal_bias_plain"
+    assert compiled.metadata["recursive_trace"]["reasoning_bias"]["style"] == "plain"
+
+
+def test_optimal_bias_guided_prompt_requests_pedagogical_strategy_and_rewards() -> None:
+    world = fake_world()
+    ctx = build_task_context("lift", 0, world, episode_seconds=1.2)
+
+    prompt = OptimalBiasGuidedInterface().build_prompt(ctx, world)
+
+    assert "optimal approach at the relevant abstraction levels" in prompt
+    assert "pedagogically" in prompt
+    assert "Strategy memory" in prompt
+    assert "reward-shaping terms" in prompt
+    assert "policy-initialization constraints" in prompt
+    assert "Do not emit robot actions" in prompt
+
+
+def test_reasoned_bias_interfaces_are_registered() -> None:
+    assert interface_by_name("optimal_bias_plain").name == "optimal_bias_plain"
+    assert interface_by_name("optimal_bias_guided").name == "optimal_bias_guided"
 
 
 def test_recursive_units_sorts_phase_blocks_before_compile() -> None:

@@ -46,17 +46,22 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
     def parse(self, text: str) -> CandidateProgram:
         return _normalize_candidate(parse_json_program(text, interface=self.name))
 
-    def mock_response(self, ctx: TaskContext, state: WorldState) -> str:
+    def mock_response(self, ctx: TaskContext, state: WorldState, reasoning_bias: dict[str, Any] | None = None) -> str:
         units = fundamental_units(state)
         unit_policies = [_mock_unit_policy(unit, ctx, state) for unit in units]
         blocks = _scheduled_blocks([block for policy in unit_policies for block in policy["blocks"]])
-        return json.dumps({
+        recursive_trace: dict[str, Any] = {
             "recursive_trace": {
                 "top": {"command": ctx.goal, "units": units},
                 "phase_schedule": _default_phase_schedule(ctx),
                 "unit_policies": unit_policies,
                 "compiler": "mock concatenation of lowest-level unit blocks",
             },
+        }
+        if reasoning_bias:
+            recursive_trace["recursive_trace"]["reasoning_bias"] = reasoning_bias
+        return json.dumps({
+            **recursive_trace,
             "blocks": blocks + [{"op": "return", "status": "done"}],
         })
 
@@ -70,14 +75,28 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
         log_dir: Path | None,
         tag: str,
     ) -> LLMCallResult:
+        return self._complete_with_llm(ctx, state, backend=backend, model=model, log_dir=log_dir, tag=tag)
+
+    def _complete_with_llm(
+        self,
+        ctx: TaskContext,
+        state: WorldState,
+        *,
+        backend: str,
+        model: str | None,
+        log_dir: Path | None,
+        tag: str,
+        reasoning_bias: dict[str, Any] | None = None,
+        initial_calls: list[dict[str, Any]] | None = None,
+    ) -> LLMCallResult:
         if backend == "mock":
-            return LLMCallResult(text=self.mock_response(ctx, state), ok=True, error=None, source="mock")
+            return LLMCallResult(text=self.mock_response(ctx, state, reasoning_bias=reasoning_bias), ok=True, error=None, source="mock")
         units = fundamental_units(state)
-        calls: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = list(initial_calls or [])
 
         top = _call_json(
             backend,
-            _top_prompt(ctx, state),
+            _top_prompt(ctx, state, reasoning_bias=reasoning_bias),
             model=model,
             log_dir=log_dir,
             tag=f"{tag}_top",
@@ -93,7 +112,7 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
         unit_commands = _unit_commands(top_obj, units, ctx.goal)
         unit_policies = []
         for unit in units:
-            prompt = _unit_prompt(ctx, state, unit, unit_commands[unit])
+            prompt = _unit_prompt(ctx, state, unit, unit_commands[unit], reasoning_bias=reasoning_bias)
             response = _call_json(
                 backend,
                 prompt,
@@ -117,9 +136,11 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
             "unit_commands": [{"unit": unit, "command": unit_commands[unit]} for unit in units],
             "unit_policies": unit_policies,
         }
+        if reasoning_bias:
+            compiler_input["reasoning_bias"] = reasoning_bias
         final = _call_json(
             backend,
-            _compiler_prompt(ctx, state, compiler_input),
+            _compiler_prompt(ctx, state, compiler_input, reasoning_bias=reasoning_bias),
             model=model,
             log_dir=log_dir,
             tag=f"{tag}_compiler",
@@ -131,7 +152,10 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
             final_obj = _json(final.text)
         except ParseError as exc:
             return LLMCallResult(text=final.text, ok=False, error=str(exc), source=backend, metadata={"calls": calls})
-        final_obj.setdefault("recursive_trace", compiler_input)
+        if not isinstance(final_obj.get("recursive_trace"), dict):
+            final_obj["recursive_trace"] = compiler_input
+        if reasoning_bias:
+            final_obj["recursive_trace"]["reasoning_bias"] = reasoning_bias
         final_obj["blocks"] = _scheduled_blocks(final_obj.get("blocks", []))
         return LLMCallResult(
             text=json.dumps(final_obj, indent=2),
@@ -193,7 +217,7 @@ class RecursiveUnitsInterface(ScriptDSLInterface):
         return LLMCallResult(text=json.dumps(repaired, indent=2), ok=True, error=None, source=backend)
 
 
-def _top_prompt(ctx: TaskContext, state: WorldState) -> str:
+def _top_prompt(ctx: TaskContext, state: WorldState, reasoning_bias: dict[str, Any] | None = None) -> str:
     units = fundamental_units(state)
     return (
         "You are the top-level policy decomposition agent for a Shadow-style dexterous hand.\n"
@@ -219,10 +243,11 @@ def _top_prompt(ctx: TaskContext, state: WorldState) -> str:
         f"Task context: {json.dumps(ctx.compact(), indent=2)}\n"
         f"Fundamental units: {json.dumps(units)}\n"
         f"World and derived context: {json.dumps(state.compact(), indent=2)}\n"
+        f"{_reasoning_bias_section(reasoning_bias)}"
     )
 
 
-def _unit_prompt(ctx: TaskContext, state: WorldState, unit: str, command: str) -> str:
+def _unit_prompt(ctx: TaskContext, state: WorldState, unit: str, command: str, reasoning_bias: dict[str, Any] | None = None) -> str:
     return (
         f"You are the subagent for the `{unit}` fundamental unit only.\n"
         "Use the actual world-coordinate frames in the context. If this unit is `base`, "
@@ -247,10 +272,16 @@ def _unit_prompt(ctx: TaskContext, state: WorldState, unit: str, command: str) -
         f"Relevant unit schema: {json.dumps(schema_for_unit(state, unit), indent=2)}\n"
         f"Derived context: {json.dumps(state.derived, indent=2)}\n"
         f"Object/base context: {json.dumps({'object_pos': state.object_pos.round(4).tolist(), 'base_q': state.base_q.round(4).tolist()}, indent=2)}\n"
+        f"{_reasoning_bias_section(reasoning_bias)}"
     )
 
 
-def _compiler_prompt(ctx: TaskContext, state: WorldState, compiler_input: dict[str, Any]) -> str:
+def _compiler_prompt(
+    ctx: TaskContext,
+    state: WorldState,
+    compiler_input: dict[str, Any],
+    reasoning_bias: dict[str, Any] | None = None,
+) -> str:
     return (
         "You are the final compiler agent. Combine all unit policies into one executable JSON "
         "policy for the robot. Preserve recursive_trace. Use only lowest-level blocks. "
@@ -276,6 +307,7 @@ def _compiler_prompt(ctx: TaskContext, state: WorldState, compiler_input: dict[s
         f"Required phase schedule: {json.dumps(_default_phase_schedule(ctx), indent=2)}\n"
         f"Actuator schema: {json.dumps(state.joint_schema, indent=2)}\n"
         f"Input traces and unit policies: {json.dumps(compiler_input, indent=2)}\n"
+        f"{_reasoning_bias_section(reasoning_bias)}"
     )
 
 
@@ -321,6 +353,16 @@ def _previous_result_payload(previous_result: Any) -> dict[str, Any]:
     row = previous_result.row() if hasattr(previous_result, "row") else {}
     payload = {"row": row}
     return payload
+
+
+def _reasoning_bias_section(reasoning_bias: dict[str, Any] | None) -> str:
+    if not reasoning_bias:
+        return ""
+    return (
+        "\nReasoning-bias context from the strategy agent. Treat this as an inductive "
+        "bias for policy exploration, not as an executable primitive list:\n"
+        f"{json.dumps(reasoning_bias, indent=2)}\n"
+    )
 
 
 def _unit_commands(top_obj: dict[str, Any], units: list[str], goal: str) -> dict[str, str]:

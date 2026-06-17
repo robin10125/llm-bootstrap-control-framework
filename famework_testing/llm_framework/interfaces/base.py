@@ -46,4 +46,12 @@ def interface_by_name(name: str) -> ControlInterface:
         from llm_framework.interfaces.recursive_units import RecursiveUnitsInterface
 
         return RecursiveUnitsInterface()
+    if name == "optimal_bias_plain":
+        from llm_framework.interfaces.reasoned_bias import OptimalBiasPlainInterface
+
+        return OptimalBiasPlainInterface()
+    if name == "optimal_bias_guided":
+        from llm_framework.interfaces.reasoned_bias import OptimalBiasGuidedInterface
+
+        return OptimalBiasGuidedInterface()
     raise KeyError(f"unknown interface {name!r}")
