@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import pickle
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Avoid JAX reserving most of an 8 GB GPU before MJX has even built the model.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
 import jax
 

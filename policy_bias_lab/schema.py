@@ -47,11 +47,9 @@ def default_bias_spec(task: str = "multi") -> dict[str, Any]:
         "name": f"default_{task}_shadow_bias",
         "description": "Bias gross pose before contact, contact before transport, and stabilize after progress.",
         "reward_terms": [
-            {"name": "reach", "observable": "palm_obj_dist", "direction": "minimize", "weight": 1.0, "scale": 0.12},
-            {"name": "finger_near", "observable": "min_finger_dist", "direction": "minimize", "weight": 0.5, "scale": 0.08},
-            {"name": "contact", "observable": "n_contacts", "direction": "maximize", "weight": 0.8, "scale": 3.0},
-            {"name": "lift_or_progress", "observable": "lift", "direction": "maximize", "weight": 1.2, "scale": 0.08},
-            {"name": "avoid_knockaway", "observable": "obj_xy_disp", "direction": "minimize", "weight": 0.2, "scale": 0.10},
+            {"name": "finger_near_progress", "observable": "min_finger_dist", "direction": "minimize", "weight": 0.35, "scale": 0.08, "tasks": ["lift"]},
+            {"name": "contact_progress", "observable": "n_contacts", "direction": "maximize", "weight": 0.35, "scale": 3.0, "tasks": ["lift"]},
+            {"name": "avoid_knockaway_progress", "observable": "obj_xy_disp", "direction": "minimize", "weight": 0.20, "scale": 0.10, "tasks": ["lift"]},
         ],
         "action_priors": [
             {"name": "center_grasp_frame", "group": "base_xy", "direction": "toward_object_xy", "weight": 0.7},
@@ -98,6 +96,12 @@ def validate_bias_spec(spec: dict[str, Any]) -> ValidationResult:
             errors.append(f"reward_terms[{i}] direction must be minimize|maximize")
         _numeric(term, "weight", f"reward_terms[{i}]", errors, default_ok=False)
         _numeric(term, "scale", f"reward_terms[{i}]", errors, default_ok=True)
+        _numeric(term, "max_step", f"reward_terms[{i}]", errors, default_ok=True)
+        tasks = term.get("tasks")
+        if tasks is not None and (
+            not isinstance(tasks, list) or not all(isinstance(item, str) for item in tasks)
+        ):
+            errors.append(f"reward_terms[{i}].tasks must be a list of strings")
 
     for section in ("action_priors", "supervised_targets"):
         for i, prior in enumerate(spec.get(section, [])):

@@ -1,0 +1,352 @@
+from __future__ import annotations
+
+import pickle
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import jax
+import jax.numpy as jp
+import optax
+
+BOOTSTRAPPING = Path(__file__).resolve().parents[2] / "bootstrapping"
+if str(BOOTSTRAPPING) not in sys.path:
+    sys.path.insert(0, str(BOOTSTRAPPING))
+
+import ppo
+
+from policy_bias_lab.bias import CompiledBias
+from policy_bias_lab.es import BIAS_ARMS
+
+
+@dataclass(frozen=True)
+class PPOBiasConfig:
+    iters: int = 300
+    envs: int = 1024
+    lr: float = 3e-4
+    gamma: float = 0.99
+    lam: float = 0.95
+    hidden: tuple[int, ...] = (256, 256)
+    ent_coef: float = 0.0
+    supervised_steps: int = 80
+    supervised_batch: int = 128
+    supervised_lr: float = 1e-3
+    checkpoint_count: int = 5
+    target_train_seconds: float | None = None
+
+
+def train_ppo_arm(
+    *,
+    env: Any,
+    bias: CompiledBias,
+    task: str,
+    arm: str,
+    seed: int,
+    cfg: PPOBiasConfig,
+    checkpoint_dir: Path | None = None,
+) -> tuple[Any, list[dict[str, Any]]]:
+    use_reward_bias, use_action_prior, use_exploration_bias, use_supervised_init = BIAS_ARMS[arm]
+    key = jax.random.PRNGKey(seed)
+    key, nk = jax.random.split(key)
+    net, params = ppo.init_params(nk, env.obs_size, env.action_size, cfg.hidden)
+    optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(cfg.lr))
+    opt_state = optimizer.init(params)
+
+    if use_supervised_init:
+        key, sk = jax.random.split(key)
+        params = supervised_pretrain(net, env, params, bias, task, sk, cfg)
+        opt_state = optimizer.init(params)
+
+    reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
+    collect = make_collect(
+        env=env,
+        net=net,
+        bias=bias,
+        task=task,
+        use_reward_bias=use_reward_bias,
+        use_action_prior=use_action_prior,
+        use_exploration_bias=use_exploration_bias,
+    )
+    update = make_update(
+        net=net,
+        optimizer=optimizer,
+        bias=bias,
+        task=task,
+        use_action_prior=use_action_prior,
+        use_exploration_bias=use_exploration_bias,
+        ent_coef=cfg.ent_coef,
+    )
+    checkpoint_iters = _checkpoint_iters(cfg.iters, cfg.checkpoint_count)
+    checkpoint_times = _checkpoint_times(cfg.target_train_seconds, cfg.checkpoint_count)
+    saved_time_checkpoints: set[int] = set()
+    rows: list[dict[str, Any]] = []
+
+    if cfg.target_train_seconds is not None:
+        key, rk, ck, uk = jax.random.split(key, 4)
+        state = reset(jax.random.split(rk, cfg.envs))
+        warmup_state, warmup_traj, warmup_last_value, _warmup_summary = collect(params, state, ck)
+        obs, action, logp, value, train_reward, _success, _lift, _base_reward, _shaped_reward = warmup_traj
+        adv, ret = ppo.compute_gae(train_reward, value, warmup_last_value, cfg.gamma, cfg.lam)
+        flat = lambda x: x.reshape((-1,) + x.shape[2:])
+        warmup_data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
+        warmup_params, _warmup_opt_state, _warmup_metrics = update(params, opt_state, warmup_data, uk)
+        warmup_state.reward.block_until_ready()
+        warmup_last_value.block_until_ready()
+        jax.block_until_ready(warmup_params)
+
+    start = time.monotonic()
+    for it in range(cfg.iters):
+        if cfg.target_train_seconds is not None and it > 0 and time.monotonic() - start >= cfg.target_train_seconds:
+            break
+        key, rk, ck, uk = jax.random.split(key, 4)
+        state = reset(jax.random.split(rk, cfg.envs))
+        state, traj, last_value, eval_summary = collect(params, state, ck)
+        obs, action, logp, value, train_reward, success, lift, base_reward, shaped_reward = traj
+        adv, ret = ppo.compute_gae(train_reward, value, last_value, cfg.gamma, cfg.lam)
+        flat = lambda x: x.reshape((-1,) + x.shape[2:])
+        data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
+        params, opt_state, metrics = update(params, opt_state, data, uk)
+        jax.block_until_ready(params)
+        elapsed = time.monotonic() - start
+        due_time_checkpoints = {
+            idx for idx, seconds in checkpoint_times.items()
+            if idx not in saved_time_checkpoints and elapsed >= seconds
+        }
+        if checkpoint_dir is not None and ((it + 1) in checkpoint_iters or due_time_checkpoints):
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            params_for_disk = jax.device_get(params)
+            if due_time_checkpoints:
+                for idx in sorted(due_time_checkpoints):
+                    with (checkpoint_dir / f"params_t{idx:02d}_iter{it + 1:04d}.pkl").open("wb") as f:
+                        pickle.dump(params_for_disk, f)
+                saved_time_checkpoints.update(due_time_checkpoints)
+            elif (it + 1) in checkpoint_iters:
+                with (checkpoint_dir / f"params_t{checkpoint_iters[it + 1]:02d}_iter{it + 1:04d}.pkl").open("wb") as f:
+                    pickle.dump(params_for_disk, f)
+        rows.append({
+            "iter": it,
+            "arm": arm,
+            "task": task,
+            "train_return": round(float(train_reward.sum(axis=0).mean()), 6),
+            "base_return": round(float(base_reward.sum(axis=0).mean()), 6),
+            "shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
+            "success": round(float((success.max(axis=0) > 0.5).mean()), 6),
+            "lift_max": round(float(lift.max(axis=0).mean()), 6),
+            "pg_loss": round(float(metrics["pg_loss"]), 6),
+            "v_loss": round(float(metrics["v_loss"]), 6),
+            "entropy": round(float(metrics["entropy"]), 6),
+            "approx_kl": round(float(metrics["approx_kl"]), 6),
+            "elapsed_seconds": round(elapsed, 3),
+        })
+    if checkpoint_dir is not None and cfg.checkpoint_count > 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        with (checkpoint_dir / f"params_t{cfg.checkpoint_count:02d}_final.pkl").open("wb") as f:
+            pickle.dump(jax.device_get(params), f)
+    return params, rows
+
+
+def evaluate_ppo_policy(
+    *,
+    env: Any,
+    params: Any,
+    bias: CompiledBias,
+    task: str,
+    arm: str,
+    seed: int,
+    n_envs: int,
+) -> dict[str, Any]:
+    use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
+    net = ppo.ActorCritic(action_dim=env.action_size, hidden=_infer_hidden(params))
+    reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
+    collect = make_collect(
+        env=env,
+        net=net,
+        bias=bias,
+        task=task,
+        use_reward_bias=use_reward_bias,
+        use_action_prior=use_action_prior,
+        use_exploration_bias=use_exploration_bias,
+        deterministic=True,
+    )
+    state = reset(jax.random.split(jax.random.PRNGKey(seed), n_envs))
+    _state, traj, _last_value, eval_summary = collect(params, state, jax.random.PRNGKey(seed + 1))
+    _obs, _action, _logp, _value, train_reward, success, lift, base_reward, shaped_reward = traj
+    return {
+        "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
+        "eval_shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
+        "eval_train_return": round(float(train_reward.sum(axis=0).mean()), 6),
+        "eval_success_rate": round(float((success.max(axis=0) > 0.5).mean()), 6),
+        "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
+        "eval_summary": [round(float(x), 6) for x in jp.mean(eval_summary, axis=0)],
+    }
+
+
+def make_collect(
+    *,
+    env: Any,
+    net: Any,
+    bias: CompiledBias,
+    task: str,
+    use_reward_bias: bool,
+    use_action_prior: bool,
+    use_exploration_bias: bool,
+    deterministic: bool = False,
+):
+    step_fn = jax.vmap(env.step)
+    noise_scale = jp.clip(bias.noise_scale, 0.1, 4.0)
+
+    def policy_dist(params, obs):
+        mean, log_std, value = net.apply(params, obs)
+        if use_action_prior:
+            prior = jax.vmap(lambda o: bias.action_prior(o, task))(obs)
+            mean = mean + prior
+        if use_exploration_bias:
+            log_std = log_std + jp.log(noise_scale)
+        return mean, jp.clip(log_std, -5.0, 2.0), value
+
+    def collect(params, state, key):
+        def body(carry, _):
+            state, key = carry
+            key, ak = jax.random.split(key)
+            mean, log_std, value = policy_dist(params, state.obs)
+            if deterministic:
+                action = mean
+            else:
+                action = mean + jp.exp(log_std) * jax.random.normal(ak, mean.shape)
+            logp = ppo.gaussian_logp(action, mean, log_std)
+            prev_eval = state.metrics["eval"]
+            nstate = step_fn(state, action)
+            base_reward = nstate.reward
+            shaped = jp.zeros_like(base_reward)
+            if use_reward_bias:
+                shaped = jax.vmap(lambda pe, ev: bias.shaped_reward(pe, ev, task))(prev_eval, nstate.metrics["eval"])
+                shaped = shaped + jax.vmap(lambda o, a: bias.action_target_reward(o, a, task))(state.obs, action)
+            train_reward = base_reward + shaped
+            return (nstate, key), (state.obs, action, logp, value, train_reward,
+                                   nstate.metrics["success"], nstate.metrics["lift"],
+                                   base_reward, shaped,
+                                   nstate.metrics["eval"])
+
+        (state, key), traj = jax.lax.scan(body, (state, key), None, length=env.horizon)
+        _, _, last_value = net.apply(params, state.obs)
+        eval_summary = jax.vmap(lambda x: jp.asarray([
+            x[:, 0].min(), x[:, 1].min(), x[:, 2].max(), x[:, 3].max(), x[:, 4].max(), x[:, 5].max()
+        ]), in_axes=1)(traj[9])
+        return state, traj[:9], last_value, eval_summary
+
+    return jax.jit(collect)
+
+
+def make_update(
+    *,
+    net: Any,
+    optimizer: Any,
+    bias: CompiledBias,
+    task: str,
+    use_action_prior: bool,
+    use_exploration_bias: bool,
+    ent_coef: float,
+):
+    noise_scale = jp.clip(bias.noise_scale, 0.1, 4.0)
+
+    def evaluate(params, obs, action):
+        mean, log_std, value = net.apply(params, obs)
+        if use_action_prior:
+            prior = jax.vmap(lambda o: bias.action_prior(o, task))(obs)
+            mean = mean + prior
+        if use_exploration_bias:
+            log_std = log_std + jp.log(noise_scale)
+        log_std = jp.clip(log_std, -5.0, 2.0)
+        return ppo.gaussian_logp(action, mean, log_std), ppo.gaussian_entropy(log_std), value
+
+    def loss_fn(params, batch):
+        obs, action, old_logp, adv, ret = batch
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        logp, ent, value = evaluate(params, obs, action)
+        ratio = jp.exp(logp - old_logp)
+        pg_loss = -jp.minimum(ratio * adv, jp.clip(ratio, 0.8, 1.2) * adv).mean()
+        v_loss = 0.5 * ((value - ret) ** 2).mean()
+        loss = pg_loss + 0.5 * v_loss - ent_coef * ent.mean()
+        return loss, {
+            "pg_loss": pg_loss,
+            "v_loss": v_loss,
+            "entropy": ent.mean(),
+            "approx_kl": jp.mean(old_logp - logp),
+        }
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+
+    def update(params, opt_state, data, key):
+        b = data[0].shape[0]
+        num_minibatches = min(8, b)
+        mb = max(1, b // num_minibatches)
+
+        def epoch(carry, _):
+            params, opt_state, key = carry
+            key, pk = jax.random.split(key)
+            perm = jax.random.permutation(pk, b)
+
+            def minibatch(carry, idx):
+                params, opt_state = carry
+                sl = jax.lax.dynamic_slice_in_dim(perm, idx * mb, mb)
+                batch = tuple(jp.take(x, sl, axis=0) for x in data)
+                (_loss, metrics), grads = grad_fn(params, batch)
+                updates, opt_state = optimizer.update(grads, opt_state, params)
+                params = optax.apply_updates(params, updates)
+                return (params, opt_state), metrics
+
+            (params, opt_state), metrics = jax.lax.scan(minibatch, (params, opt_state), jp.arange(num_minibatches))
+            return (params, opt_state, key), metrics
+
+        (params, opt_state, _key), metrics = jax.lax.scan(epoch, (params, opt_state, key), None, length=4)
+        return params, opt_state, jax.tree_util.tree_map(lambda x: x.mean(), metrics)
+
+    return jax.jit(update)
+
+
+def supervised_pretrain(net, env: Any, params: Any, bias: CompiledBias, task: str, key, cfg: PPOBiasConfig):
+    reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
+    optimizer = optax.adam(cfg.supervised_lr)
+    opt_state = optimizer.init(params)
+
+    def loss_fn(p, obs):
+        target = jax.vmap(lambda o: bias.supervised_target(o, task))(obs)
+        mean, _log_std, _value = net.apply(p, obs)
+        return jp.mean((jp.tanh(mean) - target) ** 2)
+
+    grad_fn = jax.value_and_grad(loss_fn)
+    for _ in range(cfg.supervised_steps):
+        key, rk = jax.random.split(key)
+        state = reset(jax.random.split(rk, cfg.supervised_batch))
+        loss, grads = grad_fn(params, state.obs)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+    loss.block_until_ready()
+    return params
+
+
+def _checkpoint_iters(iters: int, count: int) -> dict[int, int]:
+    if iters <= 0 or count <= 0:
+        return {}
+    return {max(1, min(iters, round(iters * idx / count))): idx for idx in range(1, count + 1)}
+
+
+def _checkpoint_times(seconds: float | None, count: int) -> dict[int, float]:
+    if seconds is None or seconds <= 0 or count <= 0:
+        return {}
+    return {idx: seconds * idx / count for idx in range(1, count + 1)}
+
+
+def _infer_hidden(params: Any) -> tuple[int, ...]:
+    action_dim = int(params["params"]["log_std"].shape[0])
+    hidden: list[int] = []
+    idx = 0
+    while f"Dense_{idx}" in params["params"]:
+        width = int(params["params"][f"Dense_{idx}"]["kernel"].shape[1])
+        if width == action_dim:
+            break
+        hidden.append(width)
+        idx += 1
+    return tuple(hidden)

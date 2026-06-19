@@ -8,10 +8,10 @@ boundary from `../bootstrapping/mjx_env.py`.
 
 ## Arms
 
-- `baseline`: ES with task fitness only
-- `reward`: ES with LLM-shaped auxiliary rewards
-- `action_prior`: ES with LLM-derived action priors during rollout
-- `exploration`: ES with LLM-derived exploration covariance scaling
+- `baseline`: PPO with the environment reward only
+- `reward`: PPO with LLM-shaped auxiliary rewards
+- `action_prior`: PPO with LLM-derived action priors added to the actor mean
+- `exploration`: PPO with LLM-derived action-group exploration std scaling
 - `supervised_init`: behavior-cloning initialization from LLM-derived target rules
 - `reward_action_prior`: reward shaping plus action priors
 - `full`: reward shaping plus action priors plus supervised initialization
@@ -19,24 +19,37 @@ boundary from `../bootstrapping/mjx_env.py`.
 ## Smoke
 
 ```bash
-../bootstrapping/.venv/bin/python -m policy_bias_lab.run_experiment \
-  --llm-backend fixture --smoke --tasks lift --arms baseline,reward \
-  --out runs/policy_bias_lab_smoke
+../bootstrapping/.venv/bin/python -m policy_bias_lab.run_ppo_experiment \
+  --llm-backend fixture --tasks lift --arms baseline,reward \
+  --iters 1 --envs 16 --eval-envs 16 --episode-seconds 0.1 \
+  --out runs/policy_bias_ppo_smoke
 ```
 
 ## Real Run
 
 ```bash
-../bootstrapping/.venv/bin/python -m policy_bias_lab.run_experiment \
-  --llm-backend codex --tasks lift,push,stabilize \
+../bootstrapping/.venv/bin/python -m policy_bias_lab.run_ppo_experiment \
+  --llm-backend codex --tasks lift \
   --arms baseline,reward,action_prior,exploration,supervised_init \
-  --seeds 0,1,2 --generations 80 --population 64 --envs 64 \
-  --out runs/policy_bias_lab_shadow_isolation
+  --seeds 0 --iters 300 --envs 1024 --eval-envs 1024 \
+  --episode-seconds 2.5 --control-dt 0.025 \
+  --out runs/policy_bias_ppo_shadow_lift
 ```
 
 Add `reward_action_prior,full` to `--arms` only when testing combined effects after
 the isolated comparisons.
 
-For Shadow/MJX memory safety, ES candidates are evaluated one at a time over a vmapped
-environment batch. This avoids compiling a `candidate x env` physics graph, which can
-exceed 8 GB GPU memory even when the final environment state tensors are small.
+`run_experiment.py` is retained as the legacy ES runner. It is useful for narrow
+optimizer diagnostics, but it is not the right learner for the main actor-critic
+experiment because PPO learns from one policy collecting many parallel rollouts.
+
+Shadow/MJX memory safety now comes from `../bootstrapping/mjx_env.py`: large colliding
+distal fingertip meshes are replaced with primitive collision proxies while visual
+meshes, joints, actuators, tendons, and object dynamics remain intact. This allows PPO
+to run thousands of parallel Shadow environments on an 8 GB GPU.
+
+Reward-shaping terms are compiled as bounded potential-progress terms, not absolute
+per-step rewards. For the lift task, overlapping env-reward terms (`palm_obj_dist`,
+`closure`, `lift`) and contradictory terms such as maximizing `obj_xy_disp` are discarded.
+Metrics report `base_return`, `shaped_return`, and `train_return`; compare arms with the
+held-out base return and success/lift metrics.

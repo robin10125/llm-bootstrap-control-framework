@@ -152,6 +152,10 @@ def train_arm(
             "elapsed_train_seconds": round(elapsed, 3),
         })
         gen += 1
+    if checkpoint_dir is not None and cfg.target_train_seconds is not None and checkpoint_count > 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        with (checkpoint_dir / f"params_t{checkpoint_count:02d}_final.pkl").open("wb") as f:
+            pickle.dump(jax.device_get(unflatten_params(flat, shapes)), f)
     return unflatten_params(flat, shapes), metrics
 
 
@@ -182,11 +186,12 @@ def make_candidate_evaluator(
             else:
                 priors = jp.zeros((n_envs, env.action_size), dtype=jp.float32)
             actions = jax.vmap(apply_policy, in_axes=(None, 0, 0))(params, cur_state.obs, priors)
+            prev_eval = cur_state.metrics["eval"]
             nxt = step(cur_state, actions)
             eval_vec = nxt.metrics["eval"]
             reward = task_fitness(task, eval_vec)
             if use_reward_bias:
-                shaped = jax.vmap(lambda ev: bias.shaped_reward(ev, task))(eval_vec)
+                shaped = jax.vmap(lambda pe, ev: bias.shaped_reward(pe, ev, task))(prev_eval, eval_vec)
                 reward = reward + shaped
             mins = jp.minimum(mins, eval_vec)
             maxs = jp.maximum(maxs, eval_vec)
@@ -229,11 +234,12 @@ def rollout_policy(
         else:
             priors = jp.zeros((n_envs, env.action_size), dtype=jp.float32)
         actions = jax.vmap(apply_policy, in_axes=(None, 0, 0))(params, state.obs, priors)
+        prev_eval = state.metrics["eval"]
         state = step(state, actions)
         eval_vec = state.metrics["eval"]
         base_reward = task_fitness(task, eval_vec)
         if use_reward_bias:
-            shaped = jax.vmap(lambda ev: bias.shaped_reward(ev, task))(eval_vec)
+            shaped = jax.vmap(lambda pe, ev: bias.shaped_reward(pe, ev, task))(prev_eval, eval_vec)
             base_reward = base_reward + shaped
         reward_sum = reward_sum + base_reward
         mins = jp.minimum(mins, eval_vec)
