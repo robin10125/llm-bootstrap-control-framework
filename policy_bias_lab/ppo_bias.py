@@ -35,6 +35,10 @@ class PPOBiasConfig:
     supervised_lr: float = 1e-3
     checkpoint_count: int = 5
     target_train_seconds: float | None = None
+    action_transform: str = "tanh"
+    saturation_penalty: float = 0.0
+    saturation_threshold: float = 0.98
+    prior_logit_clip: float = 0.95
 
 
 def train_ppo_arm(
@@ -68,6 +72,10 @@ def train_ppo_arm(
         use_reward_bias=use_reward_bias,
         use_action_prior=use_action_prior,
         use_exploration_bias=use_exploration_bias,
+        action_transform=cfg.action_transform,
+        saturation_penalty=cfg.saturation_penalty,
+        saturation_threshold=cfg.saturation_threshold,
+        prior_logit_clip=cfg.prior_logit_clip,
     )
     update = make_update(
         net=net,
@@ -77,6 +85,8 @@ def train_ppo_arm(
         use_action_prior=use_action_prior,
         use_exploration_bias=use_exploration_bias,
         ent_coef=cfg.ent_coef,
+        action_transform=cfg.action_transform,
+        prior_logit_clip=cfg.prior_logit_clip,
     )
     checkpoint_iters = _checkpoint_iters(cfg.iters, cfg.checkpoint_count)
     checkpoint_times = _checkpoint_times(cfg.target_train_seconds, cfg.checkpoint_count)
@@ -87,7 +97,7 @@ def train_ppo_arm(
         key, rk, ck, uk = jax.random.split(key, 4)
         state = reset(jax.random.split(rk, cfg.envs))
         warmup_state, warmup_traj, warmup_last_value, _warmup_summary = collect(params, state, ck)
-        obs, action, logp, value, train_reward, _success, _lift, _base_reward, _shaped_reward = warmup_traj
+        obs, action, logp, value, train_reward, _success, _lift, _base_reward, _shaped_reward, *_ = warmup_traj
         adv, ret = ppo.compute_gae(train_reward, value, warmup_last_value, cfg.gamma, cfg.lam)
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
         warmup_data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
@@ -103,7 +113,8 @@ def train_ppo_arm(
         key, rk, ck, uk = jax.random.split(key, 4)
         state = reset(jax.random.split(rk, cfg.envs))
         state, traj, last_value, eval_summary = collect(params, state, ck)
-        obs, action, logp, value, train_reward, success, lift, base_reward, shaped_reward = traj
+        (obs, action, logp, value, train_reward, success, lift, base_reward,
+         shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean) = traj
         adv, ret = ppo.compute_gae(train_reward, value, last_value, cfg.gamma, cfg.lam)
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
         data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
@@ -134,6 +145,9 @@ def train_ppo_arm(
             "shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
             "success": round(float((success.max(axis=0) > 0.5).mean()), 6),
             "lift_max": round(float(lift.max(axis=0).mean()), 6),
+            "hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
+            "saturation_frac": round(float(saturation_frac.mean()), 6),
+            "action_abs_mean": round(float(action_abs_mean.mean()), 6),
             "pg_loss": round(float(metrics["pg_loss"]), 6),
             "v_loss": round(float(metrics["v_loss"]), 6),
             "entropy": round(float(metrics["entropy"]), 6),
@@ -156,6 +170,7 @@ def evaluate_ppo_policy(
     arm: str,
     seed: int,
     n_envs: int,
+    cfg: PPOBiasConfig | None = None,
 ) -> dict[str, Any]:
     use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=_infer_hidden(params))
@@ -169,16 +184,23 @@ def evaluate_ppo_policy(
         use_action_prior=use_action_prior,
         use_exploration_bias=use_exploration_bias,
         deterministic=True,
+        action_transform=cfg.action_transform if cfg is not None else "tanh",
+        saturation_threshold=cfg.saturation_threshold if cfg is not None else 0.98,
+        prior_logit_clip=cfg.prior_logit_clip if cfg is not None else 0.95,
     )
     state = reset(jax.random.split(jax.random.PRNGKey(seed), n_envs))
     _state, traj, _last_value, eval_summary = collect(params, state, jax.random.PRNGKey(seed + 1))
-    _obs, _action, _logp, _value, train_reward, success, lift, base_reward, shaped_reward = traj
+    (_obs, _action, _logp, _value, train_reward, success, lift, base_reward,
+     shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean) = traj
     return {
         "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
         "eval_shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
         "eval_train_return": round(float(train_reward.sum(axis=0).mean()), 6),
         "eval_success_rate": round(float((success.max(axis=0) > 0.5).mean()), 6),
         "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
+        "eval_hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
+        "eval_saturation_frac": round(float(saturation_frac.mean()), 6),
+        "eval_action_abs_mean": round(float(action_abs_mean.mean()), 6),
         "eval_summary": [round(float(x), 6) for x in jp.mean(eval_summary, axis=0)],
     }
 
@@ -193,6 +215,10 @@ def make_collect(
     use_action_prior: bool,
     use_exploration_bias: bool,
     deterministic: bool = False,
+    action_transform: str = "tanh",
+    saturation_penalty: float = 0.0,
+    saturation_threshold: float = 0.98,
+    prior_logit_clip: float = 0.95,
 ):
     step_fn = jax.vmap(env.step)
     noise_scale = jp.clip(bias.noise_scale, 0.1, 4.0)
@@ -201,6 +227,8 @@ def make_collect(
         mean, log_std, value = net.apply(params, obs)
         if use_action_prior:
             prior = jax.vmap(lambda o: bias.action_prior(o, task))(obs)
+            if action_transform == "tanh":
+                prior = _atanh_clipped(prior, prior_logit_clip)
             mean = mean + prior
         if use_exploration_bias:
             log_std = log_std + jp.log(noise_scale)
@@ -212,10 +240,19 @@ def make_collect(
             key, ak = jax.random.split(key)
             mean, log_std, value = policy_dist(params, state.obs)
             if deterministic:
-                action = mean
+                pre_action = mean
             else:
-                action = mean + jp.exp(log_std) * jax.random.normal(ak, mean.shape)
-            logp = ppo.gaussian_logp(action, mean, log_std)
+                pre_action = mean + jp.exp(log_std) * jax.random.normal(ak, mean.shape)
+            if action_transform == "tanh":
+                action = jp.tanh(pre_action)
+                logp = squashed_gaussian_logp(action, mean, log_std)
+            else:
+                action = pre_action
+                logp = ppo.gaussian_logp(action, mean, log_std)
+            env_action = jp.clip(action, -1.0, 1.0)
+            hard_clip_frac = jp.mean((jp.abs(action) > 1.0).astype(jp.float32), axis=-1)
+            saturation_frac = jp.mean((jp.abs(env_action) >= saturation_threshold).astype(jp.float32), axis=-1)
+            action_abs_mean = jp.mean(jp.abs(env_action), axis=-1)
             prev_eval = state.metrics["eval"]
             nstate = step_fn(state, action)
             base_reward = nstate.reward
@@ -223,18 +260,24 @@ def make_collect(
             if use_reward_bias:
                 shaped = jax.vmap(lambda pe, ev: bias.shaped_reward(pe, ev, task))(prev_eval, nstate.metrics["eval"])
                 shaped = shaped + jax.vmap(lambda o, a: bias.action_target_reward(o, a, task))(state.obs, action)
+            if saturation_penalty > 0.0:
+                excess = jp.maximum(jp.abs(env_action) - saturation_threshold, 0.0)
+                denom = jp.maximum(1.0 - saturation_threshold, 1e-6)
+                shaped = shaped - float(saturation_penalty) * jp.mean(excess / denom, axis=-1)
             train_reward = base_reward + shaped
             return (nstate, key), (state.obs, action, logp, value, train_reward,
                                    nstate.metrics["success"], nstate.metrics["lift"],
                                    base_reward, shaped,
+                                   hard_clip_frac, saturation_frac, action_abs_mean,
                                    nstate.metrics["eval"])
 
         (state, key), traj = jax.lax.scan(body, (state, key), None, length=env.horizon)
         _, _, last_value = net.apply(params, state.obs)
+        eval_traj = traj[12]
         eval_summary = jax.vmap(lambda x: jp.asarray([
             x[:, 0].min(), x[:, 1].min(), x[:, 2].max(), x[:, 3].max(), x[:, 4].max(), x[:, 5].max()
-        ]), in_axes=1)(traj[9])
-        return state, traj[:9], last_value, eval_summary
+        ]), in_axes=1)(eval_traj)
+        return state, traj[:12], last_value, eval_summary
 
     return jax.jit(collect)
 
@@ -248,6 +291,8 @@ def make_update(
     use_action_prior: bool,
     use_exploration_bias: bool,
     ent_coef: float,
+    action_transform: str = "tanh",
+    prior_logit_clip: float = 0.95,
 ):
     noise_scale = jp.clip(bias.noise_scale, 0.1, 4.0)
 
@@ -255,11 +300,17 @@ def make_update(
         mean, log_std, value = net.apply(params, obs)
         if use_action_prior:
             prior = jax.vmap(lambda o: bias.action_prior(o, task))(obs)
+            if action_transform == "tanh":
+                prior = _atanh_clipped(prior, prior_logit_clip)
             mean = mean + prior
         if use_exploration_bias:
             log_std = log_std + jp.log(noise_scale)
         log_std = jp.clip(log_std, -5.0, 2.0)
-        return ppo.gaussian_logp(action, mean, log_std), ppo.gaussian_entropy(log_std), value
+        if action_transform == "tanh":
+            logp = squashed_gaussian_logp(action, mean, log_std)
+        else:
+            logp = ppo.gaussian_logp(action, mean, log_std)
+        return logp, ppo.gaussian_entropy(log_std), value
 
     def loss_fn(params, batch):
         obs, action, old_logp, adv, ret = batch
@@ -304,6 +355,22 @@ def make_update(
         return params, opt_state, jax.tree_util.tree_map(lambda x: x.mean(), metrics)
 
     return jax.jit(update)
+
+
+def squashed_gaussian_logp(action: jp.ndarray, mean: jp.ndarray, log_std: jp.ndarray) -> jp.ndarray:
+    clipped = jp.clip(action, -0.999999, 0.999999)
+    raw = _atanh(clipped)
+    correction = jp.sum(jp.log(1.0 - clipped * clipped + 1e-6), axis=-1)
+    return ppo.gaussian_logp(raw, mean, log_std) - correction
+
+
+def _atanh_clipped(value: jp.ndarray, limit: float) -> jp.ndarray:
+    limit = float(min(max(limit, 0.0), 0.999999))
+    return _atanh(jp.clip(value, -limit, limit))
+
+
+def _atanh(value: jp.ndarray) -> jp.ndarray:
+    return 0.5 * (jp.log1p(value) - jp.log1p(-value))
 
 
 def supervised_pretrain(net, env: Any, params: Any, bias: CompiledBias, task: str, key, cfg: PPOBiasConfig):

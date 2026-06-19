@@ -189,6 +189,8 @@ def main() -> int:
     )
     bias = compile_bias(bias_spec, env)
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=tuple(config["ppo"]["hidden"]))
+    action_transform = str(config["ppo"].get("action_transform", "raw"))
+    prior_logit_clip = float(config["ppo"].get("prior_logit_clip", 0.95))
     out_dir = args.out or run_dir / "checkpoint_videos"
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, Any]] = []
@@ -203,7 +205,7 @@ def main() -> int:
             with ckpt.open("rb") as f:
                 params = pickle.load(f)
             attempts = [
-                rollout_stats(env, net, params, bias, arm, args.task, args.seed_base + i)
+                rollout_stats(env, net, params, bias, arm, args.task, args.seed_base + i, action_transform, prior_logit_clip)
                 for i in range(args.max_attempts)
             ]
             successes = [s for s in attempts if s.success]
@@ -217,7 +219,7 @@ def main() -> int:
                 if video_path.exists() and not args.overwrite:
                     pass
                 else:
-                    render_rollout(env, net, params, bias, arm, args.task, stats.seed, video_path, fps=args.fps, width=args.width, height=args.height)
+                    render_rollout(env, net, params, bias, arm, args.task, stats.seed, video_path, action_transform, prior_logit_clip, fps=args.fps, width=args.width, height=args.height)
                 rec = {
                     "arm": arm,
                     "checkpoint": label,
@@ -237,30 +239,60 @@ def main() -> int:
     return 0
 
 
-def policy_action(net: Any, params: Any, bias: CompiledBias, arm: str, task: str, obs: np.ndarray) -> np.ndarray:
+def policy_action(
+    net: Any,
+    params: Any,
+    bias: CompiledBias,
+    arm: str,
+    task: str,
+    obs: np.ndarray,
+    action_transform: str,
+    prior_logit_clip: float,
+) -> np.ndarray:
     use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
     del use_reward_bias, use_exploration_bias
     mean, _log_std, _value = net.apply(params, jp.asarray(obs[None, :]))
     action = mean[0]
     if use_action_prior:
-        action = action + bias.action_prior(jp.asarray(obs), task)
+        prior = bias.action_prior(jp.asarray(obs), task)
+        if action_transform == "tanh":
+            prior = _atanh_clipped(prior, prior_logit_clip)
+        action = action + prior
+    if action_transform == "tanh":
+        action = jp.tanh(action)
     return np.asarray(jp.clip(action, -1.0, 1.0), dtype=np.float32)
 
 
-def rollout_stats(env: CpuShadowEnv, net: Any, params: Any, bias: CompiledBias, arm: str, task: str, seed: int) -> RolloutStats:
+def rollout_stats(
+    env: CpuShadowEnv,
+    net: Any,
+    params: Any,
+    bias: CompiledBias,
+    arm: str,
+    task: str,
+    seed: int,
+    action_transform: str,
+    prior_logit_clip: float,
+) -> RolloutStats:
     obs = env.reset(seed)
     lift_max = -1e9
     total = 0.0
     success = False
     final_lift = 0.0
     for _ in range(env.horizon):
-        action = policy_action(net, params, bias, arm, task, obs)
+        action = policy_action(net, params, bias, arm, task, obs, action_transform, prior_logit_clip)
         obs, reward, metrics = env.step(action)
         total += reward
         final_lift = metrics["lift"]
         lift_max = max(lift_max, final_lift)
         success = success or bool(metrics["success"])
     return RolloutStats(seed=seed, success=success, lift_max=float(lift_max), base_return=float(total), final_lift=float(final_lift))
+
+
+def _atanh_clipped(value: jp.ndarray, limit: float) -> jp.ndarray:
+    limit = float(min(max(limit, 0.0), 0.999999))
+    clipped = jp.clip(value, -limit, limit)
+    return 0.5 * (jp.log1p(clipped) - jp.log1p(-clipped))
 
 
 def render_rollout(
@@ -272,6 +304,8 @@ def render_rollout(
     task: str,
     seed: int,
     video_path: Path,
+    action_transform: str,
+    prior_logit_clip: float,
     *,
     fps: int,
     width: int,
@@ -307,7 +341,7 @@ def render_rollout(
                 frame = np.asarray(renderer.render(), dtype=np.uint8)
                 assert proc.stdin is not None
                 proc.stdin.write(frame.tobytes())
-            action = policy_action(net, params, bias, arm, task, obs)
+            action = policy_action(net, params, bias, arm, task, obs, action_transform, prior_logit_clip)
             obs, _reward, _metrics = env.step(action)
         renderer.update_scene(env.data, camera=camera)
         frame = np.asarray(renderer.render(), dtype=np.uint8)

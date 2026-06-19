@@ -86,6 +86,10 @@ def main() -> int:
         supervised_lr=args.supervised_lr,
         checkpoint_count=args.checkpoint_count,
         target_train_seconds=target_train_seconds,
+        action_transform=args.action_transform,
+        saturation_penalty=args.saturation_penalty,
+        saturation_threshold=args.saturation_threshold,
+        prior_logit_clip=args.prior_logit_clip,
     )
     config = {
         "learner": "ppo",
@@ -143,6 +147,7 @@ def main() -> int:
                             arm=arm,
                             seed=seed + 10_000,
                             n_envs=args.eval_envs,
+                            cfg=cfg,
                         ),
                     }
                     (run_dir / "eval.json").write_text(json.dumps(eval_row, indent=2))
@@ -166,6 +171,9 @@ def summarize(eval_rows: list[dict[str, Any]]) -> dict[str, Any]:
             "eval_shaped_return": round(sum(float(row["eval_shaped_return"]) for row in rows) / len(rows), 6),
             "eval_train_return": round(sum(float(row["eval_train_return"]) for row in rows) / len(rows), 6),
             "eval_lift_max": round(sum(float(row["eval_lift_max"]) for row in rows) / len(rows), 6),
+            "eval_hard_clip_frac": round(sum(float(row["eval_hard_clip_frac"]) for row in rows) / len(rows), 6),
+            "eval_saturation_frac": round(sum(float(row["eval_saturation_frac"]) for row in rows) / len(rows), 6),
+            "eval_action_abs_mean": round(sum(float(row["eval_action_abs_mean"]) for row in rows) / len(rows), 6),
             "n_eval": len(rows),
         }
     return out
@@ -206,6 +214,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-count", type=int, default=5)
     parser.add_argument("--target-arm-seconds", type=float, default=None, help="Train each task/seed/arm for this many seconds after compile warmup")
     parser.add_argument("--target-total-seconds", type=float, default=None, help="Split this post-compile training budget across all task/seed/arm units")
+    parser.add_argument("--action-transform", choices=["raw", "tanh"], default="tanh")
+    parser.add_argument("--saturation-penalty", type=float, default=0.0)
+    parser.add_argument("--saturation-threshold", type=float, default=0.98)
+    parser.add_argument("--prior-logit-clip", type=float, default=0.95)
     parser.add_argument("--out", type=Path, default=None)
     return parser.parse_args()
 
