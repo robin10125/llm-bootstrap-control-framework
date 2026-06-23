@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from policy_bias_lab.schema import ACTION_GROUPS, EVAL_FIELDS, PRIOR_DIRECTIONS
 from policy_bias_lab.schema import default_bias_spec, validate_bias_spec
 
 
@@ -15,28 +16,30 @@ BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 def build_bias_prompt(task: str, tasks: list[str], env_summary: dict[str, Any]) -> str:
     return (
-        "You are authoring inductive biases for a closed-loop Shadow Hand policy model.\n"
+        "You are authoring inductive biases for a closed-loop robot policy model.\n"
         "The policy is trained by actor-critic PPO and maps observation vectors directly "
         "to actuator actions. Do not emit actions, scripts, primitives, or Python. Emit only "
         "a structured JSON BiasSpec that deterministic code will compile into reward shaping, "
         "action priors, exploration scaling, and supervised initialization targets.\n\n"
-        "The environment reward already includes palm/grasp-site reach, closure gated by "
-        "nearness, lift height, and lift success. Reward shaping must be auxiliary only: "
-        "prefer potential/progress terms for fingertip approach, contact acquisition, and "
-        "avoiding knockaway. Do not duplicate palm_obj_dist, closure, or lift rewards for "
-        "the lift task. Do not reward obj_xy_disp for lift; only use obj_xy_disp as a "
-        "minimize/anti-knockaway term when relevant.\n\n"
-        "Use only these eval observables: palm_obj_dist, min_finger_dist, n_contacts, "
-        "closure, lift, obj_xy_disp.\n"
-        "Use only these action groups: base_xy, base_z, hand, thumb, index, middle, ring, "
-        "little, all.\n"
-        "Use only these action directions: toward_object_xy, lower_base, raise_base, "
-        "close_hand, open_hand, stabilize.\n\n"
-        "Return ONLY JSON with fields: name, description, reward_terms, action_priors, "
+        "Use only the task description, robot/environment summary, observable schema, and "
+        "allowed action abstractions injected below. Do not assume fixed start states, fixed "
+        "coordinates, hidden reward terms, or task-specific facts not present in the injected "
+        "context. If an allowed direction has runtime analytic semantics, treat it as a symbolic "
+        "operator over current observations rather than a waypoint.\n\n"
+        "Before proposing biases, reason about likely failure modes, reward-hacking routes, "
+        "ways to avoid those problems, and the optimal kinematic forms or approaches implied "
+        "by the task and robot. Reward shaping must remain auxiliary and bounded: it should "
+        "guide exploration into task-valid basins without replacing held-out environment success.\n\n"
+        f"Use only these eval observables: {json.dumps(EVAL_FIELDS)}.\n"
+        f"Use only these action groups: {json.dumps(ACTION_GROUPS)}.\n"
+        f"Use only these action directions: {json.dumps(PRIOR_DIRECTIONS)}.\n\n"
+        "Return ONLY JSON with fields: name, description, reasoning, reward_terms, action_priors, "
         "exploration_groups, supervised_targets, curriculum.\n"
+        "reasoning should include failure_modes, reward_hacking_risks, avoidance_plan, and "
+        "optimal_kinematic_approach.\n"
         "Each reward term: name, observable, direction=minimize|maximize, weight, scale, "
         "optional tasks=[...]. The compiler will bound these as potential-based progress "
-        "shaping and discard task-contradictory or overlapping terms.\n"
+        "shaping and discard task-contradictory or overlapping terms where it can detect them.\n"
         "Each prior/target: name, group, direction, weight.\n"
         "Each exploration group: group, scale.\n\n"
         f"Primary task: {task}\n"

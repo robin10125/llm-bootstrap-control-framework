@@ -23,6 +23,7 @@ BIAS_ARMS = {
     "exploration": (False, False, True, False),
     "supervised_init": (False, False, False, True),
     "reward_action_prior": (True, True, False, False),
+    "reward_supervised_init": (True, False, False, True),
     "full": (True, True, True, True),
 }
 

@@ -13,7 +13,9 @@ from typing import Any
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
+from policy_bias_lab.action_priors import ActionPriorCoach, ActionPriorConfig, load_action_prior_rules
 from policy_bias_lab.bias import compile_bias
+from policy_bias_lab.dynamic_rewards import load_pre_run_reward_analysis
 from policy_bias_lab.es import BIAS_ARMS
 from policy_bias_lab.llm_bias import load_bias_spec
 from policy_bias_lab.ppo_bias import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
@@ -67,6 +69,36 @@ def main() -> int:
             env_summary=env_summary,
             log_dir=args.out / "llm",
         )
+    pre_run_reward_analysis = {}
+    if args.pre_run_reward_analysis:
+        pre_run_reward_analysis = load_pre_run_reward_analysis(
+            llm_backend=args.llm_backend,
+            llm_model=args.llm_model,
+            task="+".join(tasks),
+            tasks=tasks,
+            env_summary=env_summary,
+            bias_spec=bias_spec,
+            previous_run_context=None,
+            log_dir=args.out / "pre_run_reward_analysis",
+        )
+        (args.out / "pre_run_reward_analysis.json").write_text(json.dumps(pre_run_reward_analysis, indent=2) + "\n")
+    if args.llm_action_prior:
+        bias_spec = dict(bias_spec)
+        bias_spec["action_priors"] = load_action_prior_rules(
+            ActionPriorConfig(
+                llm_backend=args.llm_backend,
+                llm_model=args.llm_model,
+                task="+".join(tasks),
+                tasks=tasks,
+                arm="global",
+                env_summary=env_summary,
+                log_dir=args.out / "llm_action_prior",
+                max_weight=args.max_action_prior_weight,
+                max_checkups=args.action_prior_max_checkups,
+                pre_run_reward_analysis=pre_run_reward_analysis,
+            ),
+            bias_spec,
+        )
     (args.out / "bias_spec.json").write_text(json.dumps(bias_spec, indent=2))
     compiled_bias = compile_bias(bias_spec, env)
     unit_count = max(1, len(tasks) * len(seeds) * len(arms))
@@ -90,6 +122,9 @@ def main() -> int:
         saturation_penalty=args.saturation_penalty,
         saturation_threshold=args.saturation_threshold,
         prior_logit_clip=args.prior_logit_clip,
+        action_target_reward_weight=args.action_target_reward_weight,
+        success_hold_seconds=args.success_hold_seconds,
+        success_lift_threshold=args.success_lift_threshold,
     )
     config = {
         "learner": "ppo",
@@ -107,6 +142,13 @@ def main() -> int:
         "seeds": seeds,
         "env": env_summary,
         "ppo": cfg.__dict__,
+        "dynamic_action_prior": {
+            "llm_action_prior": args.llm_action_prior,
+            "pre_run_reward_analysis": args.pre_run_reward_analysis,
+            "checkup_steps": args.action_prior_checkup_steps,
+            "max_checkups": args.action_prior_max_checkups,
+            "max_weight": args.max_action_prior_weight,
+        },
         "llm_backend": args.llm_backend,
         "llm_model": args.llm_model,
     }
@@ -120,6 +162,23 @@ def main() -> int:
                 for arm in arms:
                     run_dir = args.out / f"{task}_s{seed}_{arm}"
                     run_dir.mkdir(parents=True, exist_ok=True)
+                    prior_coach = None
+                    if bool(BIAS_ARMS[arm][1]) and args.action_prior_checkup_steps > 0:
+                        prior_coach = ActionPriorCoach(
+                            ActionPriorConfig(
+                                llm_backend=args.llm_backend,
+                                llm_model=args.llm_model,
+                                task=task,
+                                tasks=tasks,
+                                arm=arm,
+                                env_summary=env_summary,
+                                log_dir=run_dir / "action_prior_checkups",
+                                max_weight=args.max_action_prior_weight,
+                                max_checkups=args.action_prior_max_checkups,
+                                pre_run_reward_analysis=pre_run_reward_analysis,
+                            ),
+                            list(compiled_bias.spec.get("action_priors", [])),
+                        )
                     params, rows = train_ppo_arm(
                         env=env,
                         bias=compiled_bias,
@@ -128,6 +187,14 @@ def main() -> int:
                         seed=seed,
                         cfg=cfg,
                         checkpoint_dir=run_dir / "checkpoints",
+                        action_prior_checkup_interval=args.action_prior_checkup_steps,
+                        action_prior_checkup_fn=prior_coach,
+                    )
+                    active_action_prior_weights = (
+                        prior_coach.current_weights if prior_coach is not None else compiled_bias.default_action_prior_weights()
+                    )
+                    (run_dir / "final_action_prior_weights.json").write_text(
+                        json.dumps(_action_prior_weight_dict(compiled_bias, active_action_prior_weights), indent=2) + "\n"
                     )
                     for row in rows:
                         row = row | {"seed": seed}
@@ -148,6 +215,7 @@ def main() -> int:
                             seed=seed + 10_000,
                             n_envs=args.eval_envs,
                             cfg=cfg,
+                            action_prior_weights=active_action_prior_weights,
                         ),
                     }
                     (run_dir / "eval.json").write_text(json.dumps(eval_row, indent=2))
@@ -167,6 +235,7 @@ def summarize(eval_rows: list[dict[str, Any]]) -> dict[str, Any]:
         rows = [row for row in eval_rows if row["arm"] == arm]
         out[arm] = {
             "eval_success_rate": round(sum(float(row["eval_success_rate"]) for row in rows) / len(rows), 6),
+            "eval_instant_success_rate": round(sum(float(row.get("eval_instant_success_rate", row["eval_success_rate"])) for row in rows) / len(rows), 6),
             "eval_base_return": round(sum(float(row["eval_base_return"]) for row in rows) / len(rows), 6),
             "eval_shaped_return": round(sum(float(row["eval_shaped_return"]) for row in rows) / len(rows), 6),
             "eval_train_return": round(sum(float(row["eval_train_return"]) for row in rows) / len(rows), 6),
@@ -186,6 +255,13 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _action_prior_weight_dict(bias: Any, weights: Any) -> dict[str, float]:
+    return {
+        str(rule.get("name", f"prior_{idx}")): round(float(value), 6)
+        for idx, (rule, value) in enumerate(zip(bias.spec.get("action_priors", []), weights))
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -218,6 +294,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--saturation-penalty", type=float, default=0.0)
     parser.add_argument("--saturation-threshold", type=float, default=0.98)
     parser.add_argument("--prior-logit-clip", type=float, default=0.95)
+    parser.add_argument("--action-target-reward-weight", type=float, default=0.0)
+    parser.add_argument("--success-hold-seconds", type=float, default=0.5)
+    parser.add_argument("--success-lift-threshold", type=float, default=0.05)
+    parser.add_argument("--llm-action-prior", action="store_true")
+    parser.add_argument("--pre-run-reward-analysis", action="store_true")
+    parser.add_argument("--action-prior-checkup-steps", type=int, default=0)
+    parser.add_argument("--action-prior-max-checkups", type=int, default=3)
+    parser.add_argument("--max-action-prior-weight", type=float, default=0.6)
     parser.add_argument("--out", type=Path, default=None)
     return parser.parse_args()
 
