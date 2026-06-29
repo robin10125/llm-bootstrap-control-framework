@@ -179,7 +179,7 @@ def main() -> int:
                             ),
                             list(compiled_bias.spec.get("action_priors", [])),
                         )
-                    params, rows = train_ppo_arm(
+                    params, rows, *_ = train_ppo_arm(
                         env=env,
                         bias=compiled_bias,
                         task=task,

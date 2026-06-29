@@ -38,6 +38,10 @@ class DynamicRewardConfig:
     post_new_reward_checkup_steps: int = 10
     post_new_reward_fast_checkups: int = 3
     allow_reward_rewrite: bool = False
+    # Fixed-baseline mode: compile the initial program once, then hold reward weights and
+    # base_reward_weight constant (no deep checkups, no mid-run rewrite) for a reproducible,
+    # maximally-shaped baseline to compare action priors against.
+    freeze_reward_shaping: bool = False
     previous_run_context: dict[str, Any] | None = None
     pre_run_reward_analysis: dict[str, Any] | None = None
     # Dense-to-sparse schedule: linearly anneal adaptive shaping toward zero (and restore
@@ -203,7 +207,7 @@ class DynamicRewardCoach:
             "decision": "observe_only",
         }
         self._write_record(record)
-        if self.fast_checkups_remaining > 0 or self._should_deep_check(elapsed):
+        if not self.cfg.freeze_reward_shaping and (self.fast_checkups_remaining > 0 or self._should_deep_check(elapsed)):
             self.last_deep_seconds = elapsed
             self._deep_checkup(rows, latest, elapsed)
             if self.fast_checkups_remaining > 0:
@@ -292,20 +296,21 @@ class DynamicRewardCoach:
         self._write_rewrite_record(record)
         return adapted_spec, self.current_weights.tolist(), record
 
+    def apply_program(self, weights: Any, base_reward_weight: float, adaptive_terms: list[dict[str, Any]]) -> None:
+        """Adopt a pre-generated reward program (no LLM call) so every arm/seed trains on the
+        IDENTICAL frozen shaping — the prior's marginal effect is then unconfounded by
+        per-arm reward-program variance."""
+        self.current_weights = np.asarray(weights, dtype=np.float32).copy()
+        self.base_reward_weight = float(np.clip(base_reward_weight, self.cfg.min_base_reward_weight, self.cfg.max_base_reward_weight))
+        self.active_adaptive_reward_terms = list(adaptive_terms)
+
     def initial_reward_program(self, bias_spec: dict[str, Any]) -> tuple[dict[str, Any], list[float], dict[str, Any]]:
         """Compile the pre-run failure-mode analysis into a concrete shaped-reward program
         *before* training starts, so shaping guides exploration from iteration 0 instead of
         only appearing at the mid-run rewrite. Logged to ``initial_reward_program.json``."""
+        # Gated by the runner's --initial-reward-program flag, so compile whenever called
+        # (independent of allow_reward_rewrite, so it works in --freeze-reward-shaping mode).
         previous = self.current_weights.copy()
-        if not self.cfg.allow_reward_rewrite:
-            record = {
-                "kind": "initial_reward_program",
-                "status": "disabled",
-                "arm": self.cfg.arm,
-                "task": self.cfg.task,
-            }
-            self._write_initial_record(record)
-            return bias_spec, self.current_weights.tolist(), record
 
         prompt = self._build_initial_program_prompt(bias_spec)
         parsed: dict[str, Any] | None = None
@@ -380,7 +385,12 @@ class DynamicRewardCoach:
             "kind, observable, direction, weight, scale, threshold, tasks, gate, max_step. kind is one of "
             "absolute_bound_penalty, progress_penalty, progress_reward, absolute_good_reward. observable is "
             "one eval field. direction is minimize|maximize. gate is a list of conditions with field, op in "
-            "< <= > >=, and value. Use no more than 8 adaptive clauses.\n\n"
+            "< <= > >=, and value. Use no more than 8 adaptive clauses.\n"
+            "Reward-form guidance: for prerequisite approach/reach toward a target (e.g. shrinking a "
+            "distance), prefer absolute_good_reward as a continuous potential (rewards being inside a "
+            "band every step) over change-based progress_reward, which has ZERO gradient when the "
+            "observable plateaus and so cannot pull a stalled policy across the last gap. Reserve "
+            "progress_* for quantities that move steadily.\n\n"
             f"Task: {self.cfg.task}\n"
             f"Arm: {self.cfg.arm}\n"
             f"Eval fields: {json.dumps(EVAL_FIELDS)}\n"
@@ -499,7 +509,12 @@ class DynamicRewardCoach:
             "scale, threshold, tasks, gate, max_step. kind is one of absolute_bound_penalty, "
             "progress_penalty, progress_reward, absolute_good_reward. observable is one eval field. "
             "direction is minimize|maximize. gate is a list of conditions with field, op in < <= > >=, "
-            "and value. Use no more than 8 adaptive clauses.\n\n"
+            "and value. Use no more than 8 adaptive clauses.\n"
+            "Reward-form guidance: for prerequisite approach/reach toward a target (e.g. shrinking a "
+            "distance), prefer absolute_good_reward as a continuous potential (rewards being inside a "
+            "band every step) over change-based progress_reward, which has ZERO gradient when the "
+            "observable plateaus and so cannot pull a stalled policy across the last gap. Reserve "
+            "progress_* for quantities that move steadily.\n\n"
             "General priorities to reason over for any task:\n"
             "1. Preserve task validity before optimizing task magnitude.\n"
             "2. Identify prerequisites implied by the task before rewarding later-stage progress.\n"
@@ -638,6 +653,9 @@ def _coach_safe_diagnostics(row: dict[str, Any]) -> dict[str, Any]:
         "success": row.get("success"),
         "instant_success": row.get("instant_success"),
         "lift_max": row.get("lift_max"),
+        "reach_rate": row.get("reach_rate"),
+        "grasp_rate": row.get("grasp_rate"),
+        "lift_reached_rate": row.get("lift_reached_rate"),
         "hard_clip_frac": row.get("hard_clip_frac"),
         "saturation_frac": row.get("saturation_frac"),
         "action_abs_mean": row.get("action_abs_mean"),

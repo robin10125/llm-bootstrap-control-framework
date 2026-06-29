@@ -12,6 +12,7 @@ import jax.numpy as jp
 import numpy as np
 
 from policy_bias_lab.schema import ACTION_GROUPS, PRIOR_DIRECTIONS
+from policy_bias_lab.symbolic_control import encode_rules, make_rule_action_fn, sustained_bool
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAPPING = ROOT.parent / "bootstrapping"
@@ -36,6 +37,11 @@ class ActionPriorConfig:
     selection_seed: int = 0
     success_hold_seconds: float = 0.5
     success_lift_threshold: float = 0.05
+    # Contact-gated selection thresholds. These use only signals a real robot can
+    # observe (fingertip contact count, object height, object lateral drift), so the
+    # whole selection procedure is realizable on hardware with a few real rollouts.
+    min_contacts: float = 1.0
+    max_xy_disp: float = 0.08
 
 
 def load_action_prior_rules(cfg: ActionPriorConfig, current_bias_spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -131,19 +137,23 @@ def build_candidate_prompt(cfg: ActionPriorConfig, current_bias_spec: dict[str, 
     )
     output_key = "action_priors" if section == "action_priors" else "supervised_targets"
     return (
-        f"You are generating candidate {mechanism} for a direct robot policy model.\n"
-        "The goal is quick pre-training exploration: produce several principled candidates, then "
-        "the runner will score each in the real environment before training. After selection, the "
-        "chosen schema is fixed for the main PPO run.\n\n"
-        "Do not assume fixed starting positions, object coordinates, hidden waypoints, hand-coded "
-        "phases, or one-reset constants. Use symbolic action groups and directions only. Runtime "
-        "relative operators may use injected state, such as the object displacement exposed by the "
-        "environment. Prefer simple, conservative schemas that express durable kinematic principles "
-        "and avoid reward hacking or task-invalid shortcuts.\n\n"
-        "Before proposing candidates, reason in task-agnostic terms about likely failure modes, "
-        "reward-hacking routes, prevention strategies, and optimal kinematic forms implied by the "
-        "environment and task description. Then provide candidates spanning plausible Pareto tradeoffs: "
-        "measured-performance potential, robustness, simplicity, and strength of underlying principles.\n\n"
+        f"Design several candidate {mechanism} for a direct robot policy model.\n"
+        "Each candidate is a small set of weak rules. A rule names a symbolic action group and a "
+        "direction; its weight is a gentle pre-tanh mean shift that nudges early behavior. Rules do "
+        "not command trajectories, they only bias which basin exploration starts in.\n\n"
+        "OBJECTIVE: enter a contact-rich grasp basin. The hand should approach the object, make and "
+        "keep fingertip contact, then lift it. After you propose candidates, the runner AUTOMATICALLY "
+        "rolls out each one and scores it by a CONTACT-GATED metric: lift only counts while at least "
+        f"{int(cfg.min_contacts)} fingertip(s) are in contact AND the object's lateral drift stays small. "
+        "A candidate that 'lifts' by shoving or flinging the object sideways with no contact scores ~0. "
+        "So design every candidate to win that metric: prioritize approach + finger contact over base "
+        "translation, and never rely on lateral pushing.\n\n"
+        "Hard constraints: no fixed positions, object coordinates, waypoints, hand-coded phases, or "
+        "one-reset constants. Symbolic groups and directions only. Runtime-relative operators may use "
+        "injected state such as the exposed object displacement. Keep schemas simple and weights "
+        "conservative; when uncertain, use a smaller weight or omit the rule.\n\n"
+        "Make candidates genuinely different from each other (e.g. whole-hand enclosure vs. "
+        "finger-first opposition vs. minimal hint) so the contact-gated rollout can discriminate.\n\n"
         f"Allowed action groups: {json.dumps(ACTION_GROUPS)}\n"
         f"Allowed directions: {json.dumps(PRIOR_DIRECTIONS)}\n"
         "Return JSON only with fields: rationale, potential_failure_modes, reward_hacking_risks, "
@@ -159,31 +169,6 @@ def build_candidate_prompt(cfg: ActionPriorConfig, current_bias_spec: dict[str, 
         f"Pre-run reward failure-mode analysis: {json.dumps(cfg.pre_run_reward_analysis or {}, indent=2)}\n"
         f"Previous run context: {json.dumps(cfg.previous_run_context or {}, indent=2)}\n"
         f"Current bias spec {section} count, for reference only: {len(current_bias_spec.get(section, []) or [])}\n"
-    )
-
-
-def build_pareto_selection_prompt(
-    cfg: ActionPriorConfig,
-    candidates: list[dict[str, Any]],
-    scores: list[dict[str, Any]],
-    *,
-    section: str,
-) -> str:
-    mechanism = "action prior" if section == "action_priors" else "supervised initialization target"
-    return (
-        f"You are selecting one fixed {mechanism} candidate before PPO training starts.\n"
-        "Choose the Pareto-optimal candidate, not just the highest quick rollout score. A good "
-        "selection should balance early measured behavior, strong fundamental principles, robustness "
-        "to unseen resets/tasks, simplicity, and low risk of reward hacking or task-invalid shortcuts. "
-        "The chosen schema will be fixed during the main run, so do not rely on mid-run edits.\n\n"
-        "Return JSON only with fields: selected_candidate_name, rationale, pareto_tradeoff, "
-        "rejected_candidates.\n\n"
-        f"Task: {cfg.task}\n"
-        f"Arm: {cfg.arm}\n"
-        f"Environment summary: {json.dumps(cfg.env_summary, indent=2)}\n"
-        f"Pre-run reward failure-mode analysis: {json.dumps(cfg.pre_run_reward_analysis or {}, indent=2)}\n"
-        f"Candidates: {json.dumps(candidates, indent=2)}\n"
-        f"Real-environment quick rollout scores: {json.dumps(scores, indent=2)}\n"
     )
 
 
@@ -223,6 +208,8 @@ def _load_pareto_rules(
         steps=cfg.selection_steps,
         hold_seconds=cfg.success_hold_seconds,
         lift_threshold=cfg.success_lift_threshold,
+        min_contacts=cfg.min_contacts,
+        max_xy_disp=cfg.max_xy_disp,
     )
     scores = [
         score_candidate(list(candidate.get(output_key, [])), seed=cfg.selection_seed + idx * 997)
@@ -230,30 +217,28 @@ def _load_pareto_rules(
         for idx, candidate in enumerate(candidates)
     ]
     (cfg.log_dir / f"{label}_candidate_scores.json").write_text(json.dumps(scores, indent=2) + "\n")
-    selected_name = _fallback_pareto_select(candidates, scores)
+
+    # Objective, deterministic selection. The metric is contact-gated (a fling with no
+    # fingertip contact scores ~0) and uses only signals a real robot can measure, so the
+    # same selection runs on hardware with a handful of real rollouts -- no simulator, no
+    # qualitative LLM Pareto pick.
+    ranking = sorted(
+        ({"candidate_name": s.get("candidate_name"), "objective_score": _candidate_score(s)} for s in scores),
+        key=lambda r: r["objective_score"],
+        reverse=True,
+    )
+    selected_name = _select_by_objective(candidates, scores)
     selection_record: dict[str, Any] = {
         "selected_candidate_name": selected_name,
-        "source": "fallback",
-        "rationale": "Selected by deterministic score when no valid LLM selection was available.",
+        "source": "objective_contact_gated",
+        "metric": (
+            "primary=contact_gated_success (sustained lift with >=min_contacts fingertip contacts "
+            "and bounded object xy drift); anti-fling; real-world-observable signals only"
+        ),
+        "min_contacts": cfg.min_contacts,
+        "max_xy_disp": cfg.max_xy_disp,
+        "ranking": ranking,
     }
-    if cfg.llm_backend not in {"fixture", "mock", "fake", "none"}:
-        selection_prompt = build_pareto_selection_prompt(cfg, candidates, scores, section=section)
-        (cfg.log_dir / f"{label}_pareto_selection_prompt.md").write_text(selection_prompt)
-        selection_text = _call_llm(
-            cfg.llm_backend,
-            selection_prompt,
-            model=cfg.llm_model,
-            log_dir=cfg.log_dir,
-            tag=f"{label}_pareto_selection",
-        )
-        (cfg.log_dir / f"{label}_pareto_selection_completion.txt").write_text(selection_text)
-        parsed_selection = _parse_json(selection_text)
-        candidate_names = {str(candidate.get("name", "")) for candidate in candidates}
-        requested = str((parsed_selection or {}).get("selected_candidate_name", ""))
-        if requested in candidate_names:
-            selected_name = requested
-            selection_record = dict(parsed_selection or {})
-            selection_record["source"] = "llm"
     selected = next((candidate for candidate in candidates if str(candidate.get("name")) == selected_name), candidates[0])
     rules = list(selected.get(output_key, []))
     selection_record["selected_rules"] = rules
@@ -504,44 +489,14 @@ def _make_candidate_scorer(
     steps: int | None,
     hold_seconds: float,
     lift_threshold: float,
+    min_contacts: float,
+    max_xy_disp: float,
 ) -> Any:
     _ = task
     rollout_steps = max(1, min(int(steps or env.horizon), int(env.horizon)))
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
     step_fn = jax.vmap(env.step)
-    group_masks = jp.asarray(_group_masks(env), dtype=jp.float32)
-    close_sign = jp.sign(jp.asarray(env.ctrl_close) - jp.asarray(env.ctrl_open))
-    open_sign = jp.sign(jp.asarray(env.ctrl_open) - jp.asarray(env.ctrl_close))
-    action_dim = int(env.action_size)
-    action_names = tuple(env.model.actuator(i).name for i in range(env.nu))
-    base_x_idx = action_names.index("base_x") if "base_x" in action_names else -1
-    base_y_idx = action_names.index("base_y") if "base_y" in action_names else -1
-
-    def action_from_obs(obs, group_ids, direction_ids, weights):
-        obj_rel = _obj_rel_from_obs(obs, action_dim)
-
-        def add_rule(carry, item):
-            out = carry
-            group_id, direction_id, weight = item
-            mask = group_masks[group_id]
-            base_xy = jp.zeros((action_dim,), dtype=jp.float32)
-            if base_x_idx >= 0:
-                base_xy = base_xy.at[base_x_idx].set(jp.clip(obj_rel[0] * 8.0, -1.0, 1.0) * weight)
-            if base_y_idx >= 0:
-                base_xy = base_xy.at[base_y_idx].set(jp.clip(obj_rel[1] * 8.0, -1.0, 1.0) * weight)
-            lower = -jp.abs(weight) * mask
-            raise_base = jp.abs(weight) * mask
-            close = weight * mask * close_sign
-            open_hand = weight * mask * open_sign
-            vector = jp.where(direction_id == 0, base_xy, jp.zeros_like(base_xy))
-            vector = jp.where(direction_id == 1, lower, vector)
-            vector = jp.where(direction_id == 2, raise_base, vector)
-            vector = jp.where(direction_id == 3, close, vector)
-            vector = jp.where(direction_id == 4, open_hand, vector)
-            return out + vector, None
-
-        out, _ = jax.lax.scan(add_rule, jp.zeros((action_dim,), dtype=jp.float32), (group_ids, direction_ids, weights))
-        return jp.clip(out, -1.0, 1.0)
+    action_from_obs, _info = make_rule_action_fn(env)
 
     def rollout(key, group_ids, direction_ids, weights):
         state = reset(jax.random.split(key, int(envs)))
@@ -563,8 +518,10 @@ def _make_candidate_scorer(
 
     rollout_jit = jax.jit(rollout)
 
+    hold_steps = max(1, int(round(float(hold_seconds) / max(float(env.cfg.control_dt), 1e-9))))
+
     def score(rules: list[dict[str, Any]], *, seed: int) -> dict[str, Any]:
-        encoded = _encode_rules(rules)
+        encoded = encode_rules(rules)
         reward, instant_success, lift, eval_traj, action = rollout_jit(
             jax.random.PRNGKey(seed),
             jp.asarray(encoded["group_ids"], dtype=jp.int32),
@@ -572,113 +529,54 @@ def _make_candidate_scorer(
             jp.asarray(encoded["weights"], dtype=jp.float32),
         )
         reward.block_until_ready()
-        eval_summary = jax.vmap(lambda x: jp.asarray([
-            x[:, 0].min(), x[:, 1].min(), x[:, 2].max(), x[:, 3].max(), x[:, 4].max(), x[:, 5].max()
-        ]), in_axes=1)(eval_traj)
-        sustained = _sustained_lift_success(
-            lift,
-            control_dt=float(env.cfg.control_dt),
-            hold_seconds=hold_seconds,
-            lift_threshold=lift_threshold,
-        )
+        # Per-step, per-env observable signals (shape [T, E]). All are quantities a real
+        # robot can measure: fingertip contact count, object height, lateral drift, palm gap.
+        palm_t = eval_traj[:, :, 0]
+        contacts_t = eval_traj[:, :, 2]
+        lift_t = eval_traj[:, :, 4]
+        xy_t = eval_traj[:, :, 5]
+
+        in_contact = contacts_t >= float(min_contacts)
+        lifted = lift_t > float(lift_threshold)
+        not_flung = xy_t <= float(max_xy_disp)
+        # Contact-gated grasp-lift: lift only counts WITH contact and WITHOUT being flung.
+        grasp_lift = in_contact & lifted & not_flung
+        # Fling: object went up but with no fingertip contact -- the failure mode to suppress.
+        fling_only = lifted & jp.logical_not(in_contact)
+
+        contact_gated_success = sustained_bool(grasp_lift, hold_steps)
+        fling_fraction = sustained_bool(fling_only, hold_steps)
+        contact_engagement = jp.mean(in_contact.astype(jp.float32))
+        contact_conditioned_lift = jp.mean(jp.where(in_contact & not_flung, lift_t, 0.0))
+        contacts_mean = jp.mean(contacts_t)
+        palm_dist_min = jp.mean(jp.min(palm_t, axis=0))
+
         action_abs = jp.mean(jp.abs(action))
         saturation = jp.mean((jp.abs(action) >= 0.98).astype(jp.float32))
-        summary_mean = jp.mean(eval_summary, axis=0)
         out = {
-            "base_return": round(float(reward.sum(axis=0).mean()), 6),
-            "sustained_success": round(float(sustained), 6),
+            "contact_gated_success": round(float(contact_gated_success), 6),
+            "contact_conditioned_lift": round(float(contact_conditioned_lift), 6),
+            "contact_engagement": round(float(contact_engagement), 6),
+            "contacts_mean": round(float(contacts_mean), 6),
+            "fling_fraction": round(float(fling_fraction), 6),
+            "palm_obj_dist_min": round(float(palm_dist_min), 6),
             "instant_success": round(float((instant_success.max(axis=0) > 0.5).mean()), 6),
-            "palm_obj_dist_min": round(float(summary_mean[0]), 6),
-            "min_finger_dist_min": round(float(summary_mean[1]), 6),
-            "contacts_max": round(float(summary_mean[2]), 6),
-            "closure_max": round(float(summary_mean[3]), 6),
-            "lift_max": round(float(summary_mean[4]), 6),
-            "obj_xy_disp_max": round(float(summary_mean[5]), 6),
+            "lift_max": round(float(jp.max(lift_t)), 6),
+            "obj_xy_disp_max": round(float(jp.max(xy_t)), 6),
             "action_abs_mean": round(float(action_abs), 6),
             "saturation_frac": round(float(saturation), 6),
+            "base_return": round(float(reward.sum(axis=0).mean()), 6),
             "rollout_envs": int(envs),
             "rollout_steps": int(rollout_steps),
             "seed": int(seed),
         }
-        out["deterministic_pareto_score"] = round(_candidate_score(out), 6)
+        out["objective_score"] = round(_candidate_score(out), 6)
         return out
 
     return score
 
 
-def _encode_rules(rules: list[dict[str, Any]], *, max_rules: int = 12) -> dict[str, np.ndarray]:
-    group_ids = np.zeros((max_rules,), dtype=np.int32)
-    direction_ids = np.full((max_rules,), PRIOR_DIRECTIONS.index("stabilize"), dtype=np.int32)
-    weights = np.zeros((max_rules,), dtype=np.float32)
-    for idx, rule in enumerate(rules[:max_rules]):
-        group = str(rule.get("group", "all"))
-        direction = str(rule.get("direction", "stabilize"))
-        if group not in ACTION_GROUPS or direction not in PRIOR_DIRECTIONS:
-            continue
-        group_ids[idx] = ACTION_GROUPS.index(group)
-        direction_ids[idx] = PRIOR_DIRECTIONS.index(direction)
-        weights[idx] = max(0.0, float(rule.get("weight", 0.0)))
-    return {"group_ids": group_ids, "direction_ids": direction_ids, "weights": weights}
-
-
-def _group_masks(env: Any) -> np.ndarray:
-    names = tuple(env.model.actuator(i).name for i in range(env.nu))
-    base_ids = tuple(int(i) for i in getattr(env, "base_act_ids", ()))
-    hand_ids = tuple(int(i) for i in getattr(env, "hand_act_ids", ()))
-    masks = np.zeros((len(ACTION_GROUPS), env.action_size), dtype=np.float32)
-    for group_idx, group in enumerate(ACTION_GROUPS):
-        if group == "all":
-            ids = tuple(range(len(names)))
-        elif group == "base_xy":
-            ids = tuple(i for i, name in enumerate(names) if name in {"base_x", "base_y"})
-        elif group == "base_z":
-            ids = tuple(i for i, name in enumerate(names) if name == "base_z")
-        elif group == "hand":
-            ids = hand_ids
-        else:
-            prefixes = {
-                "thumb": "rh_A_TH",
-                "index": "rh_A_FF",
-                "middle": "rh_A_MF",
-                "ring": "rh_A_RF",
-                "little": "rh_A_LF",
-            }
-            prefix = prefixes.get(group)
-            ids = tuple(i for i, name in enumerate(names) if prefix and name.startswith(prefix))
-            if not ids:
-                ids = base_ids
-        if ids:
-            masks[group_idx, list(ids)] = 1.0
-    return masks
-
-
-def _obj_rel_from_obs(obs: jp.ndarray, action_dim: int) -> jp.ndarray:
-    rel_start = obs.shape[-1] - action_dim - 3
-    return obs[rel_start: rel_start + 3]
-
-
-def _sustained_lift_success(
-    lift: jp.ndarray,
-    *,
-    control_dt: float,
-    hold_seconds: float,
-    lift_threshold: float,
-) -> jp.ndarray:
-    hold_steps = max(1, int(round(float(hold_seconds) / max(float(control_dt), 1e-9))))
-    above = lift > float(lift_threshold)
-
-    def episode_success(ep_above: jp.ndarray) -> jp.ndarray:
-        def body(run_len, is_above):
-            next_len = jp.where(is_above, run_len + 1, 0)
-            return next_len, next_len
-
-        _last, run_lengths = jax.lax.scan(body, jp.int32(0), ep_above)
-        return (run_lengths.max() >= hold_steps).astype(jp.float32)
-
-    return jax.vmap(episode_success, in_axes=1)(above).mean()
-
-
-def _fallback_pareto_select(candidates: list[dict[str, Any]], scores: list[dict[str, Any]]) -> str:
+def _select_by_objective(candidates: list[dict[str, Any]], scores: list[dict[str, Any]]) -> str:
     if not candidates:
         return ""
     if not scores:
@@ -688,22 +586,28 @@ def _fallback_pareto_select(candidates: list[dict[str, Any]], scores: list[dict[
 
 
 def _candidate_score(score: dict[str, Any]) -> float:
-    base_return = float(score.get("base_return", 0.0))
-    sustained = float(score.get("sustained_success", 0.0))
-    instant = float(score.get("instant_success", 0.0))
-    lift = float(score.get("lift_max", 0.0))
-    contacts = float(score.get("contacts_max", 0.0))
-    xy = float(score.get("obj_xy_disp_max", 0.0))
+    """Objective, contact-gated candidate score.
+
+    Built only from real-world-observable signals so the same ranking can be reproduced
+    from a few rollouts on physical hardware. Lifting without contact (flinging) is
+    actively penalized rather than rewarded, which was the defect of the old scorer.
+    """
+    contact_gated = float(score.get("contact_gated_success", 0.0))
+    contact_lift = float(score.get("contact_conditioned_lift", 0.0))
+    engagement = float(score.get("contact_engagement", 0.0))
+    contacts_mean = float(score.get("contacts_mean", 0.0))
+    fling = float(score.get("fling_fraction", 0.0))
+    palm_dist = float(score.get("palm_obj_dist_min", 0.0))
     saturation = float(score.get("saturation_frac", 0.0))
     action_abs = float(score.get("action_abs_mean", 0.0))
     return (
-        base_return
-        + 60.0 * sustained
-        + 8.0 * instant
-        + 80.0 * lift
-        + 1.5 * contacts
-        - 18.0 * xy
-        - 8.0 * saturation
+        120.0 * contact_gated        # full contact-grasp-lift (the real goal)
+        + 30.0 * contact_lift        # partial lift, credited only while in contact
+        + 6.0 * engagement           # time spent in fingertip contact
+        + 1.0 * contacts_mean        # contact richness
+        - 25.0 * fling               # suppress non-prehensile flinging
+        - 4.0 * palm_dist            # reward getting the palm near the object
+        - 6.0 * saturation           # avoid clipped/over-strong priors
         - 0.5 * max(action_abs - 0.55, 0.0)
     )
 

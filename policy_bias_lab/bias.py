@@ -469,28 +469,32 @@ def _adaptive_reward_contribution(term: dict[str, Any], prev_eval: jp.ndarray, e
     direction = str(term["direction"])
     kind = str(term["kind"])
 
+    # Hard sign/magnitude guard: a misspecified scale/threshold/max_step must never let a
+    # term leak outside [-|weight|, 0] (penalties) or [0, |weight|] (rewards) per step. This
+    # keeps shaping bounded and policy-fair regardless of what the LLM emits.
+    wabs = abs(weight)
     if kind == "absolute_bound_penalty":
         if direction == "minimize":
             magnitude = jp.clip((value - threshold) / scale, 0.0, 1.0)
         else:
             magnitude = jp.clip((threshold - value) / scale, 0.0, 1.0)
-        return -weight * gate * magnitude
+        return jp.clip(-weight * gate * magnitude, -wabs, 0.0)
 
     if kind == "absolute_good_reward":
         if direction == "minimize":
             magnitude = jp.clip((threshold - value) / scale, 0.0, 1.0)
         else:
             magnitude = jp.clip((value - threshold) / scale, 0.0, 1.0)
-        return weight * gate * magnitude
+        return jp.clip(weight * gate * magnitude, 0.0, wabs)
 
     if kind == "progress_penalty":
         opposite = "maximize" if direction == "minimize" else "minimize"
         worsening = jp.clip(_progress(prev_eval, eval_vec, str(term["observable"]), opposite, scale), 0.0, float(term["max_step"]))
-        return -weight * gate * worsening
+        return jp.clip(-weight * gate * worsening, -wabs, 0.0)
 
     if kind == "progress_reward":
         progress = jp.clip(_progress(prev_eval, eval_vec, str(term["observable"]), direction, scale), 0.0, float(term["max_step"]))
-        return weight * gate * progress
+        return jp.clip(weight * gate * progress, 0.0, wabs)
 
     return jp.float32(0.0)
 

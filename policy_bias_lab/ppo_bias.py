@@ -33,6 +33,13 @@ class PPOBiasConfig:
     supervised_steps: int = 80
     supervised_batch: int = 128
     supervised_lr: float = 1e-3
+    # Reformatted warm-start (BC->RL handoff): clone on controller-rollout states and pretrain
+    # the critic on those returns (so PPO's first advantages aren't garbage), then anchor the
+    # actor to the BC policy with a KL penalty that decays over bc_kl_anneal_iters.
+    bc_critic_pretrain: bool = True
+    bc_rollout_states: bool = True
+    bc_kl_coef: float = 0.0
+    bc_kl_anneal_iters: int = 200
     checkpoint_count: int = 5
     target_train_seconds: float | None = None
     # Sample-efficiency budget: stop the arm once this many environment steps have been
@@ -67,6 +74,7 @@ def train_ppo_arm(
     action_prior_checkup_fn: Any | None = None,
     initial_params: Any | None = None,
     iter_offset: int = 0,
+    phase_teacher: Any | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     use_reward_bias, use_action_prior, use_exploration_bias, use_supervised_init = BIAS_ARMS[arm]
     key = jax.random.PRNGKey(seed)
@@ -77,10 +85,14 @@ def train_ppo_arm(
     optimizer = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(cfg.lr))
     opt_state = optimizer.init(params)
 
+    reference_params = params
+    bc_anchor_active = False
     if use_supervised_init and initial_params is None:
         key, sk = jax.random.split(key)
-        params = supervised_pretrain(net, env, params, bias, task, sk, cfg)
+        params = supervised_pretrain(net, env, params, bias, task, sk, cfg, phase_teacher=phase_teacher)
         opt_state = optimizer.init(params)
+        reference_params = params  # frozen BC policy for the decaying KL anchor
+        bc_anchor_active = cfg.bc_kl_coef > 0.0 and cfg.bc_kl_anneal_iters > 0
 
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
     collect = make_collect(
@@ -112,6 +124,9 @@ def train_ppo_arm(
     checkpoint_times = _checkpoint_times(cfg.target_train_seconds, cfg.checkpoint_count)
     saved_time_checkpoints: set[int] = set()
     rows: list[dict[str, Any]] = []
+    best_success = -1.0
+    best_iter = -1
+    best_params = params
     reward_weights = default_reward_template_weights(task) if reward_weights is None else jp.asarray(reward_weights, dtype=jp.float32)
     base_reward_weight_arr = jp.asarray(float(base_reward_weight), dtype=jp.float32)
     action_prior_weights = (
@@ -135,7 +150,8 @@ def train_ppo_arm(
         adv, ret = ppo.compute_gae(train_reward, value, warmup_last_value, cfg.gamma, cfg.lam)
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
         warmup_data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
-        warmup_params, _warmup_opt_state, _warmup_metrics = update(params, opt_state, warmup_data, uk, action_prior_weights)
+        warmup_params, _warmup_opt_state, _warmup_metrics = update(
+            params, opt_state, warmup_data, uk, action_prior_weights, reference_params, jp.float32(0.0))
         jax.block_until_ready(warmup_params)
         print(f"[{arm}] warmup update ready", flush=True)
 
@@ -164,7 +180,11 @@ def train_ppo_arm(
         data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
         if it == 0:
             print(f"[{arm}] iter0 update start", flush=True)
-        params, opt_state, metrics = update(params, opt_state, data, uk, action_prior_weights)
+        kl_coef = jp.float32(
+            cfg.bc_kl_coef * max(0.0, 1.0 - it / float(cfg.bc_kl_anneal_iters))
+            if bc_anchor_active else 0.0
+        )
+        params, opt_state, metrics = update(params, opt_state, data, uk, action_prior_weights, reference_params, kl_coef)
         jax.block_until_ready(params)
         if it == 0:
             print(f"[{arm}] iter0 update ready", flush=True)
@@ -190,12 +210,25 @@ def train_ppo_arm(
             control_dt=float(env.cfg.control_dt),
             hold_seconds=cfg.success_hold_seconds,
             lift_threshold=cfg.success_lift_threshold,
+            gate=success,  # contact-gated env success -> sustained GRASP, not sustained fling
         )
+        # Per-stage rates make curriculum promotion criteria observable: eval_summary columns are
+        # [palm_min, finger_min, n_contacts_max, closure_max, lift_max, xy_max] per episode.
+        reach_rate = float((eval_summary[:, 2] >= 1.0).mean())
+        grasp_rate = float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean())
+        lift_reached_rate = float((eval_summary[:, 4] >= cfg.success_lift_threshold).mean())
+        if float(sustained_success_rate) > best_success:
+            best_success = float(sustained_success_rate)
+            best_iter = iter_offset + it
+            best_params = params
         rows.append({
             "iter": iter_offset + it,
             "env_steps": (iter_offset + it + 1) * steps_per_iter,
             "arm": arm,
             "task": task,
+            "reach_rate": round(reach_rate, 6),
+            "grasp_rate": round(grasp_rate, 6),
+            "lift_reached_rate": round(lift_reached_rate, 6),
             "train_return": round(float(train_reward.sum(axis=0).mean()), 6),
             "base_return": round(float(base_reward.sum(axis=0).mean()), 6),
             "base_reward_weight": round(float(base_reward_weight_arr), 6),
@@ -213,6 +246,7 @@ def train_ppo_arm(
             "v_loss": round(float(metrics["v_loss"]), 6),
             "entropy": round(float(metrics["entropy"]), 6),
             "approx_kl": round(float(metrics["approx_kl"]), 6),
+            "kl_anchor": round(float(metrics.get("kl_anchor", 0.0)), 6),
             "elapsed_seconds": round(elapsed, 3),
         })
         if checkup_fn is not None and current_checkup_interval > 0 and (it + 1) % current_checkup_interval == 0:
@@ -251,7 +285,9 @@ def train_ppo_arm(
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         with (checkpoint_dir / f"params_t{cfg.checkpoint_count:02d}_final.pkl").open("wb") as f:
             pickle.dump(jax.device_get(params), f)
-    return params, rows
+        with (checkpoint_dir / f"params_best_iter{best_iter:04d}.pkl").open("wb") as f:
+            pickle.dump(jax.device_get(best_params), f)
+    return params, rows, best_params, best_success, best_iter
 
 
 def evaluate_ppo_policy(
@@ -304,6 +340,7 @@ def evaluate_ppo_policy(
         control_dt=float(env.cfg.control_dt),
         hold_seconds=cfg.success_hold_seconds if cfg is not None else 0.5,
         lift_threshold=cfg.success_lift_threshold if cfg is not None else 0.05,
+        gate=success,  # contact-gated env success -> sustained GRASP, not sustained fling
     )
     return {
         "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
@@ -314,6 +351,9 @@ def evaluate_ppo_policy(
         "eval_train_return": round(float(train_reward.sum(axis=0).mean()), 6),
         "eval_success_rate": round(float(sustained_success_rate), 6),
         "eval_instant_success_rate": round(float(instant_success_rate), 6),
+        "eval_reach_rate": round(float((eval_summary[:, 2] >= 1.0).mean()), 6),
+        "eval_grasp_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean()), 6),
+        "eval_lift_reached_rate": round(float((eval_summary[:, 4] >= (cfg.success_lift_threshold if cfg is not None else 0.05)).mean()), 6),
         "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
         "eval_hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
         "eval_saturation_frac": round(float(saturation_frac.mean()), 6),
@@ -437,24 +477,34 @@ def make_update(
             logp = ppo.gaussian_logp(action, mean, log_std)
         return logp, ppo.gaussian_entropy(log_std), value
 
-    def loss_fn(params, batch, action_prior_weights):
+    def loss_fn(params, batch, action_prior_weights, reference_params, kl_coef):
         obs, action, old_logp, adv, ret = batch
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         logp, ent, value = evaluate(params, obs, action, action_prior_weights)
         ratio = jp.exp(logp - old_logp)
         pg_loss = -jp.minimum(ratio * adv, jp.clip(ratio, 0.8, 1.2) * adv).mean()
         v_loss = 0.5 * ((value - ret) ** 2).mean()
-        loss = pg_loss + 0.5 * v_loss - ent_coef * ent.mean()
+        # Decaying KL anchor to the frozen BC policy (raw net outputs), protecting the
+        # warm-start during early PPO. kl_coef is 0 for non-warm-start arms (a no-op).
+        cur_mean, cur_log_std, _ = net.apply(params, obs)
+        ref_mean, ref_log_std, _ = net.apply(reference_params, obs)
+        ref_mean = jax.lax.stop_gradient(ref_mean)
+        ref_log_std = jax.lax.stop_gradient(ref_log_std)
+        kl_anchor = _diag_gaussian_kl(
+            cur_mean, jp.clip(cur_log_std, -5.0, 2.0), ref_mean, jp.clip(ref_log_std, -5.0, 2.0)
+        ).mean()
+        loss = pg_loss + 0.5 * v_loss - ent_coef * ent.mean() + kl_coef * kl_anchor
         return loss, {
             "pg_loss": pg_loss,
             "v_loss": v_loss,
             "entropy": ent.mean(),
             "approx_kl": jp.mean(old_logp - logp),
+            "kl_anchor": kl_anchor,
         }
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
 
-    def update(params, opt_state, data, key, action_prior_weights):
+    def update(params, opt_state, data, key, action_prior_weights, reference_params, kl_coef):
         b = data[0].shape[0]
         num_minibatches = min(8, b)
         mb = max(1, b // num_minibatches)
@@ -468,7 +518,7 @@ def make_update(
                 params, opt_state = carry
                 sl = jax.lax.dynamic_slice_in_dim(perm, idx * mb, mb)
                 batch = tuple(jp.take(x, sl, axis=0) for x in data)
-                (_loss, metrics), grads = grad_fn(params, batch, action_prior_weights)
+                (_loss, metrics), grads = grad_fn(params, batch, action_prior_weights, reference_params, kl_coef)
                 updates, opt_state = optimizer.update(grads, opt_state, params)
                 params = optax.apply_updates(params, updates)
                 return (params, opt_state), metrics
@@ -488,10 +538,17 @@ def sustained_lift_success(
     control_dt: float,
     hold_seconds: float,
     lift_threshold: float,
+    gate: jp.ndarray | None = None,
 ) -> jp.ndarray:
-    """Fraction of episodes with lift held above threshold for a continuous window."""
+    """Fraction of episodes with lift held above threshold for a continuous window.
+
+    If `gate` (a per-step [T, E] mask, e.g. the contact-gated env `success` signal) is given, a
+    step only counts when both lift>threshold AND the gate hold -- so sustained success requires a
+    sustained *grasp*, not a sustained fling."""
     hold_steps = max(1, int(round(float(hold_seconds) / max(float(control_dt), 1e-9))))
     above = lift > float(lift_threshold)
+    if gate is not None:
+        above = above & (gate > 0.5)
 
     def episode_success(ep_above: jp.ndarray) -> jp.ndarray:
         def body(run_len, is_above):
@@ -501,6 +558,13 @@ def sustained_lift_success(
         return (run_lengths.max() >= hold_steps).astype(jp.float32)
 
     return jax.vmap(episode_success, in_axes=1)(above).mean()
+
+
+def _diag_gaussian_kl(mean_p, log_std_p, mean_q, log_std_q) -> jp.ndarray:
+    """KL(p || q) for diagonal Gaussians, summed over action dims."""
+    var_ratio = jp.exp(2.0 * (log_std_p - log_std_q))
+    sq_term = ((mean_p - mean_q) ** 2) * jp.exp(-2.0 * log_std_q)
+    return jp.sum((log_std_q - log_std_p) + 0.5 * (var_ratio + sq_term - 1.0), axis=-1)
 
 
 def squashed_gaussian_logp(action: jp.ndarray, mean: jp.ndarray, log_std: jp.ndarray) -> jp.ndarray:
@@ -519,21 +583,65 @@ def _atanh(value: jp.ndarray) -> jp.ndarray:
     return 0.5 * (jp.log1p(value) - jp.log1p(-value))
 
 
-def supervised_pretrain(net, env: Any, params: Any, bias: CompiledBias, task: str, key, cfg: PPOBiasConfig):
+def supervised_pretrain(net, env: Any, params: Any, bias: CompiledBias, task: str, key, cfg: PPOBiasConfig, *, phase_teacher: Any | None = None):
+    """Reformatted BC warm-start. Rolls out the controller (the supervised target) to collect
+    the states it actually visits and their discounted returns, then jointly fits the actor mean
+    to the target action AND the critic to those returns. Cloning on trajectory states (not just
+    reset states) keeps the warm-start on-distribution, and pretraining the critic prevents the
+    BC policy from being washed out by garbage advantages on PPO's first updates.
+
+    Teacher source: if a `phase_teacher` (closed-loop curriculum PhaseController) is supplied it
+    generates the BC dataset -- this is the contact->close->lift teacher. Otherwise the legacy
+    static `bias.supervised_target` rule-set is used."""
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
+    step_fn = jax.vmap(env.step)
     optimizer = optax.adam(cfg.supervised_lr)
     opt_state = optimizer.init(params)
 
-    def loss_fn(p, obs):
-        target = jax.vmap(lambda o: bias.supervised_target(o, task))(obs)
-        mean, _log_std, _value = net.apply(p, obs)
-        return jp.mean((jp.tanh(mean) - target) ** 2)
+    @jax.jit
+    def static_target_dataset(rk):
+        state = reset(jax.random.split(rk, cfg.supervised_batch))
+
+        def step(carry, _):
+            state = carry
+            target = jax.vmap(lambda o: bias.supervised_target(o, task))(state.obs)
+            if cfg.bc_rollout_states:
+                nstate = step_fn(state, target)
+            else:
+                nstate = state  # stay at reset distribution (legacy behavior)
+            return nstate, (state.obs, target, nstate.reward)
+
+        _final, (obs, target, reward) = jax.lax.scan(step, state, None, length=env.horizon)
+
+        # Discounted return-to-go of the env (base) reward under the controller.
+        def disc(carry, r):
+            ret = r + cfg.gamma * carry
+            return ret, ret
+
+        _last, returns = jax.lax.scan(disc, jp.zeros((cfg.supervised_batch,), jp.float32), reward, reverse=True)
+        flat = lambda x: x.reshape((-1,) + x.shape[2:])
+        return flat(obs), flat(target), returns.reshape((-1,))
+
+    def controller_dataset(rk):
+        if phase_teacher is not None:
+            return phase_teacher.bc_dataset(rk, envs=cfg.supervised_batch, gamma=cfg.gamma)
+        return static_target_dataset(rk)
+
+    def loss_fn(p, obs, target, returns):
+        mean, _log_std, value = net.apply(p, obs)
+        actor_loss = jp.mean((jp.tanh(mean) - target) ** 2)
+        critic_loss = jp.mean((value - returns) ** 2) if cfg.bc_critic_pretrain else 0.0
+        return actor_loss + 0.5 * critic_loss
 
     grad_fn = jax.value_and_grad(loss_fn)
-    for _ in range(cfg.supervised_steps):
-        key, rk = jax.random.split(key)
-        state = reset(jax.random.split(rk, cfg.supervised_batch))
-        loss, grads = grad_fn(params, state.obs)
+    key, dk = jax.random.split(key)
+    obs_all, tgt_all, ret_all = controller_dataset(dk)
+    n = obs_all.shape[0]
+    mb = max(1, min(cfg.supervised_batch * 4, n))
+    for step_i in range(cfg.supervised_steps):
+        key, pk = jax.random.split(key)
+        idx = jax.random.randint(pk, (mb,), 0, n)
+        loss, grads = grad_fn(params, obs_all[idx], tgt_all[idx], ret_all[idx])
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
     loss.block_until_ready()
