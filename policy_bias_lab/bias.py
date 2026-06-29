@@ -7,6 +7,7 @@ import jax.numpy as jp
 import numpy as np
 
 from policy_bias_lab.schema import FIELD_INDEX, validate_bias_spec
+from policy_bias_lab.symbolic_control import base_world_jacobian
 
 CORE_REWARD_TEMPLATE_NAMES: tuple[str, ...] = (
     "lift_basin_curriculum",
@@ -38,6 +39,24 @@ class CompiledBias:
     ctrl_open: jp.ndarray
     ctrl_close: jp.ndarray
     noise_scale: jp.ndarray
+    # Base->world calibration for the carriage action-prior directions (toward_object_xy /
+    # lower_base / raise_base). The base body is mounted with a 180deg X-flip, so the base->world
+    # Jacobian is M = diag(+1, -1, -1): commanding +base_y/+base_z ctrl moves the grasp in
+    # -world_y/-world_z. base_world_sgn = sign(diag M) per (base_x, base_y, base_z) actuator; it
+    # converts a world-frame approach offset into the correct ctrl sign and makes lower/raise move
+    # the grasp the right way. Without it the training-time prior drove approach away on Y and
+    # inverted descend/lift. Shared with symbolic_control.make_rule_action_fn so the operator the
+    # prior is SELECTED with equals the one it is TRAINED with. Defaults = identity (legacy).
+    base_act_idx: tuple[int, int, int] = (-1, -1, -1)
+    base_world_sgn: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    base_pos_obs_idx: tuple[int, int, int] = (0, 1, 2)
+    action_scale: float = 0.05
+    # Optional situation-dependent prior program (composed_priors). When present, the action
+    # prior is this compiled stateless fn(obs, weights) instead of the legacy rule sum. See
+    # EXPERIMENT_situation_dependent_priors.md.
+    prior_fn: Any = None
+    prior_default_weights: Any = None
+    prior_info: dict[str, Any] | None = None
 
     def shaped_reward(self, prev_eval: jp.ndarray, eval_vec: jp.ndarray, task: str) -> jp.ndarray:
         weights = default_reward_template_weights(task)
@@ -82,12 +101,16 @@ class CompiledBias:
         return self.weighted_action_prior(obs, self.default_action_prior_weights(), task)
 
     def weighted_action_prior(self, obs: jp.ndarray, weights: jp.ndarray, task: str) -> jp.ndarray:
+        if self.prior_fn is not None:  # situation-dependent prior program
+            return self.prior_fn(obs, weights)
         prior = jp.zeros((len(self.action_names),), dtype=jp.float32)
         for idx, rule in enumerate(self.spec.get("action_priors", [])):
             prior = prior + _rule_vector(rule, obs, self, task, weight_override=weights[idx])
         return jp.clip(prior, -1.0, 1.0)
 
     def default_action_prior_weights(self) -> jp.ndarray:
+        if self.prior_default_weights is not None:
+            return jp.asarray(self.prior_default_weights, dtype=jp.float32)
         return jp.asarray([
             float(rule.get("weight", 0.0)) for rule in self.spec.get("action_priors", [])
         ], dtype=jp.float32)
@@ -110,6 +133,24 @@ def compile_bias(spec: dict[str, Any], env: Any) -> CompiledBias:
     for group in spec.get("exploration_groups", []):
         ids = _ids_for_group(str(group["group"]), names, base_ids, hand_ids)
         noise[list(ids)] *= float(group["scale"])
+    # Base->world calibration (same source of truth as symbolic_control.make_rule_action_fn): read
+    # the base->world Jacobian once and keep the per-axis sign so the carriage prior directions are
+    # applied with the correct world orientation at TRAINING time (previously hard-coded for an
+    # un-flipped base, which inverted Y approach and descend/lift).
+    base_act_idx = tuple(names.index(n) if n in names else -1 for n in ("base_x", "base_y", "base_z"))
+    M = base_world_jacobian(env)
+    if M is None:
+        base_world_sgn = (1.0, 1.0, 1.0)
+    else:
+        diagM = np.diag(M)
+        sgn = np.where(np.abs(diagM) > 1e-6, np.sign(diagM), 1.0)
+        base_world_sgn = (float(sgn[0]), float(sgn[1]), float(sgn[2]))
+    base_pos_obs_idx = tuple(int(i) for i in getattr(env, "base_pos_obs_idx", (0, 1, 2)))
+    action_scale = float(getattr(getattr(env, "cfg", None), "action_scale", 0.05)) or 0.05
+    prior_fn = prior_default_weights = prior_info = None
+    if spec.get("prior_program"):
+        from policy_bias_lab.composed_priors import make_composed_prior_fn
+        prior_fn, prior_default_weights, prior_info = make_composed_prior_fn(env, spec["prior_program"])
     return CompiledBias(
         spec=spec,
         reward_terms=_sanitize_reward_terms(spec.get("reward_terms", [])),
@@ -120,6 +161,13 @@ def compile_bias(spec: dict[str, Any], env: Any) -> CompiledBias:
         ctrl_open=jp.asarray(env.ctrl_open),
         ctrl_close=jp.asarray(env.ctrl_close),
         noise_scale=jp.asarray(np.clip(noise, 0.05, 4.0)),
+        base_act_idx=base_act_idx,
+        base_world_sgn=base_world_sgn,
+        base_pos_obs_idx=base_pos_obs_idx,
+        action_scale=action_scale,
+        prior_fn=prior_fn,
+        prior_default_weights=prior_default_weights,
+        prior_info=prior_info,
     )
 
 
@@ -559,16 +607,33 @@ def _rule_vector(
     weight = jp.asarray(float(rule["weight"]) if weight_override is None else weight_override, dtype=jp.float32)
     out = jp.zeros((len(names),), dtype=jp.float32)
     if direction == "toward_object_xy":
+        # Position-SEEKING calibrated approach (identical operator to
+        # symbolic_control.make_rule_action_fn): convert the world-frame object offset to a
+        # carriage-target via the per-axis world sign, then drive the incremental ctrl toward it so
+        # the bias settles (delta -> 0 as aligned) instead of a constant push that integrates to the
+        # travel limit. The per-axis sign fixes the Y inversion (M_yy = -1) that drove approach away.
         obj_rel = _obj_rel(obs, len(names))
-        if "base_x" in names:
-            out = out.at[names.index("base_x")].set(jp.clip(obj_rel[0] * 8.0, -1.0, 1.0) * weight)
-        if "base_y" in names:
-            out = out.at[names.index("base_y")].set(jp.clip(obj_rel[1] * 8.0, -1.0, 1.0) * weight)
+        cur_ctrl = obs[obs.shape[-1] - len(names):]
+        bx, by, _bz = bias.base_act_idx
+        px, py, _pz = bias.base_pos_obs_idx
+        sx, sy, _sz = bias.base_world_sgn
+        scale = bias.action_scale
+        if bx >= 0:
+            out = out.at[bx].set(jp.clip((obs[px] + obj_rel[0] * sx - cur_ctrl[bx]) / scale, -1.0, 1.0) * weight)
+        if by >= 0:
+            out = out.at[by].set(jp.clip((obs[py] + obj_rel[1] * sy - cur_ctrl[by]) / scale, -1.0, 1.0) * weight)
         return out
-    if direction == "lower_base":
-        return _set_ids(out, ids, -abs(weight))
-    if direction == "raise_base":
-        return _set_ids(out, ids, abs(weight))
+    if direction in ("lower_base", "raise_base"):
+        # Vertical directions move ONLY the base-z carriage (matching the scorer), with the ctrl sign
+        # calibrated to world: ctrl sign that moves the grasp DOWN = -sign(d world_z / d base_z).
+        # With the 180deg-flipped base (M_zz = -1) this makes lower_base emit +base_z and raise_base
+        # emit -base_z -- previously hard-coded the opposite, so descend raised the hand and lift
+        # pushed down.
+        bz = bias.base_act_idx[2]
+        if bz < 0:
+            return out
+        z_sign = -bias.base_world_sgn[2] if direction == "lower_base" else bias.base_world_sgn[2]
+        return out.at[bz].set(z_sign * abs(weight))
     if direction == "close_hand":
         sign = jp.sign(bias.ctrl_close - bias.ctrl_open)
         return _set_ids(out, ids, weight) * sign

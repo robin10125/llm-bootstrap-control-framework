@@ -25,6 +25,16 @@ BIAS_ARMS = {
     "reward_action_prior": (True, True, False, False),
     "reward_supervised_init": (True, False, False, True),
     "full": (True, True, True, True),
+    # Situation-dependent prior arms (composed_priors). All use shaped reward + action prior;
+    # the prior program is injected per-arm by the runner from the arm name. See
+    # EXPERIMENT_situation_dependent_priors.md.
+    "prior_monolithic": (True, True, False, False),
+    "prior_gate_soft": (True, True, False, False),
+    "prior_gate_subgoal": (True, True, False, False),
+    "prior_gate_options": (True, True, False, False),
+    "prior_gate_stacked": (True, True, False, False),
+    "prior_reactive_law": (True, True, False, False),
+    "prior_dmp": (True, True, False, False),
 }
 
 

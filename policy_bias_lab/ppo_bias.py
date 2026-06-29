@@ -125,6 +125,7 @@ def train_ppo_arm(
     saved_time_checkpoints: set[int] = set()
     rows: list[dict[str, Any]] = []
     best_success = -1.0
+    best_score = -1.0
     best_iter = -1
     best_params = params
     reward_weights = default_reward_template_weights(task) if reward_weights is None else jp.asarray(reward_weights, dtype=jp.float32)
@@ -217,7 +218,17 @@ def train_ppo_arm(
         reach_rate = float((eval_summary[:, 2] >= 1.0).mean())
         grasp_rate = float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean())
         lift_reached_rate = float((eval_summary[:, 4] >= cfg.success_lift_threshold).mean())
-        if float(sustained_success_rate) > best_success:
+        # Best-checkpoint selection. Sustained contact-gated success is the primary objective, but it
+        # stays 0 for long stretches (and whole short runs), which used to pin "best" to the iter-0
+        # checkpoint and make eval.json misleading. Fall back to a graded grasp/lift score when
+        # success is 0: the composite is constructed so success strictly dominates (a 1.0 swing) over
+        # lift_reached (1e-3) over grasp (1e-6), so behavior is unchanged once success > 0 but the
+        # best checkpoint tracks real progress (grasp -> lift) beforehand.
+        best_metric = (float(sustained_success_rate)
+                       + 1e-3 * lift_reached_rate
+                       + 1e-6 * grasp_rate)
+        if best_metric > best_score:
+            best_score = best_metric
             best_success = float(sustained_success_rate)
             best_iter = iter_offset + it
             best_params = params

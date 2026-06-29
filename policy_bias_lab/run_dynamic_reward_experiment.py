@@ -27,6 +27,7 @@ from policy_bias_lab.action_priors import (
     load_pareto_supervised_target_rules,
 )
 from policy_bias_lab.bias import REWARD_TEMPLATE_NAMES, compile_bias, default_reward_template_weights, reward_template_metadata
+from policy_bias_lab.composed_priors import default_library, prior_program_for_arm
 from policy_bias_lab.dynamic_rewards import DynamicRewardCoach, DynamicRewardConfig, load_pre_run_reward_analysis
 from policy_bias_lab.es import BIAS_ARMS
 from policy_bias_lab.llm_bias import load_bias_spec
@@ -184,6 +185,12 @@ def main() -> int:
     (args.out / "bias_spec.json").write_text(json.dumps(bias_spec, indent=2) + "\n")
     compiled_bias = compile_bias(bias_spec, env)
 
+    # Shared legacy sub-prior library for the situation-dependent prior arms (constant across a
+    # bake-off so only the gating discipline varies). None -> composed_priors.default_library().
+    prior_library = None
+    if args.prior_library_json is not None:
+        prior_library = json.loads(Path(args.prior_library_json).read_text())
+
     # Build the closed-loop curriculum teacher ONCE (shared across supervised_init arms/seeds),
     # validate it with the staged contact-gated metric, and only commit it as the warm-start
     # teacher if it actually reaches contact-grasp-lift -- otherwise fall back to no teacher
@@ -293,6 +300,9 @@ def main() -> int:
             for arm in arms
         },
         "seeds": seeds,
+        "prior_program_arms": {arm: prior_program_for_arm(arm, library=prior_library)
+                               for arm in arms if prior_program_for_arm(arm, library=prior_library) is not None},
+        "prior_library": prior_library or default_library(),
         "env": env_summary,
         "ppo": cfg.__dict__,
         "dynamic_reward": {
@@ -386,8 +396,19 @@ def main() -> int:
                         initial_program_record = shared_program["record"]
                         (run_dir / "initial_bias_spec.json").write_text(json.dumps(shared_program["spec"], indent=2) + "\n")
                         active_bias = compile_bias(shared_program["spec"], env)
+                    # Situation-dependent prior arms: inject the arm's prior program into the
+                    # (possibly reward-augmented) spec and recompile. The program is a stateless
+                    # fn(obs, weights) and replaces the legacy rule-sum prior. See
+                    # EXPERIMENT_situation_dependent_priors.md.
+                    arm_prior_program = prior_program_for_arm(arm, library=prior_library)
+                    if arm_prior_program is not None:
+                        arm_spec = dict(active_bias.spec)
+                        arm_spec["prior_program"] = arm_prior_program
+                        active_bias = compile_bias(arm_spec, env)
+                        active_action_prior_weights = active_bias.default_action_prior_weights()
+                        (run_dir / "prior_program.json").write_text(json.dumps(arm_prior_program, indent=2) + "\n")
                     prior_coach = None
-                    if bool(BIAS_ARMS[arm][1]) and args.action_prior_checkup_steps > 0:
+                    if bool(BIAS_ARMS[arm][1]) and args.action_prior_checkup_steps > 0 and arm_prior_program is None:
                         prior_coach = ActionPriorCoach(
                             ActionPriorConfig(
                                 llm_backend=args.llm_backend,
@@ -436,6 +457,8 @@ def main() -> int:
                         }
                         adapted_spec, active_reward_weights, rewrite_record = coach.rewrite_reward_code(rewrite_ctx, bias_spec)
                         active_base_reward_weight = coach.base_reward_weight
+                        if arm_prior_program is not None:
+                            adapted_spec = {**adapted_spec, "prior_program": arm_prior_program}
                         (run_dir / "adapted_bias_spec.json").write_text(json.dumps(adapted_spec, indent=2) + "\n")
                         active_bias = compile_bias(adapted_spec, env)
                         params, second_rows, best2_params, best2_success, best2_iter = train_ppo_arm(
@@ -832,6 +855,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-program-json", type=Path, default=None,
                         help="Optional JSON phase program (Phase B / LLM-authored). Defaults to the "
                         "hand-written curriculum for the task.")
+    parser.add_argument("--prior-library-json", type=Path, default=None,
+                        help="Optional JSON list of legacy sub-priors [{name, rules:[...]}] shared by "
+                        "the situation-dependent prior arms (prior_gate_* / prior_monolithic). "
+                        "Defaults to composed_priors.default_library(). Keep it constant across a "
+                        "bake-off so only the gating discipline varies.")
     parser.add_argument("--phase-teacher-min-progress", type=float, default=0.15,
                         help="Reject the teacher (fall back to no warm-start) if its validated "
                         "final_phase_frac is below this; keeps a useless teacher from poisoning BC. "
