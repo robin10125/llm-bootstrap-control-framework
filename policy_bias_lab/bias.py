@@ -491,6 +491,9 @@ def _lift_template_contributions(prev_eval: jp.ndarray, eval_vec: jp.ndarray) ->
     ], dtype=jp.float32)
 
 
+# QUARANTINED-IN-PLACE (#2, legacy): the adaptive reward-template slots. Only populated by the
+# DynamicRewardCoach (now under legacy/); empty in the active path, where the single fixed
+# `lift_basin_curriculum` core template is the only shaping. Returns zeros when `terms` is empty.
 def _adaptive_reward_contributions(
     terms: tuple[dict[str, Any], ...],
     prev_eval: jp.ndarray,
@@ -594,6 +597,10 @@ def _progress(prev_eval: jp.ndarray, eval_vec: jp.ndarray, observable: str, dire
     return jp.clip(_potential(eval_vec, term) - _potential(prev_eval, term), -0.10, 0.10)
 
 
+# QUARANTINED-IN-PLACE (#5, legacy): the fixed {group,direction} rule-sum prior path. Superseded by
+# the composed/robot-derived prior programs (composed_priors/freeform_priors); only reached when a
+# CompiledBias has no prior_fn (legacy monolithic/gated baseline arms). The active prior-authoring
+# path never calls this. Kept for back-compat + paper ablations; do not extend.
 def _rule_vector(
     rule: dict[str, Any],
     obs: jp.ndarray,

@@ -39,9 +39,9 @@ boundary from `../bootstrapping/mjx_env.py`.
 Add `reward_action_prior,full` to `--arms` only when testing combined effects after
 the isolated comparisons.
 
-`run_experiment.py` is retained as the legacy ES runner. It is useful for narrow
-optimizer diagnostics, but it is not the right learner for the main actor-critic
-experiment because PPO learns from one policy collecting many parallel rollouts.
+Quarantined legacy subsystems live under `policy_bias_lab/legacy/` (the DynamicRewardCoach,
+the phase/warm-start teacher, the old pareto action-prior selection, and the old PPO runner).
+They are kept for reference and paper ablations but are out of the active prior-authoring path.
 
 Shadow/MJX memory safety now comes from `../bootstrapping/mjx_env.py`: large colliding
 distal fingertip meshes are replaced with primitive collision proxies while visual

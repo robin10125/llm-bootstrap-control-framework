@@ -290,6 +290,19 @@ def make_composed_prior_fn(env: Any, program: dict[str, Any]) -> tuple[Callable[
             "sub_names": [str(s.get("name", f"sub_{i}")) for i, s in enumerate(library)],
         }
 
+    if mode in ("stacked", "freeform", "freeform_staged"):
+        # Lazy import avoids the composed_priors <-> freeform_priors cycle. `stacked` composes
+        # DSL/free-form phase sub-priors via the FIXED stacked gate; `freeform` is a single free-form
+        # law; `freeform_staged` is a free-form law composed of N author-defined stages, each with a
+        # free-form GATE expression (soft/hard blend) -- generalizes the fixed 3-phase gate.
+        from policy_bias_lab.freeform_priors import (
+            make_stacked_prior_fn, make_freeform_prior_fn, make_freeform_staged_prior_fn)
+        if mode == "stacked":
+            return make_stacked_prior_fn(env, program)
+        if mode == "freeform_staged":
+            return make_freeform_staged_prior_fn(env, program)
+        return make_freeform_prior_fn(env, program)
+
     if mode == "reactive_law":
         return _make_reactive_law(env, program, action_dim)
 

@@ -19,7 +19,10 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(".xla_cache").resolv
 
 import jax  # noqa: E402  (must follow the XLA env-var configuration above)
 
-from policy_bias_lab.action_priors import (
+# NOTE: the coach / phase-teacher / pareto-selection subsystems are quarantined under
+# policy_bias_lab.legacy (proven null or superseded). This runner still references them for the
+# legacy orchestration branches, but the active path uses --no-coach + injected prior programs.
+from policy_bias_lab.legacy.action_priors import (
     ActionPriorCoach,
     ActionPriorConfig,
     load_action_prior_rules,
@@ -28,12 +31,12 @@ from policy_bias_lab.action_priors import (
 )
 from policy_bias_lab.bias import REWARD_TEMPLATE_NAMES, compile_bias, default_reward_template_weights, reward_template_metadata
 from policy_bias_lab.composed_priors import default_library, prior_program_for_arm
-from policy_bias_lab.dynamic_rewards import DynamicRewardCoach, DynamicRewardConfig, load_pre_run_reward_analysis
+from policy_bias_lab.legacy.dynamic_rewards import DynamicRewardCoach, DynamicRewardConfig, load_pre_run_reward_analysis
 from policy_bias_lab.es import BIAS_ARMS
 from policy_bias_lab.llm_bias import load_bias_spec
-from policy_bias_lab.phase_controller import load_phase_teacher
+from policy_bias_lab.legacy.phase_controller import load_phase_teacher
 from policy_bias_lab.ppo_bias import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
-from policy_bias_lab.run_ppo_experiment import summarize, write_csv
+from policy_bias_lab.report_utils import summarize, write_csv
 from policy_bias_lab.tasks import task_metadata
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -190,6 +193,10 @@ def main() -> int:
     prior_library = None
     if args.prior_library_json is not None:
         prior_library = json.loads(Path(args.prior_library_json).read_text())
+    prior_program_files = {}
+    for spec in args.prior_program_arm:
+        a, _, p = str(spec).partition("=")
+        prior_program_files[a.strip()] = p.strip()
 
     # Build the closed-loop curriculum teacher ONCE (shared across supervised_init arms/seeds),
     # validate it with the staged contact-gated metric, and only commit it as the warm-start
@@ -401,6 +408,8 @@ def main() -> int:
                     # fn(obs, weights) and replaces the legacy rule-sum prior. See
                     # EXPERIMENT_situation_dependent_priors.md.
                     arm_prior_program = prior_program_for_arm(arm, library=prior_library)
+                    if arm in prior_program_files:  # explicit per-arm program file (overrides)
+                        arm_prior_program = json.loads(Path(prior_program_files[arm]).read_text())
                     if arm_prior_program is not None:
                         arm_spec = dict(active_bias.spec)
                         arm_spec["prior_program"] = arm_prior_program
@@ -855,6 +864,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase-program-json", type=Path, default=None,
                         help="Optional JSON phase program (Phase B / LLM-authored). Defaults to the "
                         "hand-written curriculum for the task.")
+    parser.add_argument("--prior-program-arm", action="append", default=[],
+                        help="Inject a full prior program from a file for a specific arm: "
+                        "ARM=path.json (repeatable). Overrides the arm-name-derived program. Used by "
+                        "the DSL-vs-free-form harness to inject LLM-generated stacked priors.")
     parser.add_argument("--prior-library-json", type=Path, default=None,
                         help="Optional JSON list of legacy sub-priors [{name, rules:[...]}] shared by "
                         "the situation-dependent prior arms (prior_gate_* / prior_monolithic). "

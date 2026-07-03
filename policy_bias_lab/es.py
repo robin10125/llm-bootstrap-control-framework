@@ -35,6 +35,12 @@ BIAS_ARMS = {
     "prior_gate_stacked": (True, True, False, False),
     "prior_reactive_law": (True, True, False, False),
     "prior_dmp": (True, True, False, False),
+    # DSL-vs-free-form preliminary: prior program injected from a file via --prior-program-arm.
+    "dsl_stacked": (True, True, False, False),
+    "freeform_stacked": (True, True, False, False),
+    # DOF-engagement instruction comparison (consider vs encourage).
+    "freeform_consider": (True, True, False, False),
+    "freeform_encourage": (True, True, False, False),
 }
 
 

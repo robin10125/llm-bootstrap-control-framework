@@ -218,15 +218,21 @@ def train_ppo_arm(
         reach_rate = float((eval_summary[:, 2] >= 1.0).mean())
         grasp_rate = float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean())
         lift_reached_rate = float((eval_summary[:, 4] >= cfg.success_lift_threshold).mean())
-        # Best-checkpoint selection. Sustained contact-gated success is the primary objective, but it
-        # stays 0 for long stretches (and whole short runs), which used to pin "best" to the iter-0
-        # checkpoint and make eval.json misleading. Fall back to a graded grasp/lift score when
-        # success is 0: the composite is constructed so success strictly dominates (a 1.0 swing) over
-        # lift_reached (1e-3) over grasp (1e-6), so behavior is unchanged once success > 0 but the
-        # best checkpoint tracks real progress (grasp -> lift) beforehand.
+        # Contact-gated lifted grip (grasp AND raised): the real bridge from a secure grip to success,
+        # and unlike lift_reached it cannot be inflated by flinging.
+        grasp_lift_rate = float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)
+                                 & (eval_summary[:, 4] >= cfg.success_lift_threshold)).mean())
+        # Best-checkpoint selection. Sustained contact-gated success is primary; it stays 0 for long
+        # stretches (and whole runs), so fall back to a CONTACT-GATED progress score
+        # (grasp -> gated-lift). NOTE: lift_reached alone is NOT contact-gated -- flinging inflates it
+        # -- so it is only a negligible tie-breaker here. The earlier version weighted lift_reached
+        # (1e-3) far ABOVE grasp (1e-6) and so picked early flingy checkpoints over a genuinely learned
+        # grip (e.g. it hid reactive_law's sustained 0.79 grasp behind an iter-4 pick). Ordering:
+        # success (1.0) >> gated lifted grip (1e-2) >> secure grip (1e-4) >> raw lift tie-break (1e-7).
         best_metric = (float(sustained_success_rate)
-                       + 1e-3 * lift_reached_rate
-                       + 1e-6 * grasp_rate)
+                       + 1e-2 * grasp_lift_rate
+                       + 1e-4 * grasp_rate
+                       + 1e-7 * lift_reached_rate)
         if best_metric > best_score:
             best_score = best_metric
             best_success = float(sustained_success_rate)
@@ -314,6 +320,7 @@ def evaluate_ppo_policy(
     reward_weights: jp.ndarray | None = None,
     base_reward_weight: float = 1.0,
     action_prior_weights: jp.ndarray | None = None,
+    return_obs: bool = False,
 ) -> dict[str, Any]:
     use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=_infer_hidden(params))
@@ -353,7 +360,7 @@ def evaluate_ppo_policy(
         lift_threshold=cfg.success_lift_threshold if cfg is not None else 0.05,
         gate=success,  # contact-gated env success -> sustained GRASP, not sustained fling
     )
-    return {
+    out = {
         "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
         "eval_base_reward_weight": round(float(base_reward_weight_arr), 6),
         "eval_shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
@@ -364,6 +371,8 @@ def evaluate_ppo_policy(
         "eval_instant_success_rate": round(float(instant_success_rate), 6),
         "eval_reach_rate": round(float((eval_summary[:, 2] >= 1.0).mean()), 6),
         "eval_grasp_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean()), 6),
+        "eval_grasp_lift_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)
+                                             & (eval_summary[:, 4] >= (cfg.success_lift_threshold if cfg is not None else 0.05))).mean()), 6),
         "eval_lift_reached_rate": round(float((eval_summary[:, 4] >= (cfg.success_lift_threshold if cfg is not None else 0.05)).mean()), 6),
         "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
         "eval_hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
@@ -371,6 +380,9 @@ def evaluate_ppo_policy(
         "eval_action_abs_mean": round(float(action_abs_mean.mean()), 6),
         "eval_summary": [round(float(x), 6) for x in jp.mean(eval_summary, axis=0)],
     }
+    if return_obs:
+        out["eval_obs"] = jax.device_get(_obs)  # [T, E, obs_dim] visited states, for stage occupancy
+    return out
 
 
 def make_collect(

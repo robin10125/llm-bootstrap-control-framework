@@ -187,7 +187,6 @@ def main() -> int:
         physics_dt=float(args.physics_dt),
         obj_xy_range=float(args.obj_xy_range),
     )
-    bias = compile_bias(bias_spec, env)
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=tuple(config["ppo"]["hidden"]))
     action_transform = str(config["ppo"].get("action_transform", "raw"))
     prior_logit_clip = float(config["ppo"].get("prior_logit_clip", 0.95))
@@ -199,13 +198,30 @@ def main() -> int:
     for arm in arms:
         if arm not in BIAS_ARMS:
             raise KeyError(f"unknown arm {arm!r}")
-        checkpoints = sorted((run_dir / f"lift_s0_{arm}" / "checkpoints").glob("params_t*_iter*.pkl"))
+        # Per-arm bias: inject the arm's situation-dependent prior program (saved at train time)
+        # so the rendered policy applies the SAME prior it trained with. Without this the shared
+        # bias_spec has no prior_program and the composed-prior arms would render with no prior.
+        arm_spec = dict(bias_spec)
+        prog_path = run_dir / f"lift_s0_{arm}" / "prior_program.json"
+        if prog_path.exists():
+            arm_spec["prior_program"] = json.loads(prog_path.read_text())
+        bias = compile_bias(arm_spec, env)
+        ckpt_root = run_dir / f"lift_s0_{arm}" / "checkpoints"
+        if args.checkpoints == "final":
+            checkpoints = sorted(ckpt_root.glob("params_t*_final.pkl")) or sorted(ckpt_root.glob("params_t*_iter*.pkl"))[-1:]
+        elif args.checkpoints == "best":
+            checkpoints = sorted(ckpt_root.glob("params_best_iter*.pkl"))
+        else:
+            checkpoints = sorted(ckpt_root.glob("params_t*_iter*.pkl"))
+        # Jit the per-step action (net + prior) once per arm -- eager per-step JAX dispatch on CPU
+        # is ~100x slower and makes rendering take tens of minutes.
+        act_fn = make_act_fn(net, bias, arm, args.task, action_transform, prior_logit_clip)
         for ckpt in checkpoints:
             label = ckpt.stem.replace("params_", "")
             with ckpt.open("rb") as f:
                 params = pickle.load(f)
             attempts = [
-                rollout_stats(env, net, params, bias, arm, args.task, args.seed_base + i, action_transform, prior_logit_clip)
+                rollout_stats(env, act_fn, params, args.seed_base + i)
                 for i in range(args.max_attempts)
             ]
             successes = [s for s in attempts if s.success]
@@ -219,7 +235,7 @@ def main() -> int:
                 if video_path.exists() and not args.overwrite:
                     pass
                 else:
-                    render_rollout(env, net, params, bias, arm, args.task, stats.seed, video_path, action_transform, prior_logit_clip, fps=args.fps, width=args.width, height=args.height)
+                    render_rollout(env, act_fn, params, stats.seed, video_path, fps=args.fps, width=args.width, height=args.height)
                 rec = {
                     "arm": arm,
                     "checkpoint": label,
@@ -239,48 +255,44 @@ def main() -> int:
     return 0
 
 
-def policy_action(
+def make_act_fn(
     net: Any,
-    params: Any,
     bias: CompiledBias,
     arm: str,
     task: str,
-    obs: np.ndarray,
     action_transform: str,
     prior_logit_clip: float,
-) -> np.ndarray:
-    use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
-    del use_reward_bias, use_exploration_bias
-    mean, _log_std, _value = net.apply(params, jp.asarray(obs[None, :]))
-    action = mean[0]
-    if use_action_prior:
-        prior = bias.action_prior(jp.asarray(obs), task)
+) -> Any:
+    """Jitted per-step action: net mean + (optional) the arm's situation-dependent prior.
+
+    The prior is applied exactly as in training (bias.action_prior == weighted_action_prior with
+    default weights, which dispatches to the composed prior_fn when a prior_program is present).
+    """
+    _, use_action_prior, _, _ = BIAS_ARMS[arm]
+
+    def _act(params, obs):
+        mean, _log_std, _value = net.apply(params, obs[None, :])
+        action = mean[0]
+        if use_action_prior:
+            prior = bias.action_prior(obs, task)
+            if action_transform == "tanh":
+                prior = _atanh_clipped(prior, prior_logit_clip)
+            action = action + prior
         if action_transform == "tanh":
-            prior = _atanh_clipped(prior, prior_logit_clip)
-        action = action + prior
-    if action_transform == "tanh":
-        action = jp.tanh(action)
-    return np.asarray(jp.clip(action, -1.0, 1.0), dtype=np.float32)
+            action = jp.tanh(action)
+        return jp.clip(action, -1.0, 1.0)
+
+    return jax.jit(_act)
 
 
-def rollout_stats(
-    env: CpuShadowEnv,
-    net: Any,
-    params: Any,
-    bias: CompiledBias,
-    arm: str,
-    task: str,
-    seed: int,
-    action_transform: str,
-    prior_logit_clip: float,
-) -> RolloutStats:
+def rollout_stats(env: CpuShadowEnv, act_fn: Any, params: Any, seed: int) -> RolloutStats:
     obs = env.reset(seed)
     lift_max = -1e9
     total = 0.0
     success = False
     final_lift = 0.0
     for _ in range(env.horizon):
-        action = policy_action(net, params, bias, arm, task, obs, action_transform, prior_logit_clip)
+        action = np.asarray(act_fn(params, jp.asarray(obs)), dtype=np.float32)
         obs, reward, metrics = env.step(action)
         total += reward
         final_lift = metrics["lift"]
@@ -297,15 +309,10 @@ def _atanh_clipped(value: jp.ndarray, limit: float) -> jp.ndarray:
 
 def render_rollout(
     env: CpuShadowEnv,
-    net: Any,
+    act_fn: Any,
     params: Any,
-    bias: CompiledBias,
-    arm: str,
-    task: str,
     seed: int,
     video_path: Path,
-    action_transform: str,
-    prior_logit_clip: float,
     *,
     fps: int,
     width: int,
@@ -341,7 +348,7 @@ def render_rollout(
                 frame = np.asarray(renderer.render(), dtype=np.uint8)
                 assert proc.stdin is not None
                 proc.stdin.write(frame.tobytes())
-            action = policy_action(net, params, bias, arm, task, obs, action_transform, prior_logit_clip)
+            action = np.asarray(act_fn(params, jp.asarray(obs)), dtype=np.float32)
             obs, _reward, _metrics = env.step(action)
         renderer.update_scene(env.data, camera=camera)
         frame = np.asarray(renderer.render(), dtype=np.uint8)
@@ -375,6 +382,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--physics-dt", type=float, default=0.01)
     parser.add_argument("--obj-xy-range", type=float, default=0.04)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--checkpoints", choices=["final", "best", "all"], default="final",
+                        help="Which checkpoint(s) per arm to render. 'final' = end-of-training policy.")
     return parser.parse_args()
 
 

@@ -13,9 +13,9 @@ from typing import Any
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 
-from policy_bias_lab.action_priors import ActionPriorCoach, ActionPriorConfig, load_action_prior_rules
+from policy_bias_lab.legacy.action_priors import ActionPriorCoach, ActionPriorConfig, load_action_prior_rules
 from policy_bias_lab.bias import compile_bias
-from policy_bias_lab.dynamic_rewards import load_pre_run_reward_analysis
+from policy_bias_lab.legacy.dynamic_rewards import load_pre_run_reward_analysis
 from policy_bias_lab.es import BIAS_ARMS
 from policy_bias_lab.llm_bias import load_bias_spec
 from policy_bias_lab.ppo_bias import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
