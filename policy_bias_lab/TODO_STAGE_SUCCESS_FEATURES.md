@@ -201,6 +201,23 @@ budget and gate-boundary causes first.
 
 ---
 
+## Future experiment: soft vs hard blend (controlled)
+
+Observational evidence strongly favors `blend='soft'` — the winners of 4/4 staged runs were soft
+except the self-locking `hard_guarded_funnel_grip` (0.041, the project's canonical failure case),
+and the self-lock failure mode is *structural* to hard blend (argmax can trap the policy in a stage
+whose own actions keep its gate winning; soft always gives weight to a rising successor gate).
+Other hard-blend candidates placed at the bottom of their batches (`hard_guarded_handoff` +0.018).
+But blend is confounded with everything else (each candidate differs in stages/gates/channels; only
+~4 hard candidates sampled), so this is NOT rigorously established.
+
+**Controlled test (cheap, existing machinery):** take the 2–3 best staged programs, flip ONLY the
+`blend` field, and run each variant through `evaluate_candidate_ppo` at matched budget
+(~8 min/eval, ~6 evals ≈ 1 h). This isolates the blend variable the same way PRELIM_dsl_vs_freeform
+isolated the sub-prior representation. Secondary readout: whether hard blend's crisper stage
+separation makes the occupancy/hand-off diagnostics sharper enough to matter for the feedback loop.
+Until run, treat **soft as the default recommendation**.
+
 ## Build order
 
 1. **Increment 1 (diagnostic):** Feature 1 + Feature 3 + Feature 6 — all in `stage_occupancy` +

@@ -21,7 +21,11 @@ calls do not (the budget models the scarce real-robot-rollout resource).
 from __future__ import annotations
 
 import json
+import os
+import pickle
 import re
+import signal
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -165,7 +169,28 @@ class AgenticOrchestrator:
     ppo_eval_envs: int = 256
     score_envs: int = 128            # open-loop arbiter only
     score_seed: int = 0
+    stop_after: int | None = None    # pause (checkpoint + exit) after this many evals THIS SESSION
+    # Wall-clock termination (long runs). Setting plateau_hours switches the loop into wall-clock
+    # mode: iteration-count plateau stops and chain deactivation are DISABLED, and the run ends
+    # only on one of these criteria (or budget/pause). Paused time never counts as run time.
+    min_hours: float | None = None      # no plateau-stop before this much accumulated run time
+    plateau_hours: float | None = None  # stop when the best objective has not improved for this long
+    success_stop: float | None = None   # stop when any eval's trained_success (SUSTAINED
+                                        # contact-gated hold rate) reaches this
+    write_dash: bool = False            # live dashboard.html on each checkpoint (off = paused;
+                                        # regenerate anytime: python -m policy_bias_lab.run_dashboard)
     log: dict = field(default_factory=dict)
+
+    # Everything needed to reconstruct the orchestrator on resume (out_dir/env come from the CLI).
+    CONFIG_KEYS = ("task", "rep", "dof_mode", "llm_backend", "llm_model", "budget", "n_seeds",
+                   "patience", "handoff_attempts", "per_stage_iters", "eps", "use_human_analogy",
+                   "arbiter", "ppo_task", "ppo_train_seconds", "ppo_train_envs", "ppo_eval_envs",
+                   "score_envs", "score_seed", "min_hours", "plateau_hours", "success_stop",
+                   "write_dash")
+    # Mutable progress restored verbatim on resume.
+    STATE_KEYS = ("iters", "evaluated", "since_improve_global", "best_obj_global", "log",
+                  "context_block", "seeds", "chains", "chosen_idx", "rr", "next_seed",
+                  "budget", "patience", "budget_resized", "wall_elapsed", "t_improve_elapsed")
 
     def __post_init__(self) -> None:
         self.out_dir = Path(self.out_dir)
@@ -179,6 +204,118 @@ class AgenticOrchestrator:
         self.evaluated: list[dict] = []   # every scored candidate (for the report)
         self.since_improve_global = 0
         self.best_obj_global = -1e18
+        # Resumable pipeline position (all persisted by save_checkpoint).
+        self.context_block: str | None = None
+        self.seeds: list[dict] | None = None
+        self.chains: list[_Chain] = []
+        self.chosen_idx: list[int] | None = None  # indices into self.chains chosen for refinement
+        self.rr = 0                               # round-robin cursor over active chains
+        self.next_seed = 0                        # first not-yet-evaluated explore seed
+        self.budget_resized = False               # per_stage_iters resize already applied
+        # Wall-clock bookkeeping (persisted): total ACTIVE run seconds across sessions, and the
+        # elapsed-time stamp of the last global-best improvement.
+        self.wall_elapsed = 0.0
+        self.t_improve_elapsed = 0.0
+        # Session-local (never persisted).
+        self._ckpt_path = self.out_dir / "checkpoint.pkl"
+        self._stop_requested = False
+        self._session_evals = 0
+        self._session_t0 = time.time()
+
+    @property
+    def wall_mode(self) -> bool:
+        return self.plateau_hours is not None
+
+    def _elapsed(self) -> float:
+        """Accumulated ACTIVE run seconds (pauses excluded): prior sessions + this one."""
+        return self.wall_elapsed + (time.time() - self._session_t0)
+
+    def _wall_stop(self) -> str | None:
+        """Wall-clock termination criteria; returns the stop reason or None."""
+        if self.success_stop is not None:
+            s = max((float((r.get("diagnostics") or {}).get("trained_success") or 0.0)
+                     for r in self.evaluated), default=0.0)
+            if s >= self.success_stop:
+                return (f"success criterion met: trained sustained-hold success {s:.3f} >= "
+                        f"{self.success_stop}")
+        if self.plateau_hours is not None:
+            el = self._elapsed()
+            stall_h = (el - self.t_improve_elapsed) / 3600.0
+            if ((self.min_hours is None or el >= self.min_hours * 3600.0)
+                    and stall_h >= self.plateau_hours):
+                return (f"wall-clock plateau: best objective unimproved for {stall_h:.2f} h "
+                        f"(threshold {self.plateau_hours} h) after {el / 3600.0:.2f} h of run time")
+        return None
+
+    # -- checkpoint / resume ----------------------------------------------------------------------
+    def save_checkpoint(self) -> None:
+        """Atomically persist config + full progress. Called after EVERY evaluation, so a hard kill
+        (SIGKILL, power loss) loses at most the in-flight eval; SIGINT/SIGTERM lose nothing."""
+        state = {k: getattr(self, k) for k in self.STATE_KEYS}
+        state["wall_elapsed"] = self._elapsed()  # live total, so resume continues the clock
+        # best_params are JAX device arrays until finish(); materialize for pickling.
+        state["evaluated"] = [
+            {**r, "best_params": (jax.device_get(r["best_params"])
+                                  if r.get("best_params") is not None else None)}
+            for r in self.evaluated]
+        payload = {"version": 1, "config": {k: getattr(self, k) for k in self.CONFIG_KEYS},
+                   "state": state}
+        tmp = self._ckpt_path.with_suffix(".pkl.tmp")
+        with tmp.open("wb") as f:
+            pickle.dump(payload, f)
+        os.replace(tmp, self._ckpt_path)
+        if self.write_dash:
+            try:  # live metrics page from the same payload; must never take the run down
+                from policy_bias_lab.run_dashboard import write_dashboard
+                write_dashboard(payload, self.out_dir / "dashboard.html")
+            except Exception as e:
+                print(f"  [dashboard] update failed (run unaffected): {e}")
+
+    def restore(self, state: dict) -> None:
+        for k in self.STATE_KEYS:
+            if k in state:
+                setattr(self, k, state[k])
+
+    def extend_budget(self, new_budget: int) -> None:
+        """Reopen a resumed run whose chains already plateaued or whose budget ran out: raise the
+        budget and give the chosen chains a fresh patience window."""
+        self.budget = new_budget
+        self.since_improve_global = 0
+        for i in (self.chosen_idx or []):
+            self.chains[i].active = True
+            self.chains[i].since_improve = 0
+        print(f"  [resume] budget extended to {new_budget}; refinement chains reactivated")
+
+    @staticmethod
+    def load_checkpoint(out_dir: Path) -> dict:
+        with (Path(out_dir) / "checkpoint.pkl").open("rb") as f:
+            return pickle.load(f)
+
+    def _install_signal_handlers(self) -> None:
+        def handler(signum, frame):
+            if self._stop_requested:  # second signal: abort now (last checkpoint is already on disk)
+                raise KeyboardInterrupt
+            self._stop_requested = True
+            print(f"\n[pause] got signal {signum}: will checkpoint and exit after the current "
+                  f"evaluation finishes (signal again to abort immediately -- everything up to the "
+                  f"last finished iteration is already saved)")
+        for s in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(s, handler)
+            except ValueError:  # not the main thread (e.g. driven from a test harness)
+                pass
+
+    def _should_pause(self) -> bool:
+        return self._stop_requested or (self.stop_after is not None
+                                        and self._session_evals >= self.stop_after)
+
+    def _paused(self) -> dict:
+        self.save_checkpoint()
+        print(f"[paused] {self.iters}/{self.budget} iterations done, state -> {self._ckpt_path}")
+        print(f"         resume with: python -m policy_bias_lab.run_agentic_selection "
+              f"--out {self.out_dir} --resume")
+        return {"paused": True, "iters_used": self.iters, "budget": self.budget,
+                "checkpoint": str(self._ckpt_path)}
 
     # -- LLM plumbing ---------------------------------------------------------------------------
     def _llm(self, prompt: str, tag: str) -> str:
@@ -282,7 +419,8 @@ class AgenticOrchestrator:
             objective = res["objective_score"]
             diagnostics = res["diagnostics"]
             full = {"eval": res["eval"], "best_train_success": res["best_train_success"],
-                    "best_checkpoint_iter": res["best_checkpoint_iter"]}
+                    "best_checkpoint_iter": res["best_checkpoint_iter"],
+                    "telemetry": res.get("telemetry")}
             best_params = res["best_params"]
         else:  # open_loop: the cheap blind scorer (prefilter-grade only)
             score = score_program(self.env, prog, envs=self.score_envs, seed=self.score_seed)
@@ -290,13 +428,16 @@ class AgenticOrchestrator:
             diagnostics = _brief_diag(score)
             full = score
         self.iters += 1
+        self._session_evals += 1
         rec = {"iter": self.iters, "source": source, "name": raw_cand.get("name"),
                "objective": objective, "diagnostics": diagnostics, "full": full,
-               "accounting": acc, "program": prog, "raw_cand": raw_cand, "best_params": best_params}
+               "accounting": acc, "program": prog, "raw_cand": raw_cand,
+               "best_params": best_params, "t_wall": time.time()}
         self.evaluated.append(rec)
         if objective > self.best_obj_global + self.eps:
             self.best_obj_global = objective
             self.since_improve_global = 0
+            self.t_improve_elapsed = self._elapsed()
         else:
             self.since_improve_global += 1
         fm = diagnostics.get("likely_failure_modes") if isinstance(diagnostics, dict) else None
@@ -307,73 +448,124 @@ class AgenticOrchestrator:
 
     # -- main loop -----------------------------------------------------------------------------
     def run(self) -> dict:
-        context_block = self.gather_context()
-        seeds = self.generate_seeds(context_block)
+        """Run (or resume) the pipeline. Every phase is keyed off persisted state, so the loop can
+        be paused at any point (SIGINT/SIGTERM or --stop-after) and re-entered: a checkpoint is
+        written after each evaluation and each phase boundary."""
+        self._install_signal_handlers()
+        self._session_t0 = time.time()  # only active sessions count toward wall-clock criteria
+        if self.wall_mode:
+            msg = f"  [wall] wall-clock mode: stop on {self.plateau_hours}h objective plateau"
+            if self.min_hours:
+                msg += f" after >= {self.min_hours}h run time"
+            if self.success_stop is not None:
+                msg += f", or on trained_success >= {self.success_stop}"
+            if self.wall_elapsed:
+                msg += f" (resuming at {self.wall_elapsed / 3600.0:.2f}h)"
+            print(msg)
+        if self.context_block is None:
+            self.context_block = self.gather_context()
+            self.save_checkpoint()
+        if self.seeds is None:
+            self.seeds = self.generate_seeds(self.context_block)
+            self.save_checkpoint()
+        context_block = self.context_block
 
         # EXPLORE: up to min(n_seeds, budget) diverse seeds, one iteration each.
-        chains: list[_Chain] = []
         explore_cap = min(self.n_seeds, self.budget)
-        for cand in seeds:
-            if self.iters >= explore_cap:
-                break
+        while self.next_seed < len(self.seeds) and self.iters < explore_cap:
+            if self._should_pause():
+                return self._paused()
+            cand = self.seeds[self.next_seed]
+            self.next_seed += 1
             rec = self._eval(cand, "explore")
-            if rec is None:
-                continue
-            chains.append(_Chain(name=str(cand.get("name") or f"seed{len(chains)}"),
-                                 raw_cand=cand, program=rec["program"], diagnostics=rec["diagnostics"],
-                                 best_obj=rec["objective"], history=[rec["objective"]],
-                                 frontier=_frontier(rec["diagnostics"])))
-        if not chains:
+            if rec is not None:
+                self.chains.append(
+                    _Chain(name=str(cand.get("name") or f"seed{len(self.chains)}"),
+                           raw_cand=cand, program=rec["program"], diagnostics=rec["diagnostics"],
+                           best_obj=rec["objective"], history=[rec["objective"]],
+                           frontier=_frontier(rec["diagnostics"])))
+            self.save_checkpoint()
+            reason = self._wall_stop()
+            if reason and self.success_stop is not None and "success criterion" in reason:
+                print(f"  [stop] {reason}")
+                return self.finish()
+        if not self.chains:
             raise RuntimeError("no seed candidate compiled; cannot refine")
 
         # REFINE: pick the best seed(s) -- one by default, a second only if competitive -- and
         # spend the remaining budget on revise->eval, with plateau/degradation early-stop.
-        chains.sort(key=lambda c: c.best_obj, reverse=True)
-        best = chains[0]
-        chosen = [best]
-        if len(chains) > 1 and chains[1].best_obj >= best.best_obj - 0.2 * abs(best.best_obj):
-            chosen.append(chains[1])
-        for c in chosen:
-            c.active = True
-        self.log["explore"] = [{"name": c.name, "obj": c.best_obj} for c in chains]
-        self.log["refining"] = [c.name for c in chosen]
-        print(f"  [refine] seeds chosen: {[c.name for c in chosen]} "
-              f"(best explore obj={best.best_obj:+.3f})")
-        # Explore is diversity probing, not hill-climbing: weaker seeds must not pre-charge the
-        # global plateau counter (observed: best seed FIRST -> two weaker seeds + one rejected
-        # refine tripped the global patience after a single refinement iteration).
-        self.since_improve_global = 0
+        if self.chosen_idx is None:
+            order = sorted(range(len(self.chains)),
+                           key=lambda i: self.chains[i].best_obj, reverse=True)
+            best = self.chains[order[0]]
+            self.chosen_idx = [order[0]]
+            if len(order) > 1 and (self.chains[order[1]].best_obj
+                                   >= best.best_obj - 0.2 * abs(best.best_obj)):
+                self.chosen_idx.append(order[1])
+            for i in self.chosen_idx:
+                self.chains[i].active = True
+            self.log["explore"] = [{"name": self.chains[i].name, "obj": self.chains[i].best_obj}
+                                   for i in order]
+            self.log["refining"] = [self.chains[i].name for i in self.chosen_idx]
+            print(f"  [refine] seeds chosen: {self.log['refining']} "
+                  f"(best explore obj={best.best_obj:+.3f})")
+            # Explore is diversity probing, not hill-climbing: weaker seeds must not pre-charge the
+            # global plateau counter (observed: best seed FIRST -> two weaker seeds + one rejected
+            # refine tripped the global patience after a single refinement iteration).
+            self.since_improve_global = 0
 
-        if self.per_stage_iters:
-            # Guarantee every authored stage `per_stage_iters` improvement attempts should it
-            # become the (failing) frontier: patience = per_stage_iters, and the refine budget is
-            # sized from the ACTUAL stage count of the chosen seed(s) (LLM-authored, so only known
-            # now). Falls back to the configured budget when there is no staged report.
-            n_st = max((len(((c.diagnostics or {}).get("stage_report") or {})
-                            .get("stage_names") or []) for c in chosen), default=0)
-            if n_st > 0:
-                self.patience = self.per_stage_iters
-                self.budget = self.iters + self.per_stage_iters * n_st * len(chosen)
-                print(f"  [budget] per_stage_iters={self.per_stage_iters} x {n_st} stages x "
-                      f"{len(chosen)} chain(s) -> budget={self.budget} (patience={self.patience})")
+            if self.wall_mode and self.per_stage_iters:
+                print("  [wall] per_stage_iters ignored in wall-clock mode (time criteria govern)")
+            if self.per_stage_iters and not self.wall_mode and not self.budget_resized:
+                # Guarantee every authored stage `per_stage_iters` improvement attempts should it
+                # become the (failing) frontier: patience = per_stage_iters, and the refine budget
+                # is sized from the ACTUAL stage count of the chosen seed(s) (LLM-authored, so only
+                # known now). Falls back to the configured budget when there is no staged report.
+                n_st = max((len(((self.chains[i].diagnostics or {}).get("stage_report") or {})
+                                .get("stage_names") or []) for i in self.chosen_idx), default=0)
+                if n_st > 0:
+                    self.patience = self.per_stage_iters
+                    self.budget = self.iters + self.per_stage_iters * n_st * len(self.chosen_idx)
+                    self.budget_resized = True
+                    print(f"  [budget] per_stage_iters={self.per_stage_iters} x {n_st} stages x "
+                          f"{len(self.chosen_idx)} chain(s) -> budget={self.budget} "
+                          f"(patience={self.patience})")
+            self.save_checkpoint()
+        chosen = [self.chains[i] for i in self.chosen_idx]
 
-        rr = 0
+        revise_fail_streak = 0
         while self.iters < self.budget and any(c.active for c in chosen):
-            if self.since_improve_global >= self.patience:
+            if self._should_pause():
+                return self._paused()
+            reason = self._wall_stop()
+            if reason:
+                print(f"  [stop] {reason}")
+                break
+            if not self.wall_mode and self.since_improve_global >= self.patience:
                 print(f"  [stop] global plateau: no gain > eps in {self.patience} iters")
                 break
             active = [c for c in chosen if c.active]
-            chain = active[rr % len(active)]
-            rr += 1
+            chain = active[self.rr % len(active)]
+            self.rr += 1
             cand = self.revise(chain, context_block)
             if cand is None:  # reasoning call failed to yield a candidate; not a budget iteration
+                revise_fail_streak += 1
                 chain.since_improve += 1
-                if chain.since_improve >= self.patience:
+                if not self.wall_mode and chain.since_improve >= self.patience:
                     chain.active = False
+                if revise_fail_streak >= 10:
+                    # In wall-clock mode chains never deactivate, so a dead LLM backend must not
+                    # spin the loop forever; a checkpoint exists, resume when the backend is back.
+                    print("  [stop] 10 consecutive revise calls yielded no candidate -- "
+                          "LLM backend looks down; pausing")
+                    return self._paused()
+                self.save_checkpoint()
                 continue
             rec = self._eval(cand, f"refine:{chain.name}")
             if rec is None:  # uncompilable revision; no rollout consumed
+                self.save_checkpoint()
                 continue
+            revise_fail_streak = 0
             chain.history.append(rec["objective"])
             improved = rec["objective"] > chain.best_obj + self.eps
             new_frontier = _frontier(rec["diagnostics"])
@@ -406,9 +598,10 @@ class AgenticOrchestrator:
                     chain.focus_side, chain.focus_attempts = "exit", 0
                     print(f"  [focus] {chain.name}: entry-side attempts exhausted -> rolling back "
                           f"to the EXIT side of the hand-off")
-            if chain.since_improve >= self.patience:
+            if not self.wall_mode and chain.since_improve >= self.patience:
                 chain.active = False
                 print(f"  [stop] chain {chain.name} plateaued (best={chain.best_obj:+.3f})")
+            self.save_checkpoint()
 
         return self.finish()
 
@@ -423,7 +616,7 @@ class AgenticOrchestrator:
         report = {
             "task": self.task, "representation": self.rep, "dof_mode": self.dof_mode,
             "arbiter": self.arbiter, "budget": self.budget, "iters_used": self.iters,
-            "n_seeds": self.n_seeds,
+            "n_seeds": self.n_seeds, "wall_hours": round(self._elapsed() / 3600.0, 3),
             "best": {"name": best["name"], "source": best["source"],
                      "objective": best["objective"], "accounting": best["accounting"],
                      "diagnostics": best["diagnostics"], "full": best["full"]},

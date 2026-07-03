@@ -156,8 +156,14 @@ def evaluate_candidate_ppo(
         diag["stage_report"] = stage_occupancy(env, program, obs)
     jax.clear_caches()
     gc.collect()
+    # Training telemetry (downsampled) travels with the result so run dashboards can plot the
+    # candidate's learning curve, not just the mid/late verdict derived from it.
+    stride = max(1, len(rows) // 150)
+    telemetry = [{k: (round(float(v), 5) if isinstance(v, (int, float)) else v)
+                  for k, v in r.items()} for r in rows[::stride]]
     return {
         "objective_score": obj, "diagnostics": diag, "eval": ev,
         "best_train_success": round(float(best_success), 6),
         "best_checkpoint_iter": int(best_iter), "best_params": best_params,
+        "telemetry": telemetry,
     }

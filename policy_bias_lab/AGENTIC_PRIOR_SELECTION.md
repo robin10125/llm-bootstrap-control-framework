@@ -273,6 +273,135 @@ it stops paying off, rather than quitting as soon as something is merely good en
   rollouts; "diverse-then-refine" spends a fixed real-trial budget the way a human experimenter
   would, and subsumes a static portfolio (diversity at seed, depth via revision).
 
+### Checkpoint / pause / resume (built 2026-07-02)
+
+Long runs (`--per-stage-iters 4 --ppo-train-seconds 420+` is hours) will be paused and resumed
+repeatedly, so the orchestrator persists its full progress to `<out>/checkpoint.pkl` (atomic
+tmp+rename pickle) **after every evaluation** and at every phase boundary (context done, seeds done,
+seed selection done). Persisted state: iteration count, all evaluated records (trained `best_params`
+device-fetched to numpy), the context block, the seed list + explore cursor, every refinement chain
+(`_Chain` incl. frontier / focus_side / failed-revision history), the chosen-chain indices,
+round-robin cursor, plateau counters, and any `per_stage_iters` budget resize.
+
+- **Pause**: `SIGINT`/`SIGTERM` (Ctrl+C, or `kill <pid>` on a detached run) sets a flag; the
+  in-flight evaluation finishes, a final checkpoint is written, and the process exits cleanly with a
+  `[paused]` line showing the resume command. A second signal aborts immediately — safe, because the
+  checkpoint after the last finished eval is already on disk (a hard `SIGKILL`/power loss likewise
+  loses at most the in-flight eval). `--stop-after N` pauses after N evaluations this session
+  (planned pauses, e.g. "run 3 more iterations tonight").
+- **Resume**: `run_agentic_selection --out <same dir> --resume` reloads config + state and re-enters
+  the loop exactly where it left off (mid-explore, pre-refine, or mid-refine). Config comes from the
+  checkpoint; any flag passed explicitly on the resume command line overrides it — in particular
+  `--budget <bigger>` extends a run whose budget ran out or whose chains plateaued
+  (`extend_budget` reactivates the chosen chains with a fresh patience window).
+- Validated end-to-end (offline smoke, 3 simulated sessions through disk): pause mid-explore →
+  resume → pause pre-refine → resume → completion, with contiguous iteration numbering and all
+  explore/refine records preserved in the final `report.json`.
+
+### Live metrics dashboard (built 2026-07-02)
+
+`<out>/dashboard.html` — a self-contained HTML page (inline SVG, no JS/CDN/server/deps) written by
+`run_dashboard.write_dashboard` from the same payload as the checkpoint, on every evaluation. Open
+it once in a browser (`file://` works); a 20 s meta-refresh keeps it live. Built to answer "how much
+longer should I run this?":
+
+- **stat cards**: iters/budget, best objective + candidate, global plateau counter, wall-clock
+  **ETA to budget** (mean of the last 5 eval durations × remaining evals), latest training verdict;
+- **run guidance** box (heuristics): plateau imminent / all chains dead / budget exhausted (with the
+  `--resume --budget N` remedy), latest-candidate `undertrained` → raise `--ppo-train-seconds`,
+  recent frontier unlocks → keep running, best-objective still improving within the patience window;
+- **charts**: objective per evaluation (per-chain series + best-so-far step envelope);
+  trained-policy metrics (success/grasp/reach/lift per eval); **stage frontier progression** per
+  chain vs the terminal line; **per-stage gate performance** bars for each refining chain's current
+  base (entered / hand-off / conversion / authored-success — the transition-stats data);
+  the latest eval's **PPO learning curve** (from telemetry rows now persisted through
+  `evaluate_candidate_ppo` → `full.telemetry`, ≤150 downsampled rows);
+- **tables**: chain status (role, best obj, frontier/n_stages, focus side, plateau, active) and the
+  last 10 evaluations with failure-mode flags.
+
+Regenerate offline for any paused/finished run: `python -m policy_bias_lab.run_dashboard runs/<dir>`.
+Dashboard writing is wrapped in try/except inside `save_checkpoint` — a rendering bug can never
+take the run down. **Off by default** (paused per user request 2026-07-02): enable with
+`--dashboard`, or regenerate manually from the checkpoint at any time.
+
+### Long-duration training with the selected prior: `run_long_ppo` (built 2026-07-02)
+
+**Division of labor (user-set):** the selection loop keeps its FIXED budget of LLM revision calls
+-- its job is only to pick a good prior. The long-duration question ("what happens when a policy
+trains under that prior for many hours") is answered by `run_long_ppo`, which makes ZERO LLM calls:
+one continuous PPO run (single XLA compile; Adam state, params, iteration count, run-time clocks
+all in `resume.pkl`) on a fixed `--program best_program.json`, optionally warm-started from the
+selection arbiter's weights (`--init-params best_params.pkl`, same 256x256 net). Termination only
+on:
+
+- **training plateau**: the best-checkpoint metric (sustained contact-gated success + gated-lift /
+  grasp tie-breaks, same metric `train_ppo_arm` uses to pick checkpoints) unimproved by
+  `--plateau-eps` for `--plateau-hours` (default 2 h), gated by `--min-hours` (default 8 h). At the
+  default eps (1e-5), new sustained success or gated-lift progress resets the clock; bare
+  grasp-rate wiggle does not.
+- **sustained success**: rolling mean (`--success-window`, default 10 iters) of the training
+  sustained contact-gated hold rate reaches `--success-stop` (default 0.8).
+
+Pause with SIGINT/SIGTERM (finishes the current PPO iteration, ~seconds) or `--stop-after-iters`;
+resume with `--resume`; `resume.pkl` also refreshes every `--save-every-iters` (crash insurance);
+paused time never counts toward the criteria; per-iteration metrics append to `metrics.jsonl`
+across sessions; on termination the global-best params get a full held-out eval into
+`final_report.json`. Implemented via three hooks added to `train_ppo_arm`
+(`initial_opt_state`, per-iteration `control_fn`, `state_out`) -- existing callers unaffected.
+
+### Reward-mode experiment arms for long training (built 2026-07-03)
+
+The first long run (`runs/longppo_20260702-234528`, 2.1 h) reward-hacked: the builtin base
+reward's dense state-based closure term paid ~12/episode for AIR-CLOSURE hovering (fingers curled
+at 3.3 cm, no contact, no lift; arithmetic match: estimated 11.3 vs observed 11.8), base_return
+rose 5x while reach/grasp/lift collapsed, and the shaping template that penalizes exactly this
+(`closure_contact_consistency`) fired but at 1/6 the exploit's income. Design principles adopted
+(user): shaping must target CURRENT weaknesses, not blindly pay mastered behavior; lift +
+sustained lift must dominate intermediate income; intermediate rewards should be stage-gated like
+the action prior so premature behavior (grasp before reach) is never paid.
+
+Three arms in `reward_modes.py`, selected by `run_long_ppo --reward-mode ...` (no changes to the
+shared env; intermediate base terms are zeroed via EnvConfig overrides and replacements live in a
+`shaping_fn(prev_eval, eval_vec, obs)` hook in the collect loop):
+
+- **`lift_only`** -- env pays ONLY the contact-gated lift terms (w_lift/w_lift_pot/w_lift_hold/
+  w_success); all intermediate income (approach, closure, contact, hold) and all template shaping
+  removed. Tests whether the action prior alone can carry the policy to contact.
+- **`adjusted`** -- the diagnosis fixes: closure paid on PROGRESS (telescoping Δclosure, bounded
+  ~0.25 total vs the old 12/episode) behind a tight 0.02 m fingertip gate; contact paid on
+  progress (Δcontact_gate, symmetric so losing a grip costs); empty-hand squeezing penalized at
+  the magnitude the old exploit paid (-0.25/step); env keeps its safe potential-based approach
+  terms.
+- **`stage_gated`** -- same adjusted terms, but each multiplied by the prior program's OWN stage
+  weights (`make_stage_weight_fn`, identical soft/hard blend the prior acts with): approach terms
+  pay only while a base-driving stage is active, closure/contact only while a hand-driving stage
+  is active (stage->term mapping read mechanically from which actuators each stage's channels
+  drive -- task-agnostic). The squeeze penalty stays ungated. Contrib slots 0-4 in metrics.jsonl:
+  approach_potential, closure_progress, contact_progress, empty_squeeze_penalty, hand_gate_mean.
+
+All three keep the lift terms dominant by construction (held 5 cm lift earns ~0.6/step + height
+potential + 3/step sustained-aloft vs bounded intermediate totals of ~1-2 per episode).
+
+### Wall-clock termination for the selection loop itself (built 2026-07-02; superseded for the
+long-training use case by `run_long_ppo` above -- kept as an opt-in)
+
+`--plateau-hours H` switches the loop into **wall-clock mode**: all iteration-count stopping is
+disabled (no global-patience stop, chains are never deactivated, `per_stage_iters` resize ignored,
+`--budget` defaults to unlimited), and the run terminates only on:
+
+- **prolonged plateau**: the best objective has not improved (`> eps`) for `--plateau-hours` hours
+  of run time, gated by `--min-hours` (no plateau stop before that much total run time); or
+- **success**: any evaluation's `trained_success` — the *sustained* contact-gated hold rate over
+  the eval horizon — reaches `--success-stop`.
+
+Run time = accumulated ACTIVE seconds across sessions (`wall_elapsed`, persisted in the
+checkpoint): pausing and resuming does not count paused time toward `--min-hours` or the plateau
+window, and the improvement clock (`t_improve_elapsed`) survives resume. A dead LLM backend cannot
+spin the loop forever: 10 consecutive revise calls yielding no candidate auto-pauses (checkpointed,
+resume when the backend is back). `report.json` records `wall_hours`. Validated: no-env unit tests
+of the criteria + env-backed loop test (thresholds scaled to seconds) confirming chains outlive
+`patience`, the plateau stop fires, and the clock persists across pause/resume.
+
 ## Integration
 - Replaces `action_priors.build_candidate_prompt` / `build_action_prior_prompt` and the fixed
   `ACTION_GROUPS`/`PRIOR_DIRECTIONS` with: robot-spec-derived vocabulary + the staged prompt

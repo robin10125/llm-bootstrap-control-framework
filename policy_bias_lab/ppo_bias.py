@@ -75,6 +75,10 @@ def train_ppo_arm(
     initial_params: Any | None = None,
     iter_offset: int = 0,
     phase_teacher: Any | None = None,
+    initial_opt_state: Any | None = None,
+    control_fn: Any | None = None,
+    state_out: dict | None = None,
+    shaping_fn: Any | None = None,
 ) -> tuple[Any, list[dict[str, Any]]]:
     use_reward_bias, use_action_prior, use_exploration_bias, use_supervised_init = BIAS_ARMS[arm]
     key = jax.random.PRNGKey(seed)
@@ -93,6 +97,8 @@ def train_ppo_arm(
         opt_state = optimizer.init(params)
         reference_params = params  # frozen BC policy for the decaying KL anchor
         bc_anchor_active = cfg.bc_kl_coef > 0.0 and cfg.bc_kl_anneal_iters > 0
+    if initial_opt_state is not None:  # resumed run: keep the Adam moments, don't restart them
+        opt_state = initial_opt_state
 
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
     collect = make_collect(
@@ -108,6 +114,7 @@ def train_ppo_arm(
         saturation_threshold=cfg.saturation_threshold,
         prior_logit_clip=cfg.prior_logit_clip,
         action_target_reward_weight=cfg.action_target_reward_weight,
+        shaping_fn=shaping_fn,
     )
     update = make_update(
         net=net,
@@ -157,6 +164,7 @@ def train_ppo_arm(
         print(f"[{arm}] warmup update ready", flush=True)
 
     steps_per_iter = int(cfg.envs) * int(env.horizon)
+    stop_reason: str | None = None
     start = time.monotonic()
     for it in range(cfg.iters):
         if cfg.target_train_seconds is not None and it > 0 and time.monotonic() - start >= cfg.target_train_seconds:
@@ -298,6 +306,18 @@ def train_ppo_arm(
                 "rows": rows,
                 "action_prior_weights": jax.device_get(action_prior_weights).tolist(),
             }), dtype=jp.float32)
+        if control_fn is not None:
+            # External run control (long-training runner): sees full live state each iteration and
+            # may snapshot it (resume checkpoints) or end the run by returning a reason string.
+            stop_reason = control_fn({
+                "iter": iter_offset + it, "elapsed_seconds": elapsed, "row": rows[-1],
+                "params": params, "opt_state": opt_state, "best_params": best_params,
+                "best_score": best_score, "best_success": best_success, "best_iter": best_iter,
+            })
+            if stop_reason:
+                break
+    if state_out is not None:
+        state_out.update(opt_state=opt_state, best_score=best_score, stop_reason=stop_reason)
     if checkpoint_dir is not None and cfg.checkpoint_count > 0:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         with (checkpoint_dir / f"params_t{cfg.checkpoint_count:02d}_final.pkl").open("wb") as f:
@@ -400,6 +420,7 @@ def make_collect(
     saturation_threshold: float = 0.98,
     prior_logit_clip: float = 0.95,
     action_target_reward_weight: float = 0.0,
+    shaping_fn: Any | None = None,
 ):
     step_fn = jax.vmap(env.step)
     noise_scale = jp.clip(bias.noise_scale, 0.1, 4.0)
@@ -440,9 +461,15 @@ def make_collect(
             shaped = jp.zeros_like(base_reward)
             reward_contrib = jp.zeros((base_reward.shape[0], REWARD_TEMPLATE_COUNT), dtype=jp.float32)
             if use_reward_bias:
-                shaped, reward_contrib = jax.vmap(
-                    lambda pe, ev: bias.dynamic_shaped_reward(pe, ev, reward_weights, task)
-                )(prev_eval, nstate.metrics["eval"])
+                if shaping_fn is not None:
+                    # Experimental reward mode (reward_modes.py): replaces the template shaping;
+                    # sees obs so terms can be gated by the prior program's own stage weights.
+                    shaped, reward_contrib = jax.vmap(shaping_fn)(
+                        prev_eval, nstate.metrics["eval"], state.obs)
+                else:
+                    shaped, reward_contrib = jax.vmap(
+                        lambda pe, ev: bias.dynamic_shaped_reward(pe, ev, reward_weights, task)
+                    )(prev_eval, nstate.metrics["eval"])
                 if action_target_reward_weight > 0.0:
                     shaped = shaped + float(action_target_reward_weight) * jax.vmap(
                         lambda o, a: bias.action_target_reward(o, a, task)
