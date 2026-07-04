@@ -35,9 +35,9 @@ import jax
 
 from policy_bias_lab.freeform_priors import robot_spec
 from policy_bias_lab.llm_util import call_llm as _call_llm
-from policy_bias_lab.ppo_arbiter import evaluate_candidate_ppo
+from policy_bias_lab.ppo_arbiter import evaluate_candidate_ppo, evaluate_candidate_prior_only
 from policy_bias_lab.prior_eval import accounting, score_program, validate_program
-from policy_bias_lab.run_dsl_vs_freeform import OPERATORS, PHASES, SIGNALS, fallback, _tmpl
+from policy_bias_lab.run_dsl_vs_freeform import OPERATORS, PHASES, fallback, _tmpl
 
 
 # ----------------------------------------------------------------------------------------------
@@ -54,7 +54,7 @@ def build_spec_block(rs: dict) -> str:
         f"SEMANTIC GROUPS: {json.dumps(rs['semantic_groups'])}\n"
         f"BASE WORLD-SIGN: {json.dumps(base_sign)}\n"
         f"CONTROL: {json.dumps(rs['control_law'])}\n"
-        f"SIGNALS available to gates/expressions: {json.dumps(SIGNALS, indent=1)}"
+        f"{rs['observables_doc']}"
     )
 
 
@@ -76,8 +76,10 @@ def _framework_doc(rep: str) -> str:
 
 def _output_item(rep: str) -> str:
     if rep == "freeform_staged":
-        return ("blend:'soft'|'hard', stages:[{name, gate:'<expr>', success:'<expr>' (optional), "
-                "channels:[{actuators:[...], expr:'<expr>'}]}]")
+        return ("signals:{'<name>':'<expr over observables>'} (your derived-signal definitions), "
+                "stages:[{name, gate:'<expr>', success:'<expr>' (optional), "
+                "channels:[{actuators:[...], expr:'<expr>'}]}], "
+                "probes:[{name, expr, stage:'<stage name>' (optional)}] (optional, <=8)")
     field_name = "rules" if rep == "dsl" else "channels"
     return (f"subpriors: [{{name, {field_name}:[...]}}] -- one per phase, in order: "
             f"{', '.join(PHASES)}")
@@ -162,11 +164,16 @@ class AgenticOrchestrator:
                                      # attempts if it becomes the (poor) frontier. Overrides budget.
     eps: float = 1e-3                # improvement tolerance
     use_human_analogy: bool = False  # C4 flag
-    arbiter: str = "short_ppo"       # "short_ppo" (trained-success, the real objective) | "open_loop"
+    arbiter: str = "short_ppo"       # "short_ppo" (trained-success, the real objective) |
+                                     # "prior_only" (untrained, one rollout batch -- pure prior
+                                     # quality, no training/reward confound) | "open_loop" (legacy)
+    refine_top: int = 2              # max chains kept for refinement (2nd+ only if competitive)
     ppo_task: str = "lift"           # task KEY for the PPO side (NL `task` is for the prompts)
     ppo_train_seconds: float = 180.0
     ppo_train_envs: int = 256
     ppo_eval_envs: int = 256
+    ppo_terminate_on_success: float | None = None  # PPOBiasConfig.success_terminate_seconds
+    eval_batches: int = 1            # rollout batches per prior_only evaluation (variance control)
     score_envs: int = 128            # open-loop arbiter only
     score_seed: int = 0
     stop_after: int | None = None    # pause (checkpoint + exit) after this many evals THIS SESSION
@@ -185,8 +192,8 @@ class AgenticOrchestrator:
     CONFIG_KEYS = ("task", "rep", "dof_mode", "llm_backend", "llm_model", "budget", "n_seeds",
                    "patience", "handoff_attempts", "per_stage_iters", "eps", "use_human_analogy",
                    "arbiter", "ppo_task", "ppo_train_seconds", "ppo_train_envs", "ppo_eval_envs",
-                   "score_envs", "score_seed", "min_hours", "plateau_hours", "success_stop",
-                   "write_dash")
+                   "ppo_terminate_on_success", "refine_top", "eval_batches", "score_envs",
+                   "score_seed", "min_hours", "plateau_hours", "success_stop", "write_dash")
     # Mutable progress restored verbatim on resume.
     STATE_KEYS = ("iters", "evaluated", "since_improve_global", "best_obj_global", "log",
                   "context_block", "seeds", "chains", "chosen_idx", "rr", "next_seed",
@@ -233,7 +240,10 @@ class AgenticOrchestrator:
     def _wall_stop(self) -> str | None:
         """Wall-clock termination criteria; returns the stop reason or None."""
         if self.success_stop is not None:
-            s = max((float((r.get("diagnostics") or {}).get("trained_success") or 0.0)
+            # "success_rate" is the current diagnostics key; "trained_success" covers checkpoints
+            # written before the diagnostics were de-interpreted.
+            s = max((float((r.get("diagnostics") or {}).get("success_rate")
+                           or (r.get("diagnostics") or {}).get("trained_success") or 0.0)
                      for r in self.evaluated), default=0.0)
             if s >= self.success_stop:
                 return (f"success criterion met: trained sustained-hold success {s:.3f} >= "
@@ -393,7 +403,9 @@ class AgenticOrchestrator:
             diagnostics=json.dumps(diag, indent=1),
             stage_focus=_stage_focus(diag, focus_side=chain.focus_side),
             output_item=_output_item(self.rep))
-        txt = self._llm(prompt, f"revise_{chain.name}")
+        # Unique tag per call: revisions of the same chain must not overwrite each other's
+        # prompt/completion logs (iters+1 = the evaluation this revision will feed).
+        txt = self._llm(prompt, f"revise_i{self.iters + 1:02d}_{chain.name}")
         obj = parse_json_obj(txt)
         if not obj:
             return None
@@ -415,13 +427,24 @@ class AgenticOrchestrator:
                 self.env, prog, task=self.ppo_task, seed=self.score_seed,
                 train_seconds=self.ppo_train_seconds, train_envs=self.ppo_train_envs,
                 eval_envs=self.ppo_eval_envs,
-                checkpoint_dir=self.out_dir / "ppo" / f"iter{self.iters + 1}")
+                checkpoint_dir=self.out_dir / "ppo" / f"iter{self.iters + 1}",
+                cfg_overrides=({"success_terminate_seconds": self.ppo_terminate_on_success}
+                               if self.ppo_terminate_on_success else None))
             objective = res["objective_score"]
             diagnostics = res["diagnostics"]
             full = {"eval": res["eval"], "best_train_success": res["best_train_success"],
                     "best_checkpoint_iter": res["best_checkpoint_iter"],
                     "telemetry": res.get("telemetry")}
             best_params = res["best_params"]
+        elif self.arbiter == "prior_only":
+            # No training: one rollout batch of the prior at PPO iteration 0. Pure prior quality,
+            # free of the reward/training confound (and ~100x cheaper than short_ppo).
+            res = evaluate_candidate_prior_only(
+                self.env, prog, task=self.ppo_task, seed=self.score_seed,
+                eval_envs=self.ppo_eval_envs, n_batches=self.eval_batches)
+            objective = res["objective_score"]
+            diagnostics = res["diagnostics"]
+            full = {"eval": res["eval"]}
         else:  # open_loop: the cheap blind scorer (prefilter-grade only)
             score = score_program(self.env, prog, envs=self.score_envs, seed=self.score_seed)
             objective = score["objective_score"]
@@ -440,10 +463,9 @@ class AgenticOrchestrator:
             self.t_improve_elapsed = self._elapsed()
         else:
             self.since_improve_global += 1
-        fm = diagnostics.get("likely_failure_modes") if isinstance(diagnostics, dict) else None
         print(f"  [iter {self.iters}/{self.budget}] {source:12s} {str(raw_cand.get('name')):22s} "
               f"obj={objective:+.4f} driven={acc['n_driven']}/{self.rs['n_actuators']} "
-              f"wrist={acc['wrist_driven']}" + (f" | {fm}" if fm else ""))
+              f"wrist={acc['wrist_driven']}")
         return rec
 
     # -- main loop -----------------------------------------------------------------------------
@@ -458,7 +480,7 @@ class AgenticOrchestrator:
             if self.min_hours:
                 msg += f" after >= {self.min_hours}h run time"
             if self.success_stop is not None:
-                msg += f", or on trained_success >= {self.success_stop}"
+                msg += f", or on trained success_rate >= {self.success_stop}"
             if self.wall_elapsed:
                 msg += f" (resuming at {self.wall_elapsed / 3600.0:.2f}h)"
             print(msg)
@@ -499,9 +521,9 @@ class AgenticOrchestrator:
                            key=lambda i: self.chains[i].best_obj, reverse=True)
             best = self.chains[order[0]]
             self.chosen_idx = [order[0]]
-            if len(order) > 1 and (self.chains[order[1]].best_obj
-                                   >= best.best_obj - 0.2 * abs(best.best_obj)):
-                self.chosen_idx.append(order[1])
+            for j in order[1:max(1, int(self.refine_top))]:
+                if self.chains[j].best_obj >= best.best_obj - 0.2 * abs(best.best_obj):
+                    self.chosen_idx.append(j)
             for i in self.chosen_idx:
                 self.chains[i].active = True
             self.log["explore"] = [{"name": self.chains[i].name, "obj": self.chains[i].best_obj}
@@ -561,6 +583,10 @@ class AgenticOrchestrator:
                     return self._paused()
                 self.save_checkpoint()
                 continue
+            # Probes persist across revisions until the model replaces them: a revision that omits
+            # `probes` keeps measuring what the previous iteration asked for.
+            if "probes" not in cand and isinstance(chain.raw_cand, dict) and chain.raw_cand.get("probes"):
+                cand["probes"] = chain.raw_cand["probes"]
             rec = self._eval(cand, f"refine:{chain.name}")
             if rec is None:  # uncompilable revision; no rollout consumed
                 self.save_checkpoint()
@@ -622,9 +648,7 @@ class AgenticOrchestrator:
                      "diagnostics": best["diagnostics"], "full": best["full"]},
             "trajectory": [{"iter": r["iter"], "source": r["source"], "name": r["name"],
                             "objective": r["objective"], "wrist_driven": r["accounting"].get("wrist_driven"),
-                            "n_driven": r["accounting"].get("n_driven"),
-                            "failure_modes": r["diagnostics"].get("likely_failure_modes")
-                            if isinstance(r["diagnostics"], dict) else None}
+                            "n_driven": r["accounting"].get("n_driven")}
                            for r in self.evaluated],
             "explore": self.log.get("explore"), "refining": self.log.get("refining"),
         }
@@ -756,11 +780,56 @@ def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
             return "n/a"
         return f"{pair[0]:+.3f} -> {pair[1]:+.3f}"
 
+    skipped = rep.get("skipped_entry_stages") or []
+    if skipped:
+        lines.append(
+            f"Note: stage(s) {skipped} ({', '.join(repr(names[i]) for i in skipped)}) are SKIPPED "
+            f"-- never dwell-entered while deeper stages run. That is gate arithmetic (another "
+            f"gate wins in those states), NOT necessarily a failure: if the deeper chain performs, "
+            f"leave the skipped stage alone rather than forcing it to dominate.")
+    pre = diagnostics.get("pretrained_prior")
+    if isinstance(pre, dict) and pre:
+        keys = ("success_rate", "grasp_rate", "reach_rate", "lift_reached_rate", "lift_max")
+        row = "; ".join(f"{m} {pre.get(m)} -> {diagnostics.get(m)}" for m in keys
+                        if pre.get(m) is not None or diagnostics.get(m) is not None)
+        lines.append(
+            f"PRE-TRAIN vs POST-TRAIN (prior alone at PPO iteration 0 -> after training): {row}. "
+            f"A weakness already present pre-train is a PRIOR defect; one that appears (or a "
+            f"strength that vanishes) only after training implicates the reward/training side, "
+            f"not the prior -- do not 'fix' the prior for it.")
     trend = rep.get("stall_signal_trend")
     if isinstance(trend, dict) and trend:
         rows = "; ".join(f"{s} {_fmt(p)}" for s, p in trend.items())
         lines.append(f"While stage {k} is active, mean signal values over the FIRST -> SECOND half "
                      f"of the episode: {rows}.")
+    ie = [r for r in (rep.get("intent_execution") or []) if r.get("gap", 0) >= 0.05]
+    if ie:
+        rows = "; ".join(f"{r['actuator']}: stage commands {r['stage_cmd']:+.2f} but "
+                         f"{r['executed']:+.2f} executes (gap {r['gap']:.2f})" for r in ie[:4])
+        lines.append(f"EXECUTED vs INTENDED while stage {k} is active -- the blended action "
+                     f"differs from this stage's own channel commands on: {rows}. A large gap "
+                     f"means other stages' channels dilute or cancel this stage's intent there.")
+    tr_rows = [r for r in (rep.get("tracking") or [])
+               if r.get("cmd_vs_measured_frac_of_range", 0) >= 0.15]
+    if tr_rows:
+        rows = "; ".join(f"{r['actuator']} {r['cmd_vs_measured_frac_of_range']:.2f}"
+                         for r in tr_rows[:4])
+        lines.append(f"COMMAND vs MEASURED position while stage {k} is active (mean |target - "
+                     f"actual| as a fraction of the actuator's range): {rows}. A persistent gap "
+                     f"means the joint is saturated, blocked by contact, or physically stopped -- "
+                     f"commanding it harder cannot close that gap.")
+    pr = rep.get("probe_report")
+    if isinstance(pr, dict) and pr:
+        prows = []
+        for pname, e in pr.items():
+            if e.get("error"):
+                prows.append(f"{pname}: FAILED TO COMPILE ({e['error']})")
+            else:
+                el = e.get("early_late_mean") or [None, None]
+                scope = f" [stage {e['stage']}]" if e.get("stage") is not None else ""
+                prows.append(f"{pname}{scope} = {_fmt(el)} (min {e.get('min')}, max {e.get('max')})")
+        lines.append("YOUR PROBES (the measurements you requested, early -> late episode means): "
+                     + "; ".join(prows))
     ng = rep.get("next_gate")
     if isinstance(ng, dict):
         pair = ng.get("value_early_late")

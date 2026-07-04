@@ -23,7 +23,7 @@ import numpy as np
 from policy_bias_lab.bias import compile_bias
 from policy_bias_lab.composed_priors import make_composed_prior_fn
 from policy_bias_lab.freeform_priors import (
-    addressed_actuators, all_actuator_names, _semantic_group,
+    DEFAULT_BLEND, MAX_PROBES, addressed_actuators, all_actuator_names, _semantic_group,
 )
 from policy_bias_lab.llm_util import candidate_score
 from policy_bias_lab.symbolic_control import sustained_bool
@@ -58,9 +58,22 @@ def validate_program(env: Any, cand: dict, rep: str) -> dict | None:
         stages = cand.get("stages")
         if not isinstance(stages, list) or not stages:
             return None
-        blend = cand.get("blend", "soft")
-        prog = {"mode": "freeform_staged", "blend": ("hard" if blend == "hard" else "soft"),
-                "stages": stages}
+        # Blend is NOT author-selectable: sharp softmax is the only gate semantics for new
+        # candidates (relu-norm "soft" degenerated into a static average and hard argmax chatters;
+        # see the 2026-07-03 blend comparison). Legacy soft/hard remain in blend_weights only so
+        # archived programs replay unchanged.
+        prog = {"mode": "freeform_staged", "blend": DEFAULT_BLEND, "stages": stages}
+        # LLM-authored derived signals (the only derived vocabulary; raw observables otherwise).
+        # A candidate WITH `signals` compiles strictly against raw + its own names; compile
+        # failures below reject it.
+        if isinstance(cand.get("signals"), dict) and cand["signals"]:
+            prog["signals"] = {str(k): str(v) for k, v in cand["signals"].items()}
+        if cand.get("temperature") is not None:
+            prog["temperature"] = float(cand["temperature"])
+        # LLM-authored diagnostic probes ride on the program (measured by stage_occupancy; a bad
+        # probe is reported there, never a validation failure).
+        if isinstance(cand.get("probes"), list) and cand["probes"]:
+            prog["probes"] = cand["probes"][:MAX_PROBES]
     else:
         subs = cand.get("subpriors")
         if not isinstance(subs, list) or len(subs) < 3:

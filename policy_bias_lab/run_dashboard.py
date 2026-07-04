@@ -282,10 +282,13 @@ def build_dashboard(payload: dict) -> str:
     c_obj = line_chart("Objective per evaluation", series)
 
     # -- chart 2: trained-policy success metrics -------------------------------------------------
-    met_keys = ["trained_success", "grasp_rate", "reach_rate", "lift_reached_rate"]
+    met_keys = ["success_rate", "grasp_rate", "reach_rate", "lift_reached_rate"]
     mseries = []
     for i, mk in enumerate(met_keys):
-        pts = [(r["iter"], (r.get("diagnostics") or {}).get(mk)) for r in evaluated]
+        # "trained_success" is the pre-rename key for success_rate (old checkpoints).
+        pts = [(r["iter"], (r.get("diagnostics") or {}).get(
+                    mk, (r.get("diagnostics") or {}).get("trained_success") if mk == "success_rate" else None))
+               for r in evaluated]
         mseries.append({"label": mk, "points": pts, "color": PALETTE[i]})
     c_met = line_chart("Trained-policy metrics per evaluation", mseries, y_range=(0.0, 1.0))
 
@@ -353,7 +356,8 @@ def build_dashboard(payload: dict) -> str:
         rows_html.append(
             f"<tr><td>{r['iter']}</td><td>{html.escape(str(r.get('source')))}</td>"
             f"<td>{html.escape(str(r.get('name')))}</td><td>{r.get('objective', 0):+.4f}</td>"
-            f"<td>{d.get('trained_success', '--')}</td><td>{f if f is not None else '--'}</td>"
+            f"<td>{d.get('success_rate', d.get('trained_success', '--'))}</td>"
+            f"<td>{f if f is not None else '--'}</td>"
             f"<td>{((d.get('training_report') or {}).get('verdict')) or '--'}</td>"
             f"<td>{html.escape(fm)}</td></tr>")
 

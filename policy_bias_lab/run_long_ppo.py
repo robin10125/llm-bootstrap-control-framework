@@ -193,6 +193,7 @@ def main() -> int:
         action_transform=args.action_transform, prior_logit_clip=args.prior_logit_clip,
         success_hold_seconds=args.success_hold_seconds,
         success_lift_threshold=args.success_lift_threshold, warmup_compile=False,
+        success_terminate_seconds=args.terminate_on_success,
     )
     if not args.resume:
         (args.out / "config.json").write_text(json.dumps(
@@ -201,6 +202,8 @@ def main() -> int:
              "reward_env_overrides": ENV_OVERRIDES[args.reward_mode],
              "reward_contrib_names": list(CONTRIB_NAMES) if args.reward_mode != "default" else None,
              "program": str(args.program), "init_params": str(args.init_params or ""),
+             "episode_seconds": args.episode_seconds,
+             "terminate_on_success": args.terminate_on_success,
              "criteria": {"min_hours": args.min_hours, "plateau_hours": args.plateau_hours,
                           "plateau_eps": args.plateau_eps, "success_stop": args.success_stop,
                           "success_window": args.success_window, "max_hours": args.max_hours},
@@ -330,6 +333,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--success-lift-threshold", type=float, default=0.05)
     p.add_argument("--episode-seconds", type=float, default=2.5)
     p.add_argument("--control-dt", type=float, default=0.025)
+    p.add_argument("--terminate-on-success", type=float, default=None, metavar="SECONDS",
+                   help="early termination for credit assignment: once the per-step success "
+                        "metric holds for this many consecutive seconds, later steps in the "
+                        "episode carry no reward/value/loss (fixed-horizon stepping continues)")
     p.add_argument("--physics-dt", type=float, default=0.01)
     p.add_argument("--obj-xy-range", type=float, default=0.04)
     return p.parse_args()

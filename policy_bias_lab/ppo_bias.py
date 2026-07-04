@@ -9,6 +9,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jp
+import numpy as np
 import optax
 
 BOOTSTRAPPING = Path(__file__).resolve().parents[2] / "bootstrapping"
@@ -53,6 +54,12 @@ class PPOBiasConfig:
     action_target_reward_weight: float = 0.0
     success_hold_seconds: float = 0.5
     success_lift_threshold: float = 0.05
+    # Early termination on sustained success: once the per-step env success metric holds for this
+    # many consecutive seconds, the episode is treated as DONE for credit assignment -- later steps
+    # carry no reward, no value target, and no loss weight, and the GAE bootstrap is dropped for
+    # episodes that finished. The fixed-horizon scan still steps the physics (it cannot stop), so
+    # this changes what the policy is trained on, not the compute per iteration. None = off.
+    success_terminate_seconds: float | None = None
     warmup_compile: bool = True
 
 
@@ -157,13 +164,21 @@ def train_ppo_arm(
         obs, action, logp, value, train_reward, _success, _lift, _base_reward, _shaped_reward, *_ = warmup_traj
         adv, ret = ppo.compute_gae(train_reward, value, warmup_last_value, cfg.gamma, cfg.lam)
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
-        warmup_data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
+        warmup_data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret),
+                       flat(jp.ones_like(train_reward)))
         warmup_params, _warmup_opt_state, _warmup_metrics = update(
             params, opt_state, warmup_data, uk, action_prior_weights, reference_params, jp.float32(0.0))
         jax.block_until_ready(warmup_params)
         print(f"[{arm}] warmup update ready", flush=True)
 
     steps_per_iter = int(cfg.envs) * int(env.horizon)
+    term_window = 0
+    if cfg.success_terminate_seconds:
+        term_window = max(1, round(float(cfg.success_terminate_seconds)
+                                   / float(env.cfg.control_dt)))
+        print(f"[{arm}] early termination: sustained success for "
+              f"{cfg.success_terminate_seconds}s ({term_window} steps) ends the episode's credit",
+              flush=True)
     stop_reason: str | None = None
     start = time.monotonic()
     for it in range(cfg.iters):
@@ -184,9 +199,19 @@ def train_ppo_arm(
             print(f"[{arm}] iter0 collect ready", flush=True)
         (obs, action, logp, value, train_reward, success, lift, base_reward,
          shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean, reward_contrib) = traj
-        adv, ret = ppo.compute_gae(train_reward, value, last_value, cfg.gamma, cfg.lam)
+        if term_window:
+            # Early termination on sustained success: post-terminal steps carry no reward, no
+            # value target, and (via the valid mask) no loss weight; finished episodes drop the
+            # bootstrap value, so the tail after "done" cannot leak credit either way.
+            alive, alive_end = success_termination_mask(success, term_window)
+            adv, ret = ppo.compute_gae(train_reward * alive, value * alive,
+                                       last_value * alive_end, cfg.gamma, cfg.lam)
+            valid = alive
+        else:
+            adv, ret = ppo.compute_gae(train_reward, value, last_value, cfg.gamma, cfg.lam)
+            valid = jp.ones_like(train_reward)
         flat = lambda x: x.reshape((-1,) + x.shape[2:])
-        data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret))
+        data = (flat(obs), flat(action), flat(logp), flat(adv), flat(ret), flat(valid))
         if it == 0:
             print(f"[{arm}] iter0 update start", flush=True)
         kl_coef = jp.float32(
@@ -341,7 +366,12 @@ def evaluate_ppo_policy(
     base_reward_weight: float = 1.0,
     action_prior_weights: jp.ndarray | None = None,
     return_obs: bool = False,
+    n_batches: int = 1,
 ) -> dict[str, Any]:
+    """Deterministic policy eval. n_batches > 1 runs several independently-seeded rollout batches
+    through the SAME compiled collect (execution-only after the first) and returns pooled metrics
+    plus the per-batch dicts under "eval_batches" -- lets callers measure and average out the
+    spawn-randomization variance of a single batch."""
     use_reward_bias, use_action_prior, use_exploration_bias, _ = BIAS_ARMS[arm]
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=_infer_hidden(params))
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
@@ -366,42 +396,65 @@ def evaluate_ppo_policy(
         if action_prior_weights is None
         else jp.asarray(action_prior_weights, dtype=jp.float32)
     )
-    state = reset(jax.random.split(jax.random.PRNGKey(seed), n_envs))
-    _state, traj, _last_value, eval_summary = collect(
-        params, state, jax.random.PRNGKey(seed + 1), reward_weights, base_reward_weight_arr, action_prior_weights
-    )
-    (_obs, _action, _logp, _value, train_reward, success, lift, base_reward,
-     shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean, reward_contrib) = traj
-    instant_success_rate = (success.max(axis=0) > 0.5).mean()
-    sustained_success_rate = sustained_lift_success(
-        lift,
-        control_dt=float(env.cfg.control_dt),
-        hold_seconds=cfg.success_hold_seconds if cfg is not None else 0.5,
-        lift_threshold=cfg.success_lift_threshold if cfg is not None else 0.05,
-        gate=success,  # contact-gated env success -> sustained GRASP, not sustained fling
-    )
-    out = {
-        "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
-        "eval_base_reward_weight": round(float(base_reward_weight_arr), 6),
-        "eval_shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
-        "eval_reward_template_returns": [round(float(x), 6) for x in reward_contrib.sum(axis=0).mean(axis=0)],
-        "eval_action_prior_weights": [round(float(x), 6) for x in action_prior_weights],
-        "eval_train_return": round(float(train_reward.sum(axis=0).mean()), 6),
-        "eval_success_rate": round(float(sustained_success_rate), 6),
-        "eval_instant_success_rate": round(float(instant_success_rate), 6),
-        "eval_reach_rate": round(float((eval_summary[:, 2] >= 1.0).mean()), 6),
-        "eval_grasp_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean()), 6),
-        "eval_grasp_lift_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)
-                                             & (eval_summary[:, 4] >= (cfg.success_lift_threshold if cfg is not None else 0.05))).mean()), 6),
-        "eval_lift_reached_rate": round(float((eval_summary[:, 4] >= (cfg.success_lift_threshold if cfg is not None else 0.05)).mean()), 6),
-        "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
-        "eval_hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
-        "eval_saturation_frac": round(float(saturation_frac.mean()), 6),
-        "eval_action_abs_mean": round(float(action_abs_mean.mean()), 6),
-        "eval_summary": [round(float(x), 6) for x in jp.mean(eval_summary, axis=0)],
-    }
-    if return_obs:
-        out["eval_obs"] = jax.device_get(_obs)  # [T, E, obs_dim] visited states, for stage occupancy
+    lift_thresh = cfg.success_lift_threshold if cfg is not None else 0.05
+
+    def _batch_metrics(traj, eval_summary) -> dict[str, Any]:
+        (_obs, _action, _logp, _value, train_reward, success, lift, base_reward,
+         shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean, reward_contrib) = traj
+        instant_success_rate = (success.max(axis=0) > 0.5).mean()
+        sustained_success_rate = sustained_lift_success(
+            lift,
+            control_dt=float(env.cfg.control_dt),
+            hold_seconds=cfg.success_hold_seconds if cfg is not None else 0.5,
+            lift_threshold=lift_thresh,
+            gate=success,  # contact-gated env success -> sustained GRASP, not sustained fling
+        )
+        return {
+            "eval_base_return": round(float(base_reward.sum(axis=0).mean()), 6),
+            "eval_base_reward_weight": round(float(base_reward_weight_arr), 6),
+            "eval_shaped_return": round(float(shaped_reward.sum(axis=0).mean()), 6),
+            "eval_reward_template_returns": [round(float(x), 6) for x in reward_contrib.sum(axis=0).mean(axis=0)],
+            "eval_action_prior_weights": [round(float(x), 6) for x in action_prior_weights],
+            "eval_train_return": round(float(train_reward.sum(axis=0).mean()), 6),
+            "eval_success_rate": round(float(sustained_success_rate), 6),
+            "eval_instant_success_rate": round(float(instant_success_rate), 6),
+            "eval_reach_rate": round(float((eval_summary[:, 2] >= 1.0).mean()), 6),
+            "eval_grasp_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)).mean()), 6),
+            "eval_grasp_lift_rate": round(float(((eval_summary[:, 2] >= 1.0) & (eval_summary[:, 3] >= 0.5)
+                                                 & (eval_summary[:, 4] >= lift_thresh)).mean()), 6),
+            "eval_lift_reached_rate": round(float((eval_summary[:, 4] >= lift_thresh).mean()), 6),
+            "eval_lift_max": round(float(lift.max(axis=0).mean()), 6),
+            "eval_hard_clip_frac": round(float(hard_clip_frac.mean()), 6),
+            "eval_saturation_frac": round(float(saturation_frac.mean()), 6),
+            "eval_action_abs_mean": round(float(action_abs_mean.mean()), 6),
+            "eval_summary": [round(float(x), 6) for x in jp.mean(eval_summary, axis=0)],
+        }
+
+    outs: list[dict[str, Any]] = []
+    obs_list = []
+    for b in range(max(1, int(n_batches))):
+        bs = seed + 7919 * b  # distinct reset keys per batch; the compiled collect is reused
+        state = reset(jax.random.split(jax.random.PRNGKey(bs), n_envs))
+        _state, traj, _last_value, eval_summary = collect(
+            params, state, jax.random.PRNGKey(bs + 1), reward_weights, base_reward_weight_arr,
+            action_prior_weights
+        )
+        outs.append(_batch_metrics(traj, eval_summary))
+        if return_obs:
+            obs_list.append(jax.device_get(traj[0]))
+    if len(outs) == 1:
+        out = dict(outs[0])
+    else:  # pooled = mean over equal-size batches (all fields are per-episode means)
+        out = {}
+        for k, v in outs[0].items():
+            if isinstance(v, list):
+                out[k] = [round(float(sum(o[k][i] for o in outs) / len(outs)), 6)
+                          for i in range(len(v))]
+            else:
+                out[k] = round(float(sum(o[k] for o in outs) / len(outs)), 6)
+        out["eval_batches"] = outs
+    if return_obs:  # [T, n_batches*E, obs_dim] visited states, for stage occupancy
+        out["eval_obs"] = (np.concatenate(obs_list, axis=1) if len(obs_list) > 1 else obs_list[0])
     return out
 
 
@@ -528,12 +581,17 @@ def make_update(
         return logp, ppo.gaussian_entropy(log_std), value
 
     def loss_fn(params, batch, action_prior_weights, reference_params, kl_coef):
-        obs, action, old_logp, adv, ret = batch
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        # valid = per-sample loss weight (0 on post-terminal steps under early termination;
+        # all-ones otherwise, in which case every masked statistic reduces to the plain mean).
+        obs, action, old_logp, adv, ret, valid = batch
+        vsum = valid.sum() + 1e-8
+        adv_mean = (adv * valid).sum() / vsum
+        adv_std = jp.sqrt((((adv - adv_mean) ** 2) * valid).sum() / vsum)
+        adv = (adv - adv_mean) / (adv_std + 1e-8)
         logp, ent, value = evaluate(params, obs, action, action_prior_weights)
         ratio = jp.exp(logp - old_logp)
-        pg_loss = -jp.minimum(ratio * adv, jp.clip(ratio, 0.8, 1.2) * adv).mean()
-        v_loss = 0.5 * ((value - ret) ** 2).mean()
+        pg_loss = -(jp.minimum(ratio * adv, jp.clip(ratio, 0.8, 1.2) * adv) * valid).sum() / vsum
+        v_loss = 0.5 * (((value - ret) ** 2) * valid).sum() / vsum
         # Decaying KL anchor to the frozen BC policy (raw net outputs), protecting the
         # warm-start during early PPO. kl_coef is 0 for non-warm-start arms (a no-op).
         cur_mean, cur_log_std, _ = net.apply(params, obs)
@@ -543,12 +601,13 @@ def make_update(
         kl_anchor = _diag_gaussian_kl(
             cur_mean, jp.clip(cur_log_std, -5.0, 2.0), ref_mean, jp.clip(ref_log_std, -5.0, 2.0)
         ).mean()
-        loss = pg_loss + 0.5 * v_loss - ent_coef * ent.mean() + kl_coef * kl_anchor
+        ent_mean = (ent * valid).sum() / vsum
+        loss = pg_loss + 0.5 * v_loss - ent_coef * ent_mean + kl_coef * kl_anchor
         return loss, {
             "pg_loss": pg_loss,
             "v_loss": v_loss,
-            "entropy": ent.mean(),
-            "approx_kl": jp.mean(old_logp - logp),
+            "entropy": ent_mean,
+            "approx_kl": ((old_logp - logp) * valid).sum() / vsum,
             "kl_anchor": kl_anchor,
         }
 
@@ -580,6 +639,28 @@ def make_update(
         return params, opt_state, jax.tree_util.tree_map(lambda x: x.mean(), metrics)
 
     return jax.jit(update)
+
+
+def success_termination_mask(success: jp.ndarray, window: int) -> tuple[jp.ndarray, jp.ndarray]:
+    """Treat the first completed run of `window` consecutive per-step successes as termination.
+
+    success: [T, E] per-step env success metric. Returns (alive [T, E] float32, alive_end [E]):
+    alive is 1.0 up to AND INCLUDING the step that completes the run and 0.0 after; alive_end is
+    0.0 for episodes that terminated before the horizon (drops the GAE bootstrap value for them).
+    Terminating on a SUSTAINED window -- not the first threshold crossing -- matters: crossing-only
+    termination rewards throwing the object through the success region.
+    """
+    T, E = success.shape
+    w = max(1, min(int(window), T))
+    s = (success > 0.5).astype(jp.float32)
+    c = jp.cumsum(s, axis=0)
+    cshift = jp.concatenate([jp.zeros((w, E), jp.float32), c], axis=0)[:T]
+    win_done = (c - cshift) >= w                                     # w-run completes AT step t
+    seen = jp.cumsum(win_done.astype(jp.int32), axis=0) > 0
+    prev_seen = jp.concatenate([jp.zeros((1, E), dtype=bool), seen[:-1]], axis=0)
+    alive = (~prev_seen).astype(jp.float32)
+    alive_end = (~seen[-1]).astype(jp.float32)
+    return alive, alive_end
 
 
 def sustained_lift_success(

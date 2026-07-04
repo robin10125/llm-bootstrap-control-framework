@@ -41,3 +41,43 @@ def task_metadata(task: str) -> dict[str, Any]:
     if task == "stabilize":
         return {"objective": "avoid object drift while maintaining control", "success": "obj_xy_disp < 0.035m"}
     raise KeyError(f"unknown task {task!r}")
+
+
+# ------------------------------------------------------------------------------------------------
+# Per-task ARBITER definitions. These live here -- the injected TASK side -- not in the framework:
+# the framework (ppo_arbiter / agentic_orchestrator) must stay task-agnostic, so anything that
+# names task-specific eval fields or encodes how progress on a task is graded is task data.
+# ------------------------------------------------------------------------------------------------
+
+def task_graded_objective(task: str, ev: dict[str, Any]) -> float:
+    """Dense selection objective over the trained-policy eval dict for `task`.
+
+    Ranking on final success alone is blind when no candidate ever succeeds at short-PPO budgets
+    (observed: the marginal-value run flatlined at a tie-breaker floor), so each task defines a
+    graded objective over its own eval fields, with anti-exploit gating where the task needs it.
+    """
+    if task == "lift":
+        # reach -> grasp -> lift -> sustain, later (harder) stages weighted more; lift credited
+        # only as far as there is a grasp, so lifting WITHOUT a secure grip (throwing/knocking the
+        # object up) scores ~0 on the lift terms.
+        lift_thresh = 0.05  # m; matches this task's success definition above
+        reach = float(ev.get("eval_reach_rate", 0.0))
+        grasp = float(ev.get("eval_grasp_rate", 0.0))
+        lift_reached = float(ev.get("eval_lift_reached_rate", 0.0))
+        lift_max_norm = min(float(ev.get("eval_lift_max", 0.0)) / lift_thresh, 1.0)
+        succ = float(ev.get("eval_success_rate", 0.0))
+        return (1.0 * succ + 0.5 * grasp + 0.2 * reach
+                + 0.3 * min(lift_reached, grasp) + 0.1 * min(lift_max_norm, grasp))
+    if task in ("push", "stabilize"):
+        return float(ev.get("eval_success_rate", 0.0))
+    raise KeyError(f"unknown task {task!r}")
+
+
+def task_progress_metrics(task: str) -> tuple[str, ...]:
+    """Training-telemetry row keys expected to RISE while `task` is being learned (used by the
+    framework's generic still-improving-vs-converged trend probe)."""
+    if task == "lift":
+        return ("base_return", "reach_rate", "grasp_rate", "lift_reached_rate", "success")
+    if task in ("push", "stabilize"):
+        return ("base_return", "success")
+    raise KeyError(f"unknown task {task!r}")

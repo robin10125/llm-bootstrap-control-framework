@@ -76,6 +76,9 @@ def robot_spec(env: Any) -> dict[str, Any]:
         "base_world_sign": base_world,
         "semantic_groups": {g: [a["name"] for a in actuators if a["group"] == g]
                             for g in sorted({a["group"] for a in actuators})},
+        # Raw observable enumeration (env detail, mechanically derived): the ONLY signal
+        # vocabulary the prompts advertise. Derived signals are LLM-authored per candidate.
+        "observables_doc": raw_signal_fn(env)[2],
     }
 
 
@@ -317,7 +320,7 @@ def make_freeform_prior_fn(env: Any, program: dict[str, Any]) -> tuple[Callable[
     weights (optional) scale channels; default = ones. prior_fn(obs, weights) -> mean_shift in [-1,1].
     """
     action_dim = int(env.action_size)
-    signals, signal_names = freeform_signal_fn(env)
+    signals, signal_names = program_signal_fn(env, program)
     channels = list(program.get("channels", []))
     compiled = []
     for ch in channels:
@@ -406,6 +409,34 @@ def make_stacked_prior_fn(env: Any, program: dict[str, Any]):
     }
 
 
+DEFAULT_BLEND = "softmax"
+DEFAULT_BLEND_TAU = 0.1
+
+
+def blend_weights(gates: jp.ndarray, blend: str, tau: float = DEFAULT_BLEND_TAU) -> jp.ndarray:
+    """Normalized stage weights from raw gate values -- the ONE place the blend semantics live,
+    shared by the prior itself, make_stage_weight_fn, and stage_occupancy so the executed mixture
+    and every diagnostic see identical weights.
+
+    softmax (default): sharp but continuous hand-offs. Invariant to a shared additive gate offset,
+    so authored constant gate floors cannot leak permanent weight to every stage (the relu-norm
+    failure mode where a 4-stage program degenerates into one static averaged pose).
+    soft: legacy relu(gate)/sum. hard: one-hot on argmax (ties split evenly).
+    """
+    if blend == "hard":
+        top = (gates >= jp.max(gates)).astype(jp.float32)
+        return top / (jp.sum(top) + 1e-8)
+    if blend == "soft":
+        pos = jp.maximum(gates, 0.0)
+        return pos / (jp.sum(pos) + 1e-8)
+    return jax.nn.softmax(gates / jp.maximum(tau, 1e-4))
+
+
+def _blend_of(program: dict[str, Any]) -> tuple[str, float]:
+    return (str(program.get("blend", DEFAULT_BLEND)),
+            float(program.get("temperature", DEFAULT_BLEND_TAU)))
+
+
 def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
     """Fully free-form MULTI-STAGE prior: the AUTHOR defines N stages, each with its own free-form
     GATE expression (stage activation, a function of observable signals) AND free-form channels.
@@ -415,15 +446,14 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
     STATELESSLY -- pure functions of the CURRENT signals, no phase latch/pointer/hysteresis (PPO
     recomputes the prior on shuffled minibatches, so any hidden state breaks the importance ratio).
 
-    program = {"mode":"freeform_staged", "blend":"soft"|"hard",
+    program = {"mode":"freeform_staged", "blend":"softmax"|"soft"|"hard", "temperature": <tau>,
                "stages":[{"name", "gate":"<expr>", "channels":[{actuators, expr}, ...]}, ...]}
-      - soft: stage weights = relu(gate_i) normalized to sum 1 (smooth blend).
-      - hard: one-hot on argmax(gate_i) (crisp phase separation; ties split evenly).
+    Blend semantics live in blend_weights(); softmax (sharp, continuous) is the default.
     Per-stage gains are the tunable `weights` vector (default ones).
     """
     action_dim = int(env.action_size)
-    signals, signal_names = freeform_signal_fn(env)
-    blend = str(program.get("blend", "soft"))
+    signals, signal_names = program_signal_fn(env, program)
+    blend, tau = _blend_of(program)
     stages = list(program.get("stages", []))
     compiled: list[tuple[Callable, list[tuple[jp.ndarray, Callable]]]] = []
     for st in stages:
@@ -445,12 +475,7 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
         sig = signals(obs)
         gates = jp.stack([g(sig) for g, _ in compiled]) if n else jp.zeros((0,), jp.float32)
         gates = jp.asarray(gates, jp.float32)
-        if blend == "hard":  # one-hot on argmax (ties -> even split), stateless
-            top = (gates >= jp.max(gates)).astype(jp.float32)
-            w = top / (jp.sum(top) + 1e-8)
-        else:  # soft: normalized nonneg blend
-            pos = jp.maximum(gates, 0.0)
-            w = pos / (jp.sum(pos) + 1e-8)
+        w = blend_weights(gates, blend, tau)
         out = jp.zeros((action_dim,), jp.float32)
         for i, (_g, chans) in enumerate(compiled):
             out = out + (w[i] * gains[i]) * _stage_out(chans, sig)
@@ -469,8 +494,8 @@ def make_stage_weight_fn(env: Any, program: dict[str, Any]):
     WHICH authored stage a trained policy stalls in -- task-agnostic, since it reads only the model's
     own gates over the shared signals.
     """
-    signals, signal_names = freeform_signal_fn(env)
-    blend = str(program.get("blend", "soft"))
+    signals, signal_names = program_signal_fn(env, program)
+    blend, tau = _blend_of(program)
     stages = list(program.get("stages", []))
     gate_evs = [compile_expr(str(st.get("gate", "1")), signal_names) for st in stages]
     n = len(gate_evs)
@@ -479,14 +504,137 @@ def make_stage_weight_fn(env: Any, program: dict[str, Any]):
     def weight_fn(obs):
         sig = signals(obs)
         gates = jp.stack([g(sig) for g in gate_evs]) if n else jp.zeros((0,), jp.float32)
-        gates = jp.asarray(gates, jp.float32)
-        if blend == "hard":
-            top = (gates >= jp.max(gates)).astype(jp.float32)
-            return top / (jp.sum(top) + 1e-8)
-        pos = jp.maximum(gates, 0.0)
-        return pos / (jp.sum(pos) + 1e-8)
+        return blend_weights(jp.asarray(gates, jp.float32), blend, tau)
 
     return weight_fn, names
+
+
+# Extra signals available ONLY to diagnostic probes (evaluated offline over whole [T, E] episode
+# arrays, so per-episode baselines are allowed -- unlike gate/channel signals, which must stay
+# stateless functions of the current obs for PPO). Generic rigid-body quantities, no task nouns.
+PROBE_EXTRA_SIGNALS = {
+    "obj_disp_xy": "object's horizontal distance from its own position at the episode start (m)",
+    "obj_speed": "object's translational speed (m/s)",
+}
+
+MAX_PROBES = 8  # measurement slots per candidate (cap keeps prompts bounded, not a hard budget)
+
+
+def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
+    """RAW observables only, mechanically enumerated from the env/robot: world positions and
+    velocities present in obs, commanded actuator targets, and measured joint positions.
+
+    NO derived quantities live here -- distances, proximity gates, closure fractions, alignment
+    measures are TASK STRUCTURE and must be LLM-authored per candidate (`signals` on the program;
+    see AGENTS.md). Returns (signals(obs)->dict, names, doc) where doc is the injectable
+    description block for prompts.
+    """
+    _base, info = make_signal_fn(env)  # obs-layout indices only
+    nb = len(env.base_qadr)
+    n_pre = int(info["n_pre"])
+    nu = int(env.nu)
+    m = env.model
+    act_names = [m.actuator(i).name for i in range(nu)]
+    qmap = actuator_obs_qpos_map(env)
+    axes = "xyz"
+    entries: list[tuple[str, int]] = []
+    for i in range(min(nb, 3)):
+        entries.append((f"base_pos_{axes[i]}", i))
+    for i in range(3):
+        entries.append((f"obj_pos_{axes[i]}", n_pre + i))
+    for i in range(3):
+        entries.append((f"obj_vel_{axes[i]}", n_pre + 3 + i))
+    for i in range(3):
+        entries.append((f"palm_pos_{axes[i]}", n_pre + 6 + i))
+    for i in range(3):
+        entries.append((f"obj_rel_{axes[i]}", n_pre + 9 + i))
+    for i, an in enumerate(act_names):
+        entries.append((f"ctrl_{an}", n_pre + 12 + i))
+    no_q = []
+    for i, an in enumerate(act_names):
+        if qmap[i] is not None:
+            entries.append((f"q_{an}", int(qmap[i])))
+        else:
+            no_q.append(an)
+    names = [n for n, _ in entries]
+    idxs = jp.asarray([ix for _, ix in entries], jp.int32)
+
+    def signals(obs: jp.ndarray) -> dict[str, jp.ndarray]:
+        vals = obs[idxs]
+        return {n: vals[k] for k, n in enumerate(names)}
+
+    doc = (
+        "OBSERVABLES (raw, per control step -- there are NO predefined derived signals; author "
+        "your own from these):\n"
+        "  base_pos_x/y/z: base carriage DOF positions (ctrl units of base_x/base_y/base_z)\n"
+        "  obj_pos_x/y/z: object position, world frame (m)\n"
+        "  obj_vel_x/y/z: object linear velocity, world frame (m/s)\n"
+        "  palm_pos_x/y/z: palm position, world frame (m)\n"
+        "  obj_rel_x/y/z: object position minus grasp-site position, world frame (m)\n"
+        "  ctrl_<actuator>: current commanded target of that actuator (its ctrl units/range)\n"
+        "  q_<actuator>: MEASURED position of the joint that actuator drives (differs from "
+        "ctrl_<actuator> when the joint is blocked or saturated)"
+        + (f"; q_ not available for tendon-coupled: {', '.join(no_q)}" if no_q else "")
+    )
+    return signals, set(names), doc
+
+
+def program_signal_fn(env: Any, program: dict[str, Any]) -> tuple[Callable, set[str]]:
+    """The signal vocabulary for ONE program: raw observables + the program's own authored
+    `signals: {name: expr}` (evaluated in insertion order; later signals may reference earlier
+    ones). Programs WITHOUT authored signals get the legacy derived vocabulary as well, so
+    archived candidates replay unchanged -- new candidates are expected to author their own."""
+    raw_fn, raw_names, _doc = raw_signal_fn(env)
+    authored = program.get("signals")
+    if isinstance(authored, dict) and authored:
+        compiled: list[tuple[str, Callable]] = []
+        avail = set(raw_names)
+        for name, expr in authored.items():
+            ev = compile_expr(str(expr), avail)  # raises -> validation rejects the candidate
+            compiled.append((str(name), ev))
+            avail.add(str(name))
+
+        def signals(obs: jp.ndarray) -> dict[str, jp.ndarray]:
+            sig = raw_fn(obs)
+            for name, ev in compiled:
+                sig[name] = jp.asarray(ev(sig), jp.float32)
+            return sig
+
+        return signals, avail
+    legacy_fn, _legacy_names = freeform_signal_fn(env)
+    legacy_names = {"palm_obj_dist", "closure", "lift", "obj_rel_x", "obj_rel_y", "obj_rel_z",
+                    "near", "gripped"}
+
+    def signals(obs: jp.ndarray) -> dict[str, jp.ndarray]:
+        sig = raw_fn(obs)
+        sig.update(legacy_fn(obs))
+        return sig
+
+    return signals, raw_names | legacy_names
+
+
+def actuator_obs_qpos_map(env: Any) -> list[int | None]:
+    """Per actuator: the index into the obs qpos block (base_q ++ hand_q) of the joint it drives,
+    or None when the transmission is not a single joint (e.g. tendon-coupled actuators). Derived
+    from the mujoco model, so it is robot-agnostic."""
+    import mujoco
+    m = env.model
+    base_qadr = [int(a) for a in env.base_qadr]
+    hand_qadr = [int(a) for a in getattr(env, "hand_qadr", ())]
+    hand_off = len(base_qadr) + len(env.base_vadr)
+    out: list[int | None] = []
+    for i in range(int(env.nu)):
+        if int(m.actuator_trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+            out.append(None)
+            continue
+        qadr = int(m.jnt_qposadr[int(m.actuator_trnid[i, 0])])
+        if qadr in base_qadr:
+            out.append(base_qadr.index(qadr))
+        elif qadr in hand_qadr:
+            out.append(hand_off + hand_qadr.index(qadr))
+        else:
+            out.append(None)
+    return out
 
 
 def stage_transition_stats(active: "np.ndarray", n: int, dwell: int = 3) -> dict:
@@ -553,9 +701,9 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     import re
     import numpy as _np
 
-    signals, signal_names = freeform_signal_fn(env)
+    signals, signal_names = program_signal_fn(env, program)
     sig_keys = sorted(signal_names)
-    blend = str(program.get("blend", "soft"))
+    blend, tau = _blend_of(program)
     stages = list(program.get("stages", []))
     names = [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]
     gate_exprs = [str(st.get("gate", "1")) for st in stages]
@@ -563,6 +711,10 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     n = len(names)
     if n == 0:
         return {"stage_names": [], "occupancy": [], "reached_frac": [], "stall_stage": None}
+    action_dim = int(env.action_size)
+    chan_evs = [[(jp.asarray(_resolve_actuators(env, ch.get("actuators", [])), dtype=jp.int32),
+                  compile_expr(str(ch.get("expr", "0")), signal_names))
+                 for ch in st.get("channels", [])] for st in stages]
     # Optional LLM-authored per-stage `success` expressions (the author's explicit post-condition
     # over the same signals). They are a cross-check, not the primary predicate -- a bad one must
     # not kill the eval, so compile failures are reported, never raised.
@@ -581,24 +733,29 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     def _all(o):
         sig = signals(o)
         gates = jp.asarray(jp.stack([g(sig) for g in gate_evs]), jp.float32)
-        if blend == "hard":
-            top = (gates >= jp.max(gates)).astype(jp.float32)
-            w = top / (jp.sum(top) + 1e-8)
-        else:
-            pos = jp.maximum(gates, 0.0)
-            w = pos / (jp.sum(pos) + 1e-8)
+        w = blend_weights(gates, blend, tau)
         succ = jp.stack([(jp.asarray(ev(sig), jp.float32) if ev is not None
                           else jp.asarray(0.0, jp.float32)) for ev in succ_evs])
-        return w, gates, jp.stack([jp.asarray(sig[k], jp.float32) for k in sig_keys]), succ
+        stage_act = []
+        for chans in chan_evs:
+            sa = jp.zeros((action_dim,), jp.float32)
+            for idx, ev in chans:
+                sa = sa.at[idx].add(jp.clip(ev(sig), -1.0, 1.0))
+            stage_act.append(sa)
+        return (w, gates, jp.stack([jp.asarray(sig[k], jp.float32) for k in sig_keys]), succ,
+                jp.stack(stage_act))
 
     arr = _np.asarray(obs)
     T, E = arr.shape[0], arr.shape[1]
     flat = arr.reshape(T * E, -1)
-    w, gates, sigv, succv = (_np.asarray(x) for x in jax.jit(jax.vmap(_all))(jp.asarray(flat)))
+    w, gates, sigv, succv, actv = (
+        _np.asarray(x) for x in jax.jit(jax.vmap(_all))(jp.asarray(flat)))
     active = w.argmax(axis=1).reshape(T, E)                          # dominant stage per step
+    w_te = w.reshape(T, E, n)
     gates_te = gates.reshape(T, E, n)
     sig_te = sigv.reshape(T, E, len(sig_keys))
     succ_te = succv.reshape(T, E, n)
+    act_te = actv.reshape(T, E, n, action_dim)                       # per-stage channel intents
     occupancy = [float((active == i).mean()) for i in range(n)]      # time-share
     reached = [float(((active == i).any(axis=0)).mean()) for i in range(n)]  # episodes reaching i
 
@@ -634,15 +791,22 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
 
     # Stall = the FIRST broken hand-off: the shallowest stage reliably (dwell-)entered whose
     # successor rarely gets a dwell-qualified run. The chain completes when no hand-off is broken.
+    # A SKIPPED stage (never entered while DEEPER stages run) is NOT a stall: which stage wins at
+    # t=0 is gate arithmetic, and directing revisions to "fix" a skipped entry stage of a working
+    # chain destroys the working behavior (observed: agentic_v3 burned its refine budget that way).
+    # Skipped stages are reported separately; only an entirely-dead chain (nothing ever entered)
+    # localizes to stage 0's entry.
     reach_thresh, handoff_thresh = 0.1, 0.1
     stall = None
     for i in range(n - 1):
         if entered[i] >= reach_thresh and (handoff[i] or 0.0) < handoff_thresh:
             stall = i
             break
-    if stall is None and n > 0 and entered[0] < reach_thresh:
-        stall = 0  # not even the first stage reliably occupies; treat its entry as the failure
+    if stall is None and max(entered) < reach_thresh:
+        stall = 0  # no stage ever reliably occupies; the chain is dead from the start
     reaches_terminal = stall is None and (n == 1 or entered[n - 1] >= reach_thresh)
+    deepest = max((i for i in range(n) if entered[i] >= reach_thresh), default=-1)
+    skipped = [i for i in range(deepest) if entered[i] < reach_thresh]
     if stall is None and not reaches_terminal:
         stall = n - 2 if n > 1 else None  # defensive; shouldn't occur with the rules above
     # Endgame leak analysis: when the chain completes, the improvement target is the WEAKEST
@@ -663,6 +827,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
         "stall_stage": stall,
         "stall_name": (names[stall] if stall is not None else None),
         "reaches_terminal": bool(reaches_terminal),
+        "skipped_entry_stages": skipped,
         "weakest_stage": weakest,
         "weakest_name": (names[weakest] if weakest is not None else None),
         "authored_success_frac": [round(x, 4) if x is not None else None for x in authored],
@@ -670,6 +835,51 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     }
     if succ_errors:
         out["success_compile_errors"] = succ_errors
+
+    # LLM-authored diagnostic PROBES: named expressions the author asked the framework to measure
+    # on the trained policy's visited states (optionally masked to one stage). Evaluated offline
+    # over the whole [T, E] episode array, so the vocabulary adds the episode-relative
+    # PROBE_EXTRA_SIGNALS. A bad probe is reported, never fatal.
+    probes = list(program.get("probes") or [])[:MAX_PROBES]
+    if probes:
+        _sigfn, _info = make_signal_fn(env)
+        n_pre = int(_info["n_pre"])
+        obj_pos = arr[:, :, n_pre:n_pre + 3]
+        obj_vel = arr[:, :, n_pre + 3:n_pre + 6]
+        probe_env = {s: sig_te[:, :, j] for j, s in enumerate(sig_keys)}
+        probe_env["obj_disp_xy"] = _np.linalg.norm(obj_pos[:, :, :2] - obj_pos[:1, :, :2], axis=-1)
+        probe_env["obj_speed"] = _np.linalg.norm(obj_vel, axis=-1)
+        probe_names = set(signal_names) | set(PROBE_EXTRA_SIGNALS)
+        phalf = max(T // 2, 1)
+        preport: dict[str, dict] = {}
+        for p in probes:
+            pname = str(p.get("name") or p.get("expr") or f"probe{len(preport)}")
+            entry: dict[str, Any] = {"expr": str(p.get("expr", "")), "stage": p.get("stage")}
+            try:
+                ev = compile_expr(str(p.get("expr", "0")), probe_names)
+                val = _np.broadcast_to(_np.asarray(ev(probe_env), dtype=_np.float64), (T, E))
+                st = p.get("stage")
+                if st is None:
+                    pm = _np.ones((T, E), bool)
+                else:
+                    si = names.index(str(st)) if str(st) in names else int(st)
+                    pm = active == si
+
+                def _mm(sl, pm=pm, val=val):
+                    m = pm[sl]
+                    return round(float((val[sl] * m).sum() / m.sum()), 4) if m.sum() else None
+
+                entry.update({
+                    "early_late_mean": [_mm(slice(0, phalf)), _mm(slice(phalf, None))],
+                    "mean": _mm(slice(None)),
+                    "min": round(float(val[pm].min()), 4) if pm.any() else None,
+                    "max": round(float(val[pm].max()), 4) if pm.any() else None,
+                })
+            except Exception as e:  # noqa: BLE001 -- a bad probe must not kill the eval
+                entry["error"] = str(e)
+            preport[pname] = entry
+        out["probe_report"] = preport
+
     # Direction evidence for the FOCUS stage: the stall, or (endgame) the weakest hand-off.
     focus = stall if stall is not None else weakest
     if focus is None or focus >= n - 1:
@@ -686,12 +896,50 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
             pair.append(round(float((v[sl] * m).sum() / c), 4) if c else None)
         return pair
 
+    # Intent vs execution + command vs measured, restricted to steps where the focus stage is
+    # dominant. "stage_cmd" = what the focus stage's own channels command; "executed" = the blended
+    # prior actually applied (dilution/cancellation across stages shows up as a gap). "tracking" =
+    # commanded ctrl target vs the measured joint position, as a fraction of the actuator's range
+    # (a persistent gap = the joint is saturated, blocked by contact, or physically stopped).
+    msum = int(mask.sum())
+    if msum:
+        act_names_all = [env.model.actuator(i).name for i in range(int(env.nu))]
+        intended = act_te[:, :, k, :]
+        executed = _np.clip((w_te[:, :, :, None] * act_te).sum(axis=2), -1.0, 1.0)
+        mi = (intended * mask[:, :, None]).sum(axis=(0, 1)) / msum
+        me = (executed * mask[:, :, None]).sum(axis=(0, 1)) / msum
+        gap = (_np.abs(executed - intended) * mask[:, :, None]).sum(axis=(0, 1)) / msum
+        rows_ie = [{"actuator": act_names_all[a], "stage_cmd": round(float(mi[a]), 3),
+                    "executed": round(float(me[a]), 3), "gap": round(float(gap[a]), 3)}
+                   for a in range(action_dim) if abs(mi[a]) >= 0.02 or gap[a] >= 0.02]
+        rows_ie.sort(key=lambda r: -r["gap"])
+        out["intent_execution"] = rows_ie[:8]
+        qmap = actuator_obs_qpos_map(env)
+        lo = _np.asarray(env.ctrl_lo, dtype=_np.float64)
+        hi = _np.asarray(env.ctrl_hi, dtype=_np.float64)
+        ctrl = arr[:, :, -action_dim:]
+        rows_tr = []
+        for a in range(action_dim):
+            if qmap[a] is None:
+                continue
+            err = _np.abs(ctrl[:, :, a] - arr[:, :, qmap[a]]) / max(float(hi[a] - lo[a]), 1e-6)
+            rows_tr.append({"actuator": act_names_all[a],
+                            "cmd_vs_measured_frac_of_range":
+                                round(float((err * mask).sum() / msum), 3)})
+        rows_tr.sort(key=lambda r: -r["cmd_vs_measured_frac_of_range"])
+        out["tracking"] = rows_tr[:6]
+
     next_sigs = [s for s in sig_keys if re.search(rf"\b{re.escape(s)}\b", gate_exprs[nk])]
+    # Trend table restricted to signals the PROGRAM references (authored signals + observables it
+    # actually uses) -- with per-candidate vocabularies the full observable set would flood the
+    # revision directive.
+    prog_text = str(program.get("stages", [])) + str(program.get("signals") or {})
+    ref_keys = [s for s in sig_keys if re.search(rf"\b{re.escape(s)}\b", prog_text)]
     out.update({
-        "stall_signal_trend": {s: _early_late(sig_te[:, :, j]) for j, s in enumerate(sig_keys)},
+        "stall_signal_trend": {s: _early_late(sig_te[:, :, sig_keys.index(s)]) for s in ref_keys},
         "stall_gate": {"expr": gate_exprs[k], "value_early_late": _early_late(gates_te[:, :, k])},
         "next_gate": {"index": nk, "name": names[nk], "expr": gate_exprs[nk],
                       "signals": next_sigs, "value_early_late": _early_late(gates_te[:, :, nk])},
-        "self_lock": bool(blend == "hard" and occupancy[k] >= 0.95 and reached[nk] <= 0.05),
+        "self_lock": bool(blend in ("hard", "softmax") and occupancy[k] >= 0.95 and reached[nk] <= 0.05),
     })
     return out

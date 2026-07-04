@@ -36,6 +36,8 @@ def main() -> int:
     ap.add_argument("--llm-model", default=None)
     ap.add_argument("--budget", type=int, default=10,
                     help="B: max candidate evaluations (default 10 = 3 explore + ~7 refine).")
+    ap.add_argument("--refine-top", type=int, default=2,
+                    help="max seeds kept for refinement (extras only if competitive; 1 = single).")
     ap.add_argument("--n-seeds", type=int, default=3,
                     help="explore cap; breadth saturates ~3 seeds (marginal-value run).")
     ap.add_argument("--patience", type=int, default=3, help="w: plateau/degradation window.")
@@ -46,7 +48,8 @@ def main() -> int:
                     "for freeform_staged runs with a stage report).")
     ap.add_argument("--eps", type=float, default=1e-3, help="improvement tolerance.")
     ap.add_argument("--human-analogy", action="store_true", help="enable the optional C4 context.")
-    ap.add_argument("--arbiter", choices=["short_ppo", "open_loop"], default="short_ppo",
+    ap.add_argument("--arbiter", choices=["short_ppo", "prior_only", "open_loop"],
+                    default="short_ppo",
                     help="short_ppo (default): rank on TRAINED contact-gated success (the real "
                     "objective); open_loop: the cheap blind rollout score (prefilter-grade).")
     ap.add_argument("--ppo-task", default="lift", help="task key for the PPO arbiter.")
@@ -54,6 +57,14 @@ def main() -> int:
                     help="short-PPO budget per candidate (the per-iteration cost).")
     ap.add_argument("--ppo-train-envs", type=int, default=256)
     ap.add_argument("--ppo-eval-envs", type=int, default=256)
+    ap.add_argument("--eval-batches", type=int, default=1,
+                    help="rollout batches per prior_only evaluation (mean objective; per-batch "
+                         "spread reported -- variance control).")
+    ap.add_argument("--episode-seconds", type=float, default=2.5,
+                    help="env episode length (horizon = episode_seconds / control_dt).")
+    ap.add_argument("--terminate-on-success", type=float, default=None, metavar="SECONDS",
+                    help="early termination for credit assignment: once the per-step success "
+                         "metric holds this long, later steps carry no reward/value/loss.")
     ap.add_argument("--score-envs", type=int, default=128, help="open_loop arbiter only.")
     ap.add_argument("--score-seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true",
@@ -93,9 +104,11 @@ def main() -> int:
         llm_backend=args.llm_backend, llm_model=args.llm_model,
         budget=args.budget, n_seeds=args.n_seeds, patience=args.patience,
         per_stage_iters=args.per_stage_iters, eps=args.eps,
-        use_human_analogy=args.human_analogy, arbiter=args.arbiter, ppo_task=args.ppo_task,
+        use_human_analogy=args.human_analogy, arbiter=args.arbiter, refine_top=args.refine_top,
+        eval_batches=args.eval_batches, ppo_task=args.ppo_task,
         ppo_train_seconds=args.ppo_train_seconds, ppo_train_envs=args.ppo_train_envs,
-        ppo_eval_envs=args.ppo_eval_envs, score_envs=args.score_envs, score_seed=args.score_seed,
+        ppo_eval_envs=args.ppo_eval_envs, ppo_terminate_on_success=args.terminate_on_success,
+        score_envs=args.score_envs, score_seed=args.score_seed,
         min_hours=args.min_hours, plateau_hours=args.plateau_hours,
         success_stop=args.success_stop, write_dash=args.dashboard,
     )
@@ -118,7 +131,7 @@ def main() -> int:
         print(f"[resume] {ckpt_file}: {saved_state['iters']}/{saved_state['budget']} iterations "
               f"done, picking up from there")
 
-    env = make_env("shadow")
+    env = make_env("shadow", episode_seconds=args.episode_seconds)
     orch = AgenticOrchestrator(env=env, out_dir=args.out, stop_after=args.stop_after, **cfg)
     if saved_state is not None:
         orch.restore(saved_state)

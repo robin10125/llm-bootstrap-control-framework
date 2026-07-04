@@ -35,7 +35,7 @@ OPERATORS = ["toward_object_xy", "lower_base", "raise_base", "close_hand", "open
 SIGNALS = {
     "palm_obj_dist": "distance from grasp site to object (m); ~0 means at the object",
     "closure": "mean finger closure 0..1",
-    "lift": "object height above rest (m); success at > 0.05",
+    "lift": "object height above rest (m)",
     "obj_rel_x/y/z": "object position minus grasp site, world frame (m)",
     "near": "smooth gate ~1 when palm within ~4cm of object",
     "gripped": "smooth gate ~1 when closure past ~0.6",
