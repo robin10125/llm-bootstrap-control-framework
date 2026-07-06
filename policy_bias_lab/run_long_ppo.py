@@ -194,6 +194,7 @@ def main() -> int:
         success_hold_seconds=args.success_hold_seconds,
         success_lift_threshold=args.success_lift_threshold, warmup_compile=False,
         success_terminate_seconds=args.terminate_on_success,
+        failure_terminate_seconds=args.terminate_on_failure,
     )
     if not args.resume:
         (args.out / "config.json").write_text(json.dumps(
@@ -204,6 +205,7 @@ def main() -> int:
              "program": str(args.program), "init_params": str(args.init_params or ""),
              "episode_seconds": args.episode_seconds,
              "terminate_on_success": args.terminate_on_success,
+             "terminate_on_failure": args.terminate_on_failure,
              "criteria": {"min_hours": args.min_hours, "plateau_hours": args.plateau_hours,
                           "plateau_eps": args.plateau_eps, "success_stop": args.success_stop,
                           "success_window": args.success_window, "max_hours": args.max_hours},
@@ -337,6 +339,9 @@ def parse_args() -> argparse.Namespace:
                    help="early termination for credit assignment: once the per-step success "
                         "metric holds for this many consecutive seconds, later steps in the "
                         "episode carry no reward/value/loss (fixed-horizon stepping continues)")
+    p.add_argument("--terminate-on-failure", type=float, default=None, metavar="SECONDS",
+                   help="failure termination (the mirror): once the task's failure signal holds "
+                        "this long, later steps carry no reward/value/loss")
     p.add_argument("--physics-dt", type=float, default=0.01)
     p.add_argument("--obj-xy-range", type=float, default=0.04)
     return p.parse_args()

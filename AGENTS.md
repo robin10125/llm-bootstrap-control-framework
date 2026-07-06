@@ -47,6 +47,37 @@ Concretely, when working on this code:
   extras (`obj_disp_xy`, `obj_speed`) are the narrow exception: raw rigid-body quantities that
   need a per-episode baseline the stateless obs cannot carry.
 
+- **Body-motion diagnostics are structural, not interpretive.** `stage_occupancy` reports measured
+  kinematics of the observed bodies (speeds, net displacement from the episode-start pose), overall
+  and per dominant stage, under the env's own field names. This is mechanical obs-layout data —
+  keep it that way: report the numbers, never classify a displacement as "knocking", "disturbance",
+  or "progress" in framework code or templates. Diagnosing aggressive-approach/object-pushing
+  behavior from these numbers is the LLM's job in the revision loop.
+- **Channel SELF observables are structural.** `ctrl_self`/`q_self` in a channel expression bind,
+  per actuator in the channel's set, to that actuator's own commanded target / measured joint
+  position -- pure obs-layout indexing (`_compile_channel`). Prompt docs may describe what the
+  mechanism does (a joint stops tracking its target when blocked; exprs over the gap react to
+  that), but must never say which task situations call for it.
+- **The embodied procedure context call (`context_procedure.md`) is a mechanism, not content.**
+  It asks for an exhaustive physical account of performing `$task` -- including the "obvious"
+  unsaid requirements -- and the LLM authors all of it at runtime. Keep the template free of task
+  nouns and behavioral advice; its whole point is that gentleness/stillness/contact-order
+  knowledge gets SAID by the model, not baked into the framework.
+- **Authored EVALS carry only TIE-BREAK selection weight.** A revision may be adopted on an
+  authored-eval improvement only when its objective is within the measured noise band
+  (`_eval_battery_delta` + the `eval_accept` guard); evals must never override a real objective
+  regression -- the model authors its own tests, so unguarded eval-selection is self-grading.
+  Do not loosen this guard.
+- **The ONE sanctioned prose exception** (user-approved 2026-07-04; extended with user approval
+  2026-07-05): the dexterity-conditional gentleness principle in
+  `prompts/framework_freeform_staged.md` AND mirrored in `prompts/revise_candidate.md` -- *if the
+  model judges the task to be dexterous manipulation*: first contact at near-zero relative speed,
+  a ceiling on contact force, only the minimum force each interaction needs, no displacing items,
+  budgets expressed as explicit signal/gate conditions. The applicability judgment stays with the
+  model. Do not extend it further, add task nouns to it, or add other behavioral advice of this
+  kind without explicit user approval. (The applied-force law itself -- servo_gain * (ctrl - q) --
+  is injected robot data in `robot_spec`, not prose.)
+
 Known legacy exceptions (quarantined, not in the default path): `policy_bias_lab/legacy/*` and the
 open-loop prefilter `prior_eval.score_program` (its `fling_fraction` etc. predate this rule; it is
 prefilter-grade only — do not route its labeled fields into prompts).

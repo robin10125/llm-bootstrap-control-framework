@@ -79,7 +79,8 @@ def _output_item(rep: str) -> str:
         return ("signals:{'<name>':'<expr over observables>'} (your derived-signal definitions), "
                 "stages:[{name, gate:'<expr>', success:'<expr>' (optional), "
                 "channels:[{actuators:[...], expr:'<expr>'}]}], "
-                "probes:[{name, expr, stage:'<stage name>' (optional)}] (optional, <=8)")
+                "probes:[{name, expr, stage:'<stage name>' (optional)}] (optional, <=8), "
+                "evals:[{name, expr, when:'ever'|'end'}] (optional, <=8)")
     field_name = "rules" if rep == "dsl" else "channels"
     return (f"subpriors: [{{name, {field_name}:[...]}}] -- one per phase, in order: "
             f"{', '.join(PHASES)}")
@@ -130,14 +131,67 @@ class _Chain:
     focus_attempts: int = 0    # rejected revisions in the current focus phase
 
 
+def _eval_battery_delta(old_diag: dict, new_diag: dict,
+                        min_gain: float = 0.05) -> tuple[str | None, list[str]]:
+    """Compare the authored-eval pass fractions of two evaluations (task 'evals' on the program).
+
+    Only eval names present in BOTH reports are compared (the author may add/replace evals, but a
+    revision cannot earn acceptance from tests its parent was never scored on). Returns
+    (gain_description | None, solved_names): a gain requires at least one shared eval up by
+    >= min_gain with none down by more than min_gain; solved = shared evals whose pass_frac
+    crossed 0.5 upward (a failing test now passes -- the branch-store trigger).
+    """
+    def _report(d):
+        sr = (d or {}).get("stage_report") if isinstance(d, dict) else None
+        rep = (sr or {}).get("eval_report") or {}
+        return {k: float(v["pass_frac"]) for k, v in rep.items()
+                if isinstance(v, dict) and v.get("pass_frac") is not None}
+    old, new = _report(old_diag), _report(new_diag)
+    shared = sorted(set(old) & set(new))
+    if not shared:
+        return None, []
+    deltas = {k: new[k] - old[k] for k in shared}
+    if any(dv < -min_gain for dv in deltas.values()):
+        return None, []
+    gains = {k: dv for k, dv in deltas.items() if dv >= min_gain}
+    if not gains:
+        return None, []
+    solved = [k for k in shared if old[k] < 0.5 <= new[k]]
+    desc = ", ".join(f"{k} {old[k]:.2f}->{new[k]:.2f}" for k in sorted(gains))
+    return desc, solved
+
+
 def _frontier(diagnostics: dict) -> int:
-    """Stage-progress depth of a candidate: its stall stage index, or n_stages when the trained
-    policy reaches the terminal stage. -1 when there is no staged report. Lets refinement value
-    UNLOCKING a deeper stage even when the scalar objective momentarily drops -- a newly reached
-    stage usually starts out badly and needs its own iterative-improvement window."""
+    """Stage-progress depth of a candidate: the deepest stage entered through an ORDERED chain of
+    dwell-qualified hand-offs (n_stages when the full chain completes). -1 when there is no staged
+    report. Lets refinement value UNLOCKING a deeper stage even when the scalar objective
+    momentarily drops -- a newly reached stage usually starts out badly and needs its own
+    iterative-improvement window.
+
+    ORDERED accomplishment is required (v9 lesson): terminal gates whose situation terms are ~0 at
+    spawn can be argmax-dominant from step 0, so "reaches_terminal"/stall alone certify gate
+    arithmetic, not progress -- a candidate that idled in its default terminal stage jumped the
+    frontier 3->6 and two objective regressions were adopted for it. A hand-off only counts here
+    if the ordered i -> i+1 transition (stage_transition_stats) fires in >= 5% of episodes."""
     sr = (diagnostics or {}).get("stage_report") if isinstance(diagnostics, dict) else None
     if not isinstance(sr, dict) or not sr.get("stage_names"):
         return -1
+    n = len(sr["stage_names"])
+    entered = sr.get("entered_frac")
+    handoff = sr.get("handoff_frac")
+    if entered and handoff and len(entered) == n:
+        start = next((i for i, e in enumerate(entered) if e is not None and e >= 0.1), None)
+        if start is None:
+            return 0
+        d = start
+        while d < n - 1 and d < len(handoff) and handoff[d] is not None and handoff[d] >= 0.05:
+            d += 1
+        if d == start:
+            # No ordered hand-off fired anywhere. A deep `start` here is default-dominance
+            # (only that stage's gate ever wins, e.g. a terminal gate true at spawn), not depth.
+            return 0
+        return n if d == n - 1 else d
+    # legacy reports without transition stats: the old dominance-based rule
     if sr.get("reaches_terminal"):
         return len(sr["stage_names"])
     s = sr.get("stall_stage")
@@ -173,6 +227,7 @@ class AgenticOrchestrator:
     ppo_train_envs: int = 256
     ppo_eval_envs: int = 256
     ppo_terminate_on_success: float | None = None  # PPOBiasConfig.success_terminate_seconds
+    ppo_terminate_on_failure: float | None = None  # PPOBiasConfig.failure_terminate_seconds
     eval_batches: int = 1            # rollout batches per prior_only evaluation (variance control)
     score_envs: int = 128            # open-loop arbiter only
     score_seed: int = 0
@@ -192,12 +247,14 @@ class AgenticOrchestrator:
     CONFIG_KEYS = ("task", "rep", "dof_mode", "llm_backend", "llm_model", "budget", "n_seeds",
                    "patience", "handoff_attempts", "per_stage_iters", "eps", "use_human_analogy",
                    "arbiter", "ppo_task", "ppo_train_seconds", "ppo_train_envs", "ppo_eval_envs",
-                   "ppo_terminate_on_success", "refine_top", "eval_batches", "score_envs",
+                   "ppo_terminate_on_success", "ppo_terminate_on_failure",
+                   "refine_top", "eval_batches", "score_envs",
                    "score_seed", "min_hours", "plateau_hours", "success_stop", "write_dash")
     # Mutable progress restored verbatim on resume.
     STATE_KEYS = ("iters", "evaluated", "since_improve_global", "best_obj_global", "log",
                   "context_block", "seeds", "chains", "chosen_idx", "rr", "next_seed",
-                  "budget", "patience", "budget_resized", "wall_elapsed", "t_improve_elapsed")
+                  "budget", "patience", "budget_resized", "wall_elapsed", "t_improve_elapsed",
+                  "branches")
 
     def __post_init__(self) -> None:
         self.out_dir = Path(self.out_dir)
@@ -219,6 +276,9 @@ class AgenticOrchestrator:
         self.rr = 0                               # round-robin cursor over active chains
         self.next_seed = 0                        # first not-yet-evaluated explore seed
         self.budget_resized = False               # per_stage_iters resize already applied
+        # BRANCH STORE: every accepted revision that SOLVED a problem (frontier unlock or a
+        # failing authored eval flipped to passing), snapshotted with its performance breakdown.
+        self.branches: list[dict] = []
         # Wall-clock bookkeeping (persisted): total ACTIVE run seconds across sessions, and the
         # elapsed-time stamp of the last global-best improvement.
         self.wall_elapsed = 0.0
@@ -338,6 +398,7 @@ class AgenticOrchestrator:
     # -- Stage 0: parallel context -------------------------------------------------------------
     def gather_context(self) -> str:
         calls = [
+            ("context_procedure", "C0_procedure"),
             ("context_execution", "C1_execution"),
             ("context_failure_modes", "C2_failure_modes"),
             ("context_kinematics", "C3_kinematics"),
@@ -346,9 +407,8 @@ class AgenticOrchestrator:
             calls.append(("context_human_analogy", "C4_human_analogy"))
 
         def run_one(tmpl_name: str, tag: str) -> tuple[str, dict | None, str]:
-            # phases is only used by context_execution; extra keys are ignored by Template.substitute.
             prompt = _tmpl(f"{tmpl_name}.md").substitute(
-                task=self.task, spec_block=self.spec_block, phases=", ".join(PHASES))
+                task=self.task, spec_block=self.spec_block)
             txt = self._llm(prompt, tag)
             return tag, parse_json_obj(txt), txt
 
@@ -362,6 +422,8 @@ class AgenticOrchestrator:
         # Assemble a readable CONTEXT block; fall back to a stub if a call returned nothing.
         parts = []
         labels = {
+            "C0_procedure": ("EMBODIED PROCEDURE ACCOUNT (moment-by-moment: what moves, what stays "
+                             "still, contacts, precision, forbidden motions)"),
             "C1_execution": "PER-ACTUATOR EXECUTION ACCOUNT",
             "C2_failure_modes": "FAILURE MODES / EXPLOITS TO AVOID",
             "C3_kinematics": "KINEMATIC / AFFORDANCE ANALYSIS",
@@ -373,14 +435,19 @@ class AgenticOrchestrator:
         return "\n\n".join(parts) if parts else "(no upstream context available)"
 
     # -- Stage 2: diverse seeds ----------------------------------------------------------------
-    def generate_seeds(self, context_block: str) -> list[dict]:
+    def generate_seeds(self, context_block: str, retry_note: str | None = None) -> list[dict]:
         prompt = _tmpl("seed_candidates.md").substitute(
             task=self.task, framework=self.framework, spec_block=self.spec_block,
             representation_doc=self.rep_doc, dof_requirement=self.dof_req,
             context_block=context_block, n_seeds=str(self.n_seeds), output_item=_output_item(self.rep))
-        (self.out_dir / "seed_prompt.md").write_text(prompt)
-        txt = self._llm(prompt, "seeds")
-        (self.out_dir / "seed_completion.txt").write_text(txt or "")
+        tag = "seeds" if retry_note is None else "seeds_retry"
+        if retry_note:
+            prompt += "\n" + retry_note
+        (self.out_dir / f"{tag}_prompt.md" if retry_note else self.out_dir / "seed_prompt.md"
+         ).write_text(prompt)
+        txt = self._llm(prompt, tag)
+        (self.out_dir / f"{tag}_completion.txt" if retry_note else
+         self.out_dir / "seed_completion.txt").write_text(txt or "")
         obj = parse_json_obj(txt)
         cands = (obj or {}).get("candidates", []) if obj else []
         if not cands:
@@ -397,7 +464,7 @@ class AgenticOrchestrator:
             diag = dict(diag)
             diag["prior_failed_revisions"] = chain.failed[-4:]
         prompt = _tmpl("revise_candidate.md").substitute(
-            task=self.task, phases=", ".join(PHASES), spec_block=self.spec_block,
+            task=self.task, spec_block=self.spec_block,
             representation_doc=self.rep_doc, dof_requirement=self.dof_req,
             context_block=context_block, candidate=json.dumps(chain.program, indent=1),
             diagnostics=json.dumps(diag, indent=1),
@@ -411,10 +478,47 @@ class AgenticOrchestrator:
             return None
         return obj.get("candidate") or obj  # accept either {candidate:{...}} or a bare candidate
 
+    def _save_branch(self, chain: "_Chain", rec: dict, *, reason: str, solved: list[str]) -> None:
+        """Snapshot an accepted, problem-solving revision as a persistent BRANCH of the prior.
+
+        Written to out_dir/branches/ (program + performance breakdown) and indexed in
+        branches/index.json; the index also rides the checkpoint. Branch = a program that durably
+        solved something (a newly reached stage, or an authored eval flipped to passing) -- the
+        substrate an ultra-long refinement can fork from instead of only walking one chain."""
+        bdir = self.out_dir / "branches"
+        bdir.mkdir(exist_ok=True)
+        d = rec.get("diagnostics") or {}
+        sr = d.get("stage_report") or {}
+        prev = [b for b in self.branches if b.get("chain") == chain.name]
+        fname = f"iter{self.iters:03d}_{chain.name}.json"
+        entry = {
+            "iter": self.iters, "chain": chain.name, "name": rec.get("name"),
+            "parent_iter": prev[-1]["iter"] if prev else None,
+            "reason": reason, "solved_evals": solved,
+            "objective": rec.get("objective"),
+            "breakdown": {
+                "occupancy": sr.get("occupancy"), "entered_frac": sr.get("entered_frac"),
+                "handoff_frac": sr.get("handoff_frac"), "conversion": sr.get("conversion"),
+                "stall_stage": sr.get("stall_stage"), "reaches_terminal": sr.get("reaches_terminal"),
+                "eval_report": sr.get("eval_report"),
+                "rates": {k: d.get(k) for k in ("success_rate", "grasp_rate", "reach_rate",
+                                                "lift_reached_rate", "lift_max")},
+            },
+            "file": f"branches/{fname}",
+        }
+        (bdir / fname).write_text(json.dumps({**entry, "program": rec["program"]}, indent=1) + "\n")
+        self.branches.append(entry)
+        (bdir / "index.json").write_text(json.dumps(self.branches, indent=1) + "\n")
+        print(f"  [branch] {entry['file']} saved ({reason}"
+              + (f"; solved: {', '.join(solved)}" if solved else "") + ")")
+
     # -- evaluation (one budget iteration) -----------------------------------------------------
-    def _eval(self, raw_cand: dict, source: str) -> dict | None:
+    def _eval(self, raw_cand: dict, source: str,
+              errors: list[str] | None = None) -> dict | None:
         # Cheap compile-check + DOF accounting BEFORE spending a (short-PPO) iteration on it.
-        prog = validate_program(self.env, raw_cand, self.rep)
+        # A validation reject consumes NO budget iteration; `errors` (when given) collects the
+        # reject reason so the caller can feed it back to the LLM instead of losing it.
+        prog = validate_program(self.env, raw_cand, self.rep, errors=errors)
         if prog is None:
             return None
         acc = accounting(self.env, prog, self.rep, raw_cand)
@@ -428,8 +532,9 @@ class AgenticOrchestrator:
                 train_seconds=self.ppo_train_seconds, train_envs=self.ppo_train_envs,
                 eval_envs=self.ppo_eval_envs,
                 checkpoint_dir=self.out_dir / "ppo" / f"iter{self.iters + 1}",
-                cfg_overrides=({"success_terminate_seconds": self.ppo_terminate_on_success}
-                               if self.ppo_terminate_on_success else None))
+                cfg_overrides=({k: v for k, v in (
+                    ("success_terminate_seconds", self.ppo_terminate_on_success),
+                    ("failure_terminate_seconds", self.ppo_terminate_on_failure)) if v} or None))
             objective = res["objective_score"]
             diagnostics = res["diagnostics"]
             full = {"eval": res["eval"], "best_train_success": res["best_train_success"],
@@ -494,23 +599,48 @@ class AgenticOrchestrator:
 
         # EXPLORE: up to min(n_seeds, budget) diverse seeds, one iteration each.
         explore_cap = min(self.n_seeds, self.budget)
-        while self.next_seed < len(self.seeds) and self.iters < explore_cap:
-            if self._should_pause():
-                return self._paused()
-            cand = self.seeds[self.next_seed]
-            self.next_seed += 1
-            rec = self._eval(cand, "explore")
-            if rec is not None:
-                self.chains.append(
-                    _Chain(name=str(cand.get("name") or f"seed{len(self.chains)}"),
-                           raw_cand=cand, program=rec["program"], diagnostics=rec["diagnostics"],
-                           best_obj=rec["objective"], history=[rec["objective"]],
-                           frontier=_frontier(rec["diagnostics"])))
+        seed_errors: list[str] = []
+
+        def _explore_pass() -> str | None:
+            while self.next_seed < len(self.seeds) and self.iters < explore_cap:
+                if self._should_pause():
+                    return "pause"
+                cand = self.seeds[self.next_seed]
+                self.next_seed += 1
+                rec = self._eval(cand, "explore", errors=seed_errors)
+                if rec is not None:
+                    self.chains.append(
+                        _Chain(name=str(cand.get("name") or f"seed{len(self.chains)}"),
+                               raw_cand=cand, program=rec["program"],
+                               diagnostics=rec["diagnostics"], best_obj=rec["objective"],
+                               history=[rec["objective"]], frontier=_frontier(rec["diagnostics"])))
+                self.save_checkpoint()
+                reason = self._wall_stop()
+                if reason and self.success_stop is not None and "success criterion" in reason:
+                    print(f"  [stop] {reason}")
+                    return "success"
+            return None
+
+        stop = _explore_pass()
+        # SEED RETRY: every seed failed validation -- fatal for small --n-seeds if not handled.
+        # A validation reject costs no budget iteration, so regenerating with the compile errors
+        # fed back is cheap; give up after 2 retries.
+        retries = 0
+        while stop is None and not self.chains and seed_errors and retries < 2:
+            retries += 1
+            note = ("NOTE: your previous candidates FAILED VALIDATION and were rejected -- "
+                    "regenerate them with these compile errors fixed:\n- "
+                    + "\n- ".join(seed_errors[-6:]))
+            print(f"  [seeds] all seeds rejected -> regenerating with error feedback "
+                  f"(retry {retries}/2)")
+            self.seeds = self.generate_seeds(context_block, retry_note=note)
+            self.next_seed = 0
             self.save_checkpoint()
-            reason = self._wall_stop()
-            if reason and self.success_stop is not None and "success criterion" in reason:
-                print(f"  [stop] {reason}")
-                return self.finish()
+            stop = _explore_pass()
+        if stop == "pause":
+            return self._paused()
+        if stop == "success":
+            return self.finish()
         if not self.chains:
             raise RuntimeError("no seed candidate compiled; cannot refine")
 
@@ -521,8 +651,11 @@ class AgenticOrchestrator:
                            key=lambda i: self.chains[i].best_obj, reverse=True)
             best = self.chains[order[0]]
             self.chosen_idx = [order[0]]
+            # refine_top >= number of chains is an explicit request to refine EVERY chain
+            # (breadth experiment); the competitiveness filter only applies to a partial top-k.
+            refine_all = int(self.refine_top) >= len(self.chains)
             for j in order[1:max(1, int(self.refine_top))]:
-                if self.chains[j].best_obj >= best.best_obj - 0.2 * abs(best.best_obj):
+                if refine_all or self.chains[j].best_obj >= best.best_obj - 0.2 * abs(best.best_obj):
                     self.chosen_idx.append(j)
             for i in self.chosen_idx:
                 self.chains[i].active = True
@@ -583,12 +716,21 @@ class AgenticOrchestrator:
                     return self._paused()
                 self.save_checkpoint()
                 continue
-            # Probes persist across revisions until the model replaces them: a revision that omits
-            # `probes` keeps measuring what the previous iteration asked for.
+            # Probes and authored evals persist across revisions until the model replaces them: a
+            # revision that omits them keeps measuring/testing what the previous iteration asked
+            # for (evals MUST persist for the battery comparison to mean anything).
             if "probes" not in cand and isinstance(chain.raw_cand, dict) and chain.raw_cand.get("probes"):
                 cand["probes"] = chain.raw_cand["probes"]
-            rec = self._eval(cand, f"refine:{chain.name}")
+            if "evals" not in cand and isinstance(chain.raw_cand, dict) and chain.raw_cand.get("evals"):
+                cand["evals"] = chain.raw_cand["evals"]
+            rev_errors: list[str] = []
+            rec = self._eval(cand, f"refine:{chain.name}", errors=rev_errors)
             if rec is None:  # uncompilable revision; no rollout consumed
+                # Surface the compile error to the next revise call (prior_failed_revisions)
+                # instead of silently dropping the attempt.
+                if rev_errors:
+                    chain.failed.append({"name": cand.get("name"), "objective": None,
+                                         "rejected": rev_errors[-1]})
                 self.save_checkpoint()
                 continue
             revise_fail_streak = 0
@@ -596,7 +738,15 @@ class AgenticOrchestrator:
             improved = rec["objective"] > chain.best_obj + self.eps
             new_frontier = _frontier(rec["diagnostics"])
             unlocked = new_frontier > chain.frontier
-            if improved or unlocked:
+            # Authored-eval tie-break (partial selection): a revision whose objective stays within
+            # the measured noise band may be adopted on a strict improvement of the SHARED authored
+            # eval battery. Never overrides a real objective regression.
+            eval_gain, eval_solved = _eval_battery_delta(chain.diagnostics, rec["diagnostics"])
+            std = float((rec["diagnostics"] or {}).get("objective_batch_std") or 0.0)
+            noise_band = max(self.eps, 2.0 * std)
+            eval_accept = (not improved and not unlocked and eval_gain is not None
+                           and rec["objective"] >= chain.best_obj - noise_band)
+            if improved or unlocked or eval_accept:
                 # Adopt as the new base. A frontier UNLOCK is adopted even when the objective
                 # momentarily drops: a newly reached stage starts out badly, and the reset patience
                 # window below is its chance at iterative improvement. finish() still returns the
@@ -607,6 +757,17 @@ class AgenticOrchestrator:
                           f" (adopted despite obj {rec['objective']:+.4f} <= {chain.best_obj:+.4f})"))
                     chain.frontier = new_frontier
                     self.since_improve_global = 0  # structural progress: don't let global patience kill it
+                if eval_accept:
+                    print(f"  [evals] {chain.name}: adopted on authored-eval improvement "
+                          f"({eval_gain}) with objective within noise "
+                          f"({rec['objective']:+.4f} vs {chain.best_obj:+.4f})")
+                # A refinement that SOLVED a problem -- unlocked a stage or flipped a failing
+                # authored eval to passing -- becomes a persistent BRANCH of the prior, indexed
+                # with its performance breakdown (ultra-long refinement can fork from it later).
+                if unlocked or eval_solved:
+                    self._save_branch(chain, rec,
+                                      reason=("frontier_unlock" if unlocked else "eval_solved"),
+                                      solved=eval_solved)
                 chain.best_obj = max(chain.best_obj, rec["objective"])
                 chain.program = rec["program"]
                 chain.raw_cand = cand
@@ -742,15 +903,38 @@ def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
         if k is None:
             return (f"Stage residence [{table}]. Make one focused change against the diagnostics."
                     + train_note)
-        hand_line = ""
-        if k < len(entered) and k < len(handoff) and handoff[k] is not None:
-            hand_line = (f" Dwell-qualified: stage {k} is ENTERED in {_pct(entered[k])} of episodes "
-                         f"but HANDS OFF to stage {k + 1} in only {_pct(handoff[k])} "
-                         f"(conversion {_pct(conv[k] if k < len(conv) else None)}).")
-        lines = [
-            f"Stage residence [{table}]. The policy STALLS in stage {k} ('{rep.get('stall_name')}'): "
-            f"it reliably reaches this stage but rarely advances to stage {k + 1}.{hand_line}",
-            _directive(k)]
+        # UNSTABLE ENTRY (flicker): the stall stage is entered but almost immediately loses
+        # dominance BACK to its predecessor. The broken boundary is then k-1 <-> k, not k -> k+1;
+        # entry-side edits to stage k+1 cannot fix it, so the directive overrides the focus side.
+        rev_in = reverse[k - 1] if (k >= 1 and k - 1 < len(reverse)
+                                    and reverse[k - 1] is not None) else None
+        occ_k = occ[k] if k < len(occ) else None
+        ent_k = entered[k] if k < len(entered) else None
+        flicker = (rev_in is not None and ent_k and rev_in >= 0.5 * float(ent_k)
+                   and occ_k is not None and float(occ_k) < 0.2 * float(ent_k))
+        if flicker:
+            lines = [
+                f"Stage residence [{table}]. UNSTABLE ENTRY into stage {k} "
+                f"('{rep.get('stall_name')}'): it is entered in {_pct(ent_k)} of episodes but holds "
+                f"dominance for only {_pct(occ_k)} of steps, and in {_pct(rev_in)} of episodes the "
+                f"policy FALLS BACK to stage {k - 1} after entering. The stage {k - 1} <-> {k} "
+                f"boundary oscillates: stage {k - 1}'s gate retakes control in the states stage {k} "
+                f"produces (or stage {k}'s own channels immediately break its gate condition).",
+                f"FOCUS = this unstable boundary: revise stages {k - 1} and {k} COHERENTLY (edit "
+                f"menu option d) -- separate their gate conditions so each clearly dominates its own "
+                f"region, and make stage {k}'s channels KEEP its own gate condition true while the "
+                f"stage acts. Return every OTHER stage byte-identical to the input."]
+        else:
+            hand_line = ""
+            if k < len(entered) and k < len(handoff) and handoff[k] is not None:
+                hand_line = (f" Dwell-qualified: stage {k} is ENTERED in {_pct(entered[k])} of "
+                             f"episodes but HANDS OFF to stage {k + 1} in only {_pct(handoff[k])} "
+                             f"(conversion {_pct(conv[k] if k < len(conv) else None)}).")
+            lines = [
+                f"Stage residence [{table}]. The policy STALLS in stage {k} "
+                f"('{rep.get('stall_name')}'): it reliably reaches this stage but rarely advances "
+                f"to stage {k + 1}.{hand_line}",
+                _directive(k)]
 
     # Dominance-success discrepancy (authored `success` expr vs the hand-off predicate).
     disc = rep.get("success_discrepancy") or []
@@ -779,6 +963,17 @@ def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
         if not pair or pair[0] is None or pair[1] is None:
             return "n/a"
         return f"{pair[0]:+.3f} -> {pair[1]:+.3f}"
+
+    fa = rep.get("failure_attribution")
+    if isinstance(fa, dict) and (fa.get("failure_rate") or 0) > 0.05:
+        by = fa.get("by_stage_at_first_failure") or {}
+        top = ", ".join(f"{nm} {100*v:.0f}%" for nm, v in
+                        sorted(by.items(), key=lambda kv: -kv[1])[:3])
+        lines.append(
+            f"TASK FAILURE SIGNAL: the task's mistake indicator fires in "
+            f"{_pct(fa.get('failure_rate'))} of episodes; the stage IN CONTROL at the first "
+            f"failing step: {top}. The mistake belongs to that stage's channels -- fixing it "
+            f"outranks advancing the chain.")
 
     skipped = rep.get("skipped_entry_stages") or []
     if skipped:

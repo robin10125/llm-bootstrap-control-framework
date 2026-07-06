@@ -58,13 +58,16 @@ def _object_rest_z(env: Any) -> float:
 def make_signal_fn(env: Any) -> tuple[Callable[[jp.ndarray], dict[str, jp.ndarray]], dict[str, Any]]:
     """Build ``signals(obs) -> {palm_obj_dist, obj_rel, closure, lift}`` from obs alone.
 
-    obs layout: [base_q, base_v, hand_q, hand_v, obj_pos(3), obj_vel(3), palm_pos(3),
-    obj_rel(3), ctrl(action_dim)]. palm_obj_dist == ||obj_rel|| exactly (obj_rel = obj - grasp
-    site). closure == normalized hand ctrl. lift == obj_pos_z - rest_z (rest_z ~ const).
+    obs layout: [<robot prefix: joint blocks + per-joint constraint forces>, obj_pos(3),
+    obj_vel(3), palm_pos(3), obj_rel(3), ctrl(action_dim)]. palm_obj_dist == ||obj_rel|| exactly
+    (obj_rel = obj - grasp site). closure == normalized hand ctrl. lift == obj_pos_z - rest_z
+    (rest_z ~ const).
     """
     action_dim = int(env.action_size)
-    n_pre = (len(env.base_qadr) + len(env.base_vadr)
-             + len(getattr(env, "hand_qadr", ())) + len(getattr(env, "hand_vadr", ())))
+    # Prefix length derived from the ACTUAL obs size, not a re-listing of the prefix blocks --
+    # the tail [obj_pos, obj_vel, palm_pos, obj_rel, ctrl] is the layout contract (12 + nu), so
+    # this stays correct when the robot prefix grows (e.g. the constraint-force block).
+    n_pre = int(env.obs_size) - 12 - action_dim
     obj_z_idx = n_pre + 2
     hand_ids = np.asarray([int(i) for i in getattr(env, "hand_act_ids", ())], dtype=np.int32)
     ctrl_open = np.asarray(env.ctrl_open, dtype=np.float32)

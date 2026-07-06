@@ -6,7 +6,8 @@ TASK: $task
 
 $spec_block
 
-For EACH phase in [$phases], describe -- per actuator or semantic group -- what it does and WHY
+Segment the run into the phases YOU judge it to have (your naming; as many as the task needs).
+For EACH phase, describe -- per actuator or semantic group -- what it does and WHY
 (direction in world/ctrl terms, rough magnitude, what observable signal would trigger it). Cover
 EVERY actuator listed; do not skip any, and do not default an actuator to "held/stable" without
 first considering whether actively moving it would improve the outcome. If an actuator genuinely

@@ -68,7 +68,6 @@ class CpuShadowEnv:
         self.horizon = max(1, round(self.cfg.episode_seconds / self.cfg.control_dt))
         self.nu = self.model.nu
         self.action_size = self.nu
-        self.obs_size = 89
         self.ctrl_lo = np.asarray(self.model.actuator_ctrlrange[:, 0], dtype=np.float32)
         self.ctrl_hi = np.asarray(self.model.actuator_ctrlrange[:, 1], dtype=np.float32)
 
@@ -86,6 +85,10 @@ class CpuShadowEnv:
         ]
         self.hand_qadr = [int(self.model.jnt_qposadr[j]) for j in hand_jids]
         self.hand_vadr = [int(self.model.jnt_dofadr[j]) for j in hand_jids]
+        # prefix (q + v + constraint-force blocks) + [obj_pos, obj_vel, palm_pos, obj_rel] + ctrl
+        self.obs_size = (len(self.base_qadr) + len(self.base_vadr) + len(self.hand_qadr)
+                         + len(self.hand_vadr) + len(self.base_vadr) + len(self.hand_vadr)
+                         + 12 + self.nu)
         act_names = [self.model.actuator(i).name for i in range(self.nu)]
         self.base_act_ids = [i for i, n in enumerate(act_names) if n in ("base_x", "base_y", "base_z")]
         self.hand_act_ids = [i for i in range(self.nu) if i not in self.base_act_ids]
@@ -145,12 +148,15 @@ class CpuShadowEnv:
         base_v = self.data.qvel[self.base_vadr]
         hand_q = self.data.qpos[self.hand_qadr]
         hand_v = self.data.qvel[self.hand_vadr]
+        base_f = self.data.qfrc_constraint[self.base_vadr]
+        hand_f = self.data.qfrc_constraint[self.hand_vadr]
         obj_pos = self.data.xpos[self.object_bid]
         obj_vel = self.data.cvel[self.object_bid, 3:6]
         palm_pos = self.data.xpos[self.palm_bid]
         grasp_pos = self.data.site_xpos[self.grasp_sid]
         obj_rel = obj_pos - grasp_pos
-        return np.concatenate([base_q, base_v, hand_q, hand_v, obj_pos, obj_vel, palm_pos, obj_rel, self.data.ctrl]).astype(np.float32)
+        return np.concatenate([base_q, base_v, hand_q, hand_v, base_f, hand_f,
+                               obj_pos, obj_vel, palm_pos, obj_rel, self.data.ctrl]).astype(np.float32)
 
     def eval_vec(self) -> np.ndarray:
         obj_pos = self.data.xpos[self.object_bid]

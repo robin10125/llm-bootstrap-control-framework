@@ -65,6 +65,10 @@ def main() -> int:
     ap.add_argument("--terminate-on-success", type=float, default=None, metavar="SECONDS",
                     help="early termination for credit assignment: once the per-step success "
                          "metric holds this long, later steps carry no reward/value/loss.")
+    ap.add_argument("--terminate-on-failure", type=float, default=None, metavar="SECONDS",
+                    help="failure termination (the mirror): once the task's failure signal holds "
+                         "this long, later steps carry no reward/value/loss -- the mistake's cost "
+                         "lands on the actions that caused it, not the chase after it.")
     ap.add_argument("--score-envs", type=int, default=128, help="open_loop arbiter only.")
     ap.add_argument("--score-seed", type=int, default=0)
     ap.add_argument("--resume", action="store_true",
@@ -108,6 +112,7 @@ def main() -> int:
         eval_batches=args.eval_batches, ppo_task=args.ppo_task,
         ppo_train_seconds=args.ppo_train_seconds, ppo_train_envs=args.ppo_train_envs,
         ppo_eval_envs=args.ppo_eval_envs, ppo_terminate_on_success=args.terminate_on_success,
+        ppo_terminate_on_failure=args.terminate_on_failure,
         score_envs=args.score_envs, score_seed=args.score_seed,
         min_hours=args.min_hours, plateau_hours=args.plateau_hours,
         success_stop=args.success_stop, write_dash=args.dashboard,

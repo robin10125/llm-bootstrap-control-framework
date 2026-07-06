@@ -94,6 +94,7 @@ def _eval_policy(env: Any, bias: Any, params: Any, program: dict, *, task: str, 
         n_envs=eval_envs, cfg=cfg, reward_weights=reward_weights, base_reward_weight=1.0,
         action_prior_weights=apw, return_obs=want_stages, n_batches=n_batches)
     obs = ev.pop("eval_obs", None)
+    fail_steps = ev.pop("eval_fail_steps", None)
     obj = task_graded_objective(task, ev)
     diag = behavioral_diagnostics(ev)
     batches = ev.get("eval_batches")
@@ -104,7 +105,7 @@ def _eval_policy(env: Any, bias: Any, params: Any, program: dict, *, task: str, 
         diag["objective_batch_std"] = round((sum((o - m) ** 2 for o in objs) / len(objs)) ** 0.5, 4)
     if want_stages and obs is not None:
         from policy_bias_lab.freeform_priors import stage_occupancy
-        diag["stage_report"] = stage_occupancy(env, program, obs)
+        diag["stage_report"] = stage_occupancy(env, program, obs, failure=fail_steps)
     return obj, diag, ev
 
 

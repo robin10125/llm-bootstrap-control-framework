@@ -13,11 +13,31 @@ $dof_requirement
 FAILURE MODES to steer away from and the upstream CONTEXT:
 $context_block
 
+The context above includes a moment-by-moment account of what COMPLETING this task looks like (the
+embodied procedure: its phases, contacts, budgets, and end conditions). Before choosing an edit,
+locate the measured behavior on that account: which phase does the policy actually reach, judged by
+the DIAGNOSTICS below (not by which gates fire)? Your edit should be the one that carries the
+behavior into the NEXT phase of that account.
+
 CURRENT CANDIDATE (program JSON):
 $candidate
 
 DIAGNOSTICS for it (real, observable; higher objective is better):
 $diagnostics
+
+The stage report's `body_motion` block gives measured kinematics of the observed bodies: speeds and
+net displacement from each episode's start pose, overall and attributed per stage (statistics over
+the steps where that stage is dominant). The `commanded_motion` block gives the target speed your
+CHANNELS asked for, per stage and actuator group (ctrl-units/s) -- compare it with body_motion and
+with the CONTROL law's units bridge to separate commanded aggression from passive drift. Read both
+against your intent -- decide yourself which motion is progress and which is a side effect of your
+channels, and revise accordingly.
+One general principle: if you judge this to be a dexterous manipulation task, be gentle -- manage
+velocity and force EXPLICITLY: first contact at near-zero relative speed, a ceiling on contact
+force, and only the MINIMUM force each interaction needs (the spec's CONTROL law maps
+commanded-vs-measured gaps to applied force). A revision that gains objective by moving faster
+while the body_motion evidence shows it striking or displacing items is the wrong direction --
+keep the budgets as explicit signal/gate conditions.
 
 WHERE THE POLICY STALLS (revise here):
 $stage_focus
@@ -48,6 +68,15 @@ needs a quantity that is not yet defined), plus two probe-only, episode-relative
 steps where that stage is dominant. Use probes to TEST A HYPOTHESIS about why the policy fails --
 ask for the measurement that discriminates between your candidate explanations, then act on the
 numbers next iteration. Probes you authored earlier persist until you replace them.
+
+EVALS -- author acceptance tests. You may include `evals: [{name, expr, when: 'ever'|'end'}]` (up
+to 8): pass/fail checks scored per episode ('ever' = the expression exceeds 0 for a sustained run
+somewhere in the episode; 'end' = it holds through the final steps), reported back as pass
+fractions (eval_report in the diagnostics). Write each eval as the test that decides whether one
+specific problem is SOLVED. They carry selection weight: a revision whose objective is unchanged
+within measurement noise is still ADOPTED if it strictly improves the shared eval battery, and a
+revision that flips a failing eval to passing is archived as a durable BRANCH of the prior. Evals
+persist until you replace them; they can never rescue a revision whose objective regressed.
 
 Use the signal trends above to pick
 the DIRECTION of your change: if a signal the next gate needs is moving the wrong way under the

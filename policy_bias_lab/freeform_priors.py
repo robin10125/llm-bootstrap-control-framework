@@ -35,6 +35,23 @@ from policy_bias_lab.schema import ACTION_GROUPS
 # Robot spec (all DOF enumerated)
 # ----------------------------------------------------------------------------------------------
 
+def _target_speed_doc(env: Any, action_scale: float) -> str:
+    """Units bridge, mechanically derived: what a channel VALUE means as a physical target speed.
+    Authored channels are dimensionless; without this line the author has no quantitative path
+    from a gain/clip choice to the m/s it commands (observed: prose said 'small increments' while
+    the authored clip commanded ~0.7 m/s)."""
+    dt = float(getattr(env.cfg, "control_dt", 0.0) or 0.0)
+    if not dt:
+        return "control_dt unknown; target speed = action * action_scale per control step"
+    rate = float(action_scale) / dt
+    return (f"a SUSTAINED action value v moves that actuator's commanded target at "
+            f"v * action_scale / control_dt = v * {rate:.2f} ctrl-units per second "
+            f"(ctrl units: meters for slide joints, radians for hinge joints) -- e.g. |v| = 0.3 "
+            f"held on a slide actuator commands ~{0.3 * rate:.2f} m/s of target motion. Convert "
+            f"every channel magnitude and clip bound into these units to know the speed it asks "
+            f"for.")
+
+
 def robot_spec(env: Any) -> dict[str, Any]:
     """Injectable, robot-agnostic description of every controllable DOF.
 
@@ -55,6 +72,7 @@ def robot_spec(env: Any) -> dict[str, Any]:
                 "note": f"+{names[idx]} ctrl moves the grasp toward {'+' if s>0 else '-'}world_{axis}",
             }
     actuators = []
+    gain = np.asarray(m.actuator_gainprm[:, 0])
     for i, n in enumerate(names):
         jid = int(m.actuator_trnid[i, 0])
         actuators.append({
@@ -62,6 +80,7 @@ def robot_spec(env: Any) -> dict[str, Any]:
             "index": i,
             "joint": m.joint(jid).name if jid >= 0 else None,
             "ctrlrange": [float(cr[i, 0]), float(cr[i, 1])],
+            "servo_gain": float(gain[i]),
             "group": _semantic_group(n),
         })
     return {
@@ -72,6 +91,13 @@ def robot_spec(env: Any) -> dict[str, Any]:
             "rule": "target = current_ctrl + action * action_scale",
             "action_scale": cal["action_scale"],
             "action_range": [-1.0, 1.0],
+            "control_dt": float(getattr(env.cfg, "control_dt", 0.0)),
+            "target_speed": _target_speed_doc(env, cal["action_scale"]),
+            "applied_force": ("each actuator is a position servo: the steady-state force/torque "
+                              "it applies to its joint is ~ servo_gain * (ctrl_<name> - q_<name>)"
+                              " -- the same tracking gap that detects contact also MEASURES how "
+                              "hard the servo is pressing, so commanded force is controllable "
+                              "through how far ctrl is driven past q"),
         },
         "base_world_sign": base_world,
         "semantic_groups": {g: [a["name"] for a in actuators if a["group"] == g]
@@ -219,7 +245,7 @@ def _names_of(env: Any, tokens: list[str]) -> list[str]:
 # Free-form expression compiler (restricted AST safe-eval -> JAX)
 # ----------------------------------------------------------------------------------------------
 
-_ALLOWED_FUNCS = {"clip", "sigmoid", "min", "max", "abs", "exp"}
+_ALLOWED_FUNCS = {"clip", "sigmoid", "min", "max", "abs", "exp", "sqrt", "tanh"}
 
 
 def _validate_ast(node: ast.AST, signals: set[str]) -> None:
@@ -277,6 +303,8 @@ def _eval_ast(node: ast.AST, sig: dict[str, jp.ndarray]) -> jp.ndarray:
         if f == "min": return jp.minimum(a[0], a[1])
         if f == "max": return jp.maximum(a[0], a[1])
         if f == "abs": return jp.abs(a[0])
+        if f == "sqrt": return jp.sqrt(jp.maximum(a[0], 0.0))
+        if f == "tanh": return jp.tanh(a[0])
         return jp.exp(a[0])
     if isinstance(node, ast.Compare):
         l = _eval_ast(node.left, sig); r = _eval_ast(node.comparators[0], sig); op = node.ops[0]
@@ -292,6 +320,61 @@ def compile_expr(src: str, signal_names: set[str]) -> Callable[[dict[str, jp.nda
     tree = ast.parse(str(src), mode="eval")
     _validate_ast(tree, signal_names)
     return lambda sig: _eval_ast(tree, sig)
+
+
+# Per-actuator SELF observables, available ONLY inside channel expressions: bound, per actuator in
+# the channel's set, to that actuator's own commanded target / measured joint position (the same
+# quantities as ctrl_<name>/q_<name>, resolved mechanically from the obs layout). One channel can
+# thereby give each of its actuators an individual reactive response -- without this, per-joint
+# shapes need one channel per actuator, which no candidate can afford to author.
+CHANNEL_SELF_SIGNALS = {"ctrl_self", "q_self", "v_self", "f_self"}
+
+
+def _compile_channel(env: Any, ch: dict, signal_names: set[str],
+                     obs_idx: dict[str, int]) -> tuple[jp.ndarray, Callable]:
+    """Compile one channel {actuators, expr} -> (idx[int32], ev(obs, sig)).
+
+    ev returns a scalar (broadcast over idx) or, when the expr uses a SELF observable, a vector of
+    len(idx) with self bound per actuator. `obs_idx` is the name->index map from raw_obs_entries;
+    self indices are resolved through the ctrl_<name>/q_<name> observables, never obs-layout
+    arithmetic. An actuator without a q_ observable (e.g. tendon-coupled) makes q_self a compile
+    error, so validation rejects the candidate with the actuator names in the message.
+    """
+    act_ids = _resolve_actuators(env, ch.get("actuators", []))
+    idx = jp.asarray(act_ids, dtype=jp.int32)
+    src = str(ch.get("expr", "0"))
+    used = {n.id for n in ast.walk(ast.parse(src, mode="eval")) if isinstance(n, ast.Name)}
+    self_used = used & CHANNEL_SELF_SIGNALS
+    ev = compile_expr(src, set(signal_names) | CHANNEL_SELF_SIGNALS)
+    if not self_used:
+        return idx, lambda obs, sig, _ev=ev: _ev(sig)
+    m = env.model
+    names = [m.actuator(a).name for a in act_ids]
+    ctrl_idx = jp.asarray([obs_idx[f"ctrl_{an}"] for an in names], jp.int32)
+
+    def _self_idx(prefix):
+        missing = [an for an in names if f"{prefix}_{an}" not in obs_idx]
+        if missing:
+            raise ValueError(f"{prefix}_self is not available for actuators without a {prefix}_ "
+                             "observable: " + ", ".join(missing))
+        return jp.asarray([obs_idx[f"{prefix}_{an}"] for an in names], jp.int32)
+
+    q_idx = _self_idx("q") if "q_self" in self_used else None
+    v_idx = _self_idx("v") if "v_self" in self_used else None
+    f_idx = _self_idx("f") if "f_self" in self_used else None
+
+    def ev_self(obs, sig, _ev=ev, _c=ctrl_idx, _q=q_idx, _v=v_idx, _f=f_idx):
+        s = dict(sig)
+        s["ctrl_self"] = obs[_c]
+        if _q is not None:
+            s["q_self"] = obs[_q]
+        if _v is not None:
+            s["v_self"] = obs[_v]
+        if _f is not None:
+            s["f_self"] = obs[_f]
+        return _ev(s)
+
+    return idx, ev_self
 
 
 def freeform_signal_fn(env: Any, *, eps: float = 0.04, kappa: float = 0.6,
@@ -321,12 +404,9 @@ def make_freeform_prior_fn(env: Any, program: dict[str, Any]) -> tuple[Callable[
     """
     action_dim = int(env.action_size)
     signals, signal_names = program_signal_fn(env, program)
+    obs_idx = dict(raw_obs_entries(env)[0])
     channels = list(program.get("channels", []))
-    compiled = []
-    for ch in channels:
-        idx = _resolve_actuators(env, ch.get("actuators", []))
-        ev = compile_expr(ch.get("expr", "0"), signal_names)
-        compiled.append((jp.asarray(idx, dtype=jp.int32), ev))
+    compiled = [_compile_channel(env, ch, signal_names, obs_idx) for ch in channels]
     n_ch = len(compiled)
 
     def prior_fn(obs, weights):
@@ -334,7 +414,7 @@ def make_freeform_prior_fn(env: Any, program: dict[str, Any]) -> tuple[Callable[
         sig = signals(obs)
         out = jp.zeros((action_dim,), jp.float32)
         for i, (idx, ev) in enumerate(compiled):
-            val = jp.clip(ev(sig), -1.0, 1.0) * gains[i]
+            val = jp.clip(ev(obs, sig), -1.0, 1.0) * gains[i]
             out = out.at[idx].add(val)
         return jp.clip(out, -1.0, 1.0)
 
@@ -453,21 +533,21 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
     """
     action_dim = int(env.action_size)
     signals, signal_names = program_signal_fn(env, program)
+    obs_idx = dict(raw_obs_entries(env)[0])
     blend, tau = _blend_of(program)
     stages = list(program.get("stages", []))
     compiled: list[tuple[Callable, list[tuple[jp.ndarray, Callable]]]] = []
     for st in stages:
         gate_ev = compile_expr(str(st.get("gate", "1")), signal_names)
-        chans = [(jp.asarray(_resolve_actuators(env, ch.get("actuators", [])), dtype=jp.int32),
-                  compile_expr(str(ch.get("expr", "0")), signal_names))
+        chans = [_compile_channel(env, ch, signal_names, obs_idx)
                  for ch in st.get("channels", [])]
         compiled.append((gate_ev, chans))
     n = len(compiled)
 
-    def _stage_out(chans, sig):
+    def _stage_out(chans, obs, sig):
         out = jp.zeros((action_dim,), jp.float32)
         for idx, ev in chans:
-            out = out.at[idx].add(jp.clip(ev(sig), -1.0, 1.0))
+            out = out.at[idx].add(jp.clip(ev(obs, sig), -1.0, 1.0))
         return out
 
     def prior_fn(obs, weights):
@@ -478,7 +558,7 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
         w = blend_weights(gates, blend, tau)
         out = jp.zeros((action_dim,), jp.float32)
         for i, (_g, chans) in enumerate(compiled):
-            out = out + (w[i] * gains[i]) * _stage_out(chans, sig)
+            out = out + (w[i] * gains[i]) * _stage_out(chans, obs, sig)
         return jp.clip(out, -1.0, 1.0)
 
     info = {"mode": "freeform_staged", "blend": blend, "n_stages": n, "n_weights": n,
@@ -518,23 +598,22 @@ PROBE_EXTRA_SIGNALS = {
 }
 
 MAX_PROBES = 8  # measurement slots per candidate (cap keeps prompts bounded, not a hard budget)
+MAX_EVALS = 8   # authored acceptance-test slots per candidate (same bound, same reason)
 
 
-def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
-    """RAW observables only, mechanically enumerated from the env/robot: world positions and
-    velocities present in obs, commanded actuator targets, and measured joint positions.
+def raw_obs_entries(env: Any) -> tuple[list[tuple[str, int]], list[str]]:
+    """(name, obs index) for every raw observable, plus the actuators without a q_ observable.
 
-    NO derived quantities live here -- distances, proximity gates, closure fractions, alignment
-    measures are TASK STRUCTURE and must be LLM-authored per candidate (`signals` on the program;
-    see AGENTS.md). Returns (signals(obs)->dict, names, doc) where doc is the injectable
-    description block for prompts.
+    THE single place the env's obs layout is decoded into named observables -- everything that
+    needs a raw observable's obs index (raw_signal_fn, channel SELF observables, body-motion
+    diagnostics) must resolve it through these entries by NAME, never re-derive offsets. Porting
+    to an env with a different obs layout means changing only this function.
     """
     _base, info = make_signal_fn(env)  # obs-layout indices only
     nb = len(env.base_qadr)
     n_pre = int(info["n_pre"])
-    nu = int(env.nu)
     m = env.model
-    act_names = [m.actuator(i).name for i in range(nu)]
+    act_names = [m.actuator(i).name for i in range(int(env.nu))]
     qmap = actuator_obs_qpos_map(env)
     axes = "xyz"
     entries: list[tuple[str, int]] = []
@@ -551,11 +630,30 @@ def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
     for i, an in enumerate(act_names):
         entries.append((f"ctrl_{an}", n_pre + 12 + i))
     no_q = []
+    vmap = actuator_obs_qvel_map(env)
+    fmap = actuator_obs_qforce_map(env)
     for i, an in enumerate(act_names):
         if qmap[i] is not None:
             entries.append((f"q_{an}", int(qmap[i])))
         else:
             no_q.append(an)
+        if vmap[i] is not None:
+            entries.append((f"v_{an}", int(vmap[i])))
+        if fmap[i] is not None:
+            entries.append((f"f_{an}", int(fmap[i])))
+    return entries, no_q
+
+
+def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
+    """RAW observables only, mechanically enumerated from the env/robot: world positions and
+    velocities present in obs, commanded actuator targets, and measured joint positions.
+
+    NO derived quantities live here -- distances, proximity gates, closure fractions, alignment
+    measures are TASK STRUCTURE and must be LLM-authored per candidate (`signals` on the program;
+    see AGENTS.md). Returns (signals(obs)->dict, names, doc) where doc is the injectable
+    description block for prompts.
+    """
+    entries, no_q = raw_obs_entries(env)
     names = [n for n, _ in entries]
     idxs = jp.asarray([ix for _, ix in entries], jp.int32)
 
@@ -573,8 +671,14 @@ def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
         "  obj_rel_x/y/z: object position minus grasp-site position, world frame (m)\n"
         "  ctrl_<actuator>: current commanded target of that actuator (its ctrl units/range)\n"
         "  q_<actuator>: MEASURED position of the joint that actuator drives (differs from "
-        "ctrl_<actuator> when the joint is blocked or saturated)"
-        + (f"; q_ not available for tendon-coupled: {', '.join(no_q)}" if no_q else "")
+        "ctrl_<actuator> when the joint is blocked or saturated)\n"
+        "  v_<actuator>: MEASURED velocity of that joint (position units per second) -- the "
+        "damping/feedback term a position error alone cannot provide\n"
+        "  f_<actuator>: measured CONSTRAINT force/torque on that joint (N or N*m): the "
+        "GROUND-TRUTH contact signal -- exactly zero in free air no matter how fast the joint "
+        "moves, nonzero when the joint's link chain is pressing on something (sign follows the "
+        "joint axis)"
+        + (f"; q_/v_/f_ not available (no single-joint transmission): {', '.join(no_q)}" if no_q else "")
     )
     return signals, set(names), doc
 
@@ -637,6 +741,56 @@ def actuator_obs_qpos_map(env: Any) -> list[int | None]:
     return out
 
 
+def actuator_obs_qvel_map(env: Any) -> list[int | None]:
+    """Per actuator: the index into the obs of the MEASURED VELOCITY of the joint it drives
+    (base_v ++ hand_v blocks), or None when the transmission is not a single joint. Mirrors
+    actuator_obs_qpos_map; derived from the mujoco model, so it is robot-agnostic."""
+    import mujoco
+    m = env.model
+    base_vadr = [int(a) for a in env.base_vadr]
+    hand_vadr = [int(a) for a in getattr(env, "hand_vadr", ())]
+    base_off = len(env.base_qadr)
+    hand_off = len(env.base_qadr) + len(base_vadr) + len(getattr(env, "hand_qadr", ()))
+    out: list[int | None] = []
+    for i in range(int(env.nu)):
+        if int(m.actuator_trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+            out.append(None)
+            continue
+        vadr = int(m.jnt_dofadr[int(m.actuator_trnid[i, 0])])
+        if vadr in base_vadr:
+            out.append(base_off + base_vadr.index(vadr))
+        elif vadr in hand_vadr:
+            out.append(hand_off + hand_vadr.index(vadr))
+        else:
+            out.append(None)
+    return out
+
+
+def actuator_obs_qforce_map(env: Any) -> list[int | None]:
+    """Per actuator: the obs index of the CONSTRAINT FORCE on the joint it drives (base_f ++
+    hand_f block, i.e. qfrc_constraint -- ground-truth contact/limit load, zero in free air), or
+    None when the transmission is not a single joint. Mirrors actuator_obs_qpos_map."""
+    import mujoco
+    m = env.model
+    base_vadr = [int(a) for a in env.base_vadr]
+    hand_vadr = [int(a) for a in getattr(env, "hand_vadr", ())]
+    fb = (len(env.base_qadr) + len(base_vadr)
+          + len(getattr(env, "hand_qadr", ())) + len(hand_vadr))  # force block start
+    out: list[int | None] = []
+    for i in range(int(env.nu)):
+        if int(m.actuator_trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+            out.append(None)
+            continue
+        vadr = int(m.jnt_dofadr[int(m.actuator_trnid[i, 0])])
+        if vadr in base_vadr:
+            out.append(fb + base_vadr.index(vadr))
+        elif vadr in hand_vadr:
+            out.append(fb + len(base_vadr) + hand_vadr.index(vadr))
+        else:
+            out.append(None)
+    return out
+
+
 def stage_transition_stats(active: "np.ndarray", n: int, dwell: int = 3) -> dict:
     """Dwell-qualified, ORDERED stage-transition statistics from the active-stage array [T, E].
 
@@ -678,7 +832,27 @@ def stage_transition_stats(active: "np.ndarray", n: int, dwell: int = 3) -> dict
             "first_occ": first_occ}  # [E,n] first dominance step (T+1 = never); for success windows
 
 
-def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dict:
+def _failure_attribution(failure: "np.ndarray", active: "np.ndarray",
+                         names: list[str], n: int) -> dict:
+    """Localize the task's per-step mistake indicator [T, E] to the authored stages: for each
+    failing episode, the dominant stage at the FIRST failing step -- which stage was in control
+    when the episode went wrong. The indicator is injected task data (task_failure_signal); this
+    only attributes it."""
+    f = np.asarray(failure, dtype=bool)
+    fired = f.any(axis=0)
+    outd: dict[str, Any] = {"failure_rate": round(float(fired.mean()), 4),
+                            "by_stage_at_first_failure": {}}
+    if fired.any():
+        eps = np.nonzero(fired)[0]
+        first = f.argmax(axis=0)[eps]
+        counts = np.bincount(active[first, eps], minlength=n)
+        outd["by_stage_at_first_failure"] = {
+            names[i]: round(float(c / len(eps)), 4) for i, c in enumerate(counts) if c > 0}
+    return outd
+
+
+def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
+                    failure: "np.ndarray | None" = None) -> dict:
     """Localize the stalling stage from observations VISITED by the trained policy.
 
     obs: array [T, E, obs_dim] of states the policy actually occupied. For each state we recompute
@@ -712,8 +886,8 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     if n == 0:
         return {"stage_names": [], "occupancy": [], "reached_frac": [], "stall_stage": None}
     action_dim = int(env.action_size)
-    chan_evs = [[(jp.asarray(_resolve_actuators(env, ch.get("actuators", [])), dtype=jp.int32),
-                  compile_expr(str(ch.get("expr", "0")), signal_names))
+    _obs_idx0 = dict(raw_obs_entries(env)[0])
+    chan_evs = [[_compile_channel(env, ch, signal_names, _obs_idx0)
                  for ch in st.get("channels", [])] for st in stages]
     # Optional LLM-authored per-stage `success` expressions (the author's explicit post-condition
     # over the same signals). They are a cross-check, not the primary predicate -- a bad one must
@@ -740,7 +914,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
         for chans in chan_evs:
             sa = jp.zeros((action_dim,), jp.float32)
             for idx, ev in chans:
-                sa = sa.at[idx].add(jp.clip(ev(sig), -1.0, 1.0))
+                sa = sa.at[idx].add(jp.clip(ev(o, sig), -1.0, 1.0))
             stage_act.append(sa)
         return (w, gates, jp.stack([jp.asarray(sig[k], jp.float32) for k in sig_keys]), succ,
                 jp.stack(stage_act))
@@ -758,6 +932,71 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     act_te = actv.reshape(T, E, n, action_dim)                       # per-stage channel intents
     occupancy = [float((active == i).mean()) for i in range(n)]      # time-share
     reached = [float(((active == i).any(axis=0)).mean()) for i in range(n)]  # episodes reaching i
+
+    # BODY MOTION report: kinematics of every observed body, mechanically read from the obs layout
+    # and attributed to whichever stage is dominant at each step. Uninterpreted measurements under
+    # the env's own field names (speeds, net displacement from the episode-start pose) -- whether a
+    # displacement is progress or disturbance is the author's call, not the framework's.
+    def _triple(prefix):
+        return arr[:, :, [_obs_idx0[f"{prefix}_{ax}"] for ax in "xyz"]]
+    obj_pos, obj_vel, palm_pos = _triple("obj_pos"), _triple("obj_vel"), _triple("palm_pos")
+    dt = float(getattr(env.cfg, "control_dt", 1.0))
+    obj_speed = _np.linalg.norm(obj_vel, axis=-1)                              # [T,E] m/s
+    obj_disp_xy = _np.linalg.norm(obj_pos[:, :, :2] - obj_pos[:1, :, :2], axis=-1)
+    obj_disp = _np.linalg.norm(obj_pos - obj_pos[:1], axis=-1)
+    palm_speed = _np.zeros_like(obj_speed)
+    if T > 1:
+        palm_speed[1:] = _np.linalg.norm(_np.diff(palm_pos, axis=0), axis=-1) / max(dt, 1e-9)
+
+    def _masked(v, m):
+        c = m.sum()
+        return round(float((v * m).sum() / c), 4) if c else None
+
+    per_stage_motion = []
+    for i in range(n):
+        m = active == i
+        per_stage_motion.append({
+            "stage": names[i],
+            "obj_speed_mean": _masked(obj_speed, m),
+            "obj_speed_max": round(float(obj_speed[m].max()), 4) if m.any() else None,
+            "palm_speed_mean": _masked(palm_speed, m),
+            "obj_disp_xy_from_start_mean": _masked(obj_disp_xy, m),
+        })
+    body_motion = {
+        "obj_disp_xy_from_start_final": {"mean": round(float(obj_disp_xy[-1].mean()), 4),
+                                         "max": round(float(obj_disp_xy[-1].max()), 4)},
+        "obj_disp_from_start_final": {"mean": round(float(obj_disp[-1].mean()), 4),
+                                      "max": round(float(obj_disp[-1].max()), 4)},
+        "obj_speed": {"mean": round(float(obj_speed.mean()), 4),
+                      "max": round(float(obj_speed.max()), 4)},
+        "per_stage_while_dominant": per_stage_motion,
+    }
+
+    # COMMANDED MOTION report: the target speed the CHANNELS asked for, per dominant stage and
+    # actuator group (|delta ctrl| / dt, ctrl-units/s, from the obs ctrl block). body_motion says
+    # what the bodies DID; this says what the authoring commanded -- separating commanded
+    # aggression from passive drift, and directly comparable to the control-law units bridge.
+    m_act = env.model
+    act_names_cm = [m_act.actuator(i).name for i in range(int(env.nu))]
+    ctrl_cols = _np.asarray([_obs_idx0[f"ctrl_{an}"] for an in act_names_cm])
+    groups_cm = sorted({_semantic_group(an) for an in act_names_cm})
+    gmask = {g: _np.asarray([_semantic_group(an) == g for an in act_names_cm]) for g in groups_cm}
+    ctrl_arr = arr[:, :, ctrl_cols]                                        # [T, E, nu]
+    if T > 1:
+        cmd_speed = _np.abs(_np.diff(ctrl_arr, axis=0)) / max(dt, 1e-9)   # [T-1, E, nu]
+        act_cm = active[1:]                                                # stage at the step taken
+        commanded_motion = []
+        for i in range(n):
+            sm = act_cm == i
+            row: dict[str, Any] = {"stage": names[i]}
+            for g in groups_cm:
+                if sm.any():
+                    row[g] = round(float(cmd_speed[:, :, gmask[g]][sm].mean()), 4)
+                else:
+                    row[g] = None
+            commanded_motion.append(row)
+    else:
+        commanded_motion = []
 
     ts = stage_transition_stats(active, n)
     dwell, entered, handoff, reverse = ts["dwell"], ts["entered"], ts["handoff"], ts["reverse"]
@@ -832,6 +1071,12 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
         "weakest_name": (names[weakest] if weakest is not None else None),
         "authored_success_frac": [round(x, 4) if x is not None else None for x in authored],
         "success_discrepancy": discrepancy,
+        "body_motion": body_motion,
+        "commanded_motion": {"units": "ctrl-units per second, |delta ctrl|/dt, mean over steps "
+                                      "where the stage is dominant",
+                             "per_stage": commanded_motion},
+        **({} if failure is None
+           else {"failure_attribution": _failure_attribution(failure, active, names, n)}),
     }
     if succ_errors:
         out["success_compile_errors"] = succ_errors
@@ -842,13 +1087,9 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
     # PROBE_EXTRA_SIGNALS. A bad probe is reported, never fatal.
     probes = list(program.get("probes") or [])[:MAX_PROBES]
     if probes:
-        _sigfn, _info = make_signal_fn(env)
-        n_pre = int(_info["n_pre"])
-        obj_pos = arr[:, :, n_pre:n_pre + 3]
-        obj_vel = arr[:, :, n_pre + 3:n_pre + 6]
         probe_env = {s: sig_te[:, :, j] for j, s in enumerate(sig_keys)}
-        probe_env["obj_disp_xy"] = _np.linalg.norm(obj_pos[:, :, :2] - obj_pos[:1, :, :2], axis=-1)
-        probe_env["obj_speed"] = _np.linalg.norm(obj_vel, axis=-1)
+        probe_env["obj_disp_xy"] = obj_disp_xy
+        probe_env["obj_speed"] = obj_speed
         probe_names = set(signal_names) | set(PROBE_EXTRA_SIGNALS)
         phalf = max(T // 2, 1)
         preport: dict[str, dict] = {}
@@ -879,6 +1120,39 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray") -> dic
                 entry["error"] = str(e)
             preport[pname] = entry
         out["probe_report"] = preport
+
+    # LLM-authored EVALS: named acceptance tests over the same vocabulary as probes. Each is
+    # {name, expr, when: "ever"|"end"} scored per EPISODE as pass/fail -- "ever": expr > 0 holds
+    # for >= dwell consecutive steps anywhere in the episode; "end": expr > 0 holds over the final
+    # dwell steps. pass_frac feeds the revision loop's tie-break acceptance (an authored-eval
+    # improvement can carry a revision whose objective is within noise, never one that regresses).
+    # A bad eval is reported, never fatal.
+    authored_evals = list(program.get("evals") or [])[:MAX_EVALS]
+    if authored_evals:
+        eval_env = {s: sig_te[:, :, j] for j, s in enumerate(sig_keys)}
+        eval_env["obj_disp_xy"] = obj_disp_xy
+        eval_env["obj_speed"] = obj_speed
+        allowed = set(signal_names) | set(PROBE_EXTRA_SIGNALS)
+        dwell_e = min(3, T)
+        ereport: dict[str, dict] = {}
+        for it in authored_evals:
+            ename = str(it.get("name") or it.get("expr") or f"eval{len(ereport)}")
+            when = str(it.get("when", "ever"))
+            entry: dict[str, Any] = {"expr": str(it.get("expr", "")), "when": when}
+            try:
+                ev = compile_expr(str(it.get("expr", "0")), allowed)
+                val = _np.broadcast_to(_np.asarray(ev(eval_env), dtype=_np.float64), (T, E))
+                pos = val > 0.0
+                if when == "end":
+                    passed = pos[-dwell_e:].all(axis=0)
+                else:
+                    c = _np.concatenate([_np.zeros((1, E), int), _np.cumsum(pos, axis=0)], axis=0)
+                    passed = ((c[dwell_e:] - c[:-dwell_e]) >= dwell_e).any(axis=0)
+                entry["pass_frac"] = round(float(passed.mean()), 4)
+            except Exception as e:  # noqa: BLE001 -- a bad eval must not kill the evaluation
+                entry["error"] = str(e)
+            ereport[ename] = entry
+        out["eval_report"] = ereport
 
     # Direction evidence for the FOCUS stage: the stall, or (endgame) the weakest hand-off.
     focus = stall if stall is not None else weakest

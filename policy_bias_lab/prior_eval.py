@@ -23,7 +23,7 @@ import numpy as np
 from policy_bias_lab.bias import compile_bias
 from policy_bias_lab.composed_priors import make_composed_prior_fn
 from policy_bias_lab.freeform_priors import (
-    DEFAULT_BLEND, MAX_PROBES, addressed_actuators, all_actuator_names, _semantic_group,
+    DEFAULT_BLEND, MAX_EVALS, MAX_PROBES, addressed_actuators, all_actuator_names, _semantic_group,
 )
 from policy_bias_lab.llm_util import candidate_score
 from policy_bias_lab.symbolic_control import sustained_bool
@@ -47,7 +47,8 @@ def flatten_for_dofcheck(prog: dict, rep: str) -> dict:
     return {"mode": "dsl", "rules": rules}
 
 
-def validate_program(env: Any, cand: dict, rep: str) -> dict | None:
+def validate_program(env: Any, cand: dict, rep: str,
+                     errors: list[str] | None = None) -> dict | None:
     """Wrap an LLM candidate's phase sub-priors into a stacked program and compile-check it.
 
     We do NOT force every DOF to be driven (the vocabulary is basis-complete, so any DOF is
@@ -57,6 +58,8 @@ def validate_program(env: Any, cand: dict, rep: str) -> dict | None:
     if rep == "freeform_staged":
         stages = cand.get("stages")
         if not isinstance(stages, list) or not stages:
+            if errors is not None:
+                errors.append(f"candidate {cand.get('name')!r}: no 'stages' list")
             return None
         # Blend is NOT author-selectable: sharp softmax is the only gate semantics for new
         # candidates (relu-norm "soft" degenerated into a static average and hard argmax chatters;
@@ -74,6 +77,10 @@ def validate_program(env: Any, cand: dict, rep: str) -> dict | None:
         # probe is reported there, never a validation failure).
         if isinstance(cand.get("probes"), list) and cand["probes"]:
             prog["probes"] = cand["probes"][:MAX_PROBES]
+        # LLM-authored acceptance-test EVALS ride the same way (scored by stage_occupancy as
+        # per-episode pass fractions; a bad eval is reported there, never a validation failure).
+        if isinstance(cand.get("evals"), list) and cand["evals"]:
+            prog["evals"] = cand["evals"][:MAX_EVALS]
     else:
         subs = cand.get("subpriors")
         if not isinstance(subs, list) or len(subs) < 3:
@@ -83,6 +90,8 @@ def validate_program(env: Any, cand: dict, rep: str) -> dict | None:
         compile_bias({"name": "x", "action_priors": [], "prior_program": prog}, env)
     except Exception as e:  # noqa: BLE001 - report and reject any uncompilable candidate
         print(f"  [reject] compile failed: {e}")
+        if errors is not None:
+            errors.append(f"candidate {cand.get('name')!r}: {e}")
         return None
     return prog
 

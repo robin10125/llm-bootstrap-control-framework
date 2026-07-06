@@ -20,6 +20,7 @@ import ppo
 
 from policy_bias_lab.bias import CompiledBias, REWARD_TEMPLATE_COUNT, default_reward_template_weights
 from policy_bias_lab.es import BIAS_ARMS
+from policy_bias_lab.tasks import task_failure_signal
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,12 @@ class PPOBiasConfig:
     # episodes that finished. The fixed-horizon scan still steps the physics (it cannot stop), so
     # this changes what the policy is trained on, not the compute per iteration. None = off.
     success_terminate_seconds: float | None = None
+    # FAILURE termination (the mirror): when the task's failure signal (tasks.task_failure_signal,
+    # e.g. object knocked beyond a recoverable radius) holds for this many consecutive seconds,
+    # the episode's credit ends -- post-mistake steps carry no reward/value/loss weight, so the
+    # actions BEFORE the mistake bear its full cost (concentrated credit assignment). Same masking
+    # mechanics as success termination; saves no sim compute (fixed scan). None = off.
+    failure_terminate_seconds: float | None = None
     warmup_compile: bool = True
 
 
@@ -155,7 +162,7 @@ def train_ppo_arm(
         print(f"[{arm}] warmup compile start envs={cfg.envs} horizon={env.horizon}", flush=True)
         key, rk, ck, uk = jax.random.split(key, 4)
         state = reset(jax.random.split(rk, cfg.envs))
-        warmup_state, warmup_traj, warmup_last_value, _warmup_summary = collect(
+        warmup_state, warmup_traj, warmup_last_value, _warmup_summary, _warmup_fail = collect(
             params, state, ck, reward_weights, base_reward_weight_arr, action_prior_weights
         )
         warmup_state.reward.block_until_ready()
@@ -179,6 +186,13 @@ def train_ppo_arm(
         print(f"[{arm}] early termination: sustained success for "
               f"{cfg.success_terminate_seconds}s ({term_window} steps) ends the episode's credit",
               flush=True)
+    fail_window = 0
+    if cfg.failure_terminate_seconds:
+        fail_window = max(1, round(float(cfg.failure_terminate_seconds)
+                                   / float(env.cfg.control_dt)))
+        print(f"[{arm}] failure termination: the task failure signal sustained for "
+              f"{cfg.failure_terminate_seconds}s ({fail_window} steps) ends the episode's credit",
+              flush=True)
     stop_reason: str | None = None
     start = time.monotonic()
     for it in range(cfg.iters):
@@ -190,7 +204,7 @@ def train_ppo_arm(
         state = reset(jax.random.split(rk, cfg.envs))
         if it == 0:
             print(f"[{arm}] iter0 collect start", flush=True)
-        state, traj, last_value, eval_summary = collect(
+        state, traj, last_value, eval_summary, fail_signal = collect(
             params, state, ck, reward_weights, base_reward_weight_arr, action_prior_weights
         )
         if it == 0:
@@ -199,11 +213,20 @@ def train_ppo_arm(
             print(f"[{arm}] iter0 collect ready", flush=True)
         (obs, action, logp, value, train_reward, success, lift, base_reward,
          shaped_reward, hard_clip_frac, saturation_frac, action_abs_mean, reward_contrib) = traj
-        if term_window:
-            # Early termination on sustained success: post-terminal steps carry no reward, no
-            # value target, and (via the valid mask) no loss weight; finished episodes drop the
-            # bootstrap value, so the tail after "done" cannot leak credit either way.
-            alive, alive_end = success_termination_mask(success, term_window)
+        if term_window or fail_window:
+            # Early termination on sustained success and/or a sustained task failure signal:
+            # post-terminal steps carry no reward, no value target, and (via the valid mask) no
+            # loss weight; finished episodes drop the bootstrap value, so the tail after "done"
+            # cannot leak credit either way. Failure termination concentrates the mistake's cost
+            # on the actions that caused it instead of diluting it over the chase that follows.
+            alive = jp.ones_like(train_reward)
+            alive_end = jp.ones_like(last_value)
+            if term_window:
+                a_s, ae_s = success_termination_mask(success, term_window)
+                alive, alive_end = alive * a_s, alive_end * ae_s
+            if fail_window:
+                a_f, ae_f = success_termination_mask(fail_signal.astype(jp.float32), fail_window)
+                alive, alive_end = alive * a_f, alive_end * ae_f
             adv, ret = ppo.compute_gae(train_reward * alive, value * alive,
                                        last_value * alive_end, cfg.gamma, cfg.lam)
             valid = alive
@@ -432,22 +455,46 @@ def evaluate_ppo_policy(
 
     outs: list[dict[str, Any]] = []
     obs_list = []
+    fail_list = []
     for b in range(max(1, int(n_batches))):
         bs = seed + 7919 * b  # distinct reset keys per batch; the compiled collect is reused
         state = reset(jax.random.split(jax.random.PRNGKey(bs), n_envs))
-        _state, traj, _last_value, eval_summary = collect(
+        _state, traj, _last_value, eval_summary, fail_signal = collect(
             params, state, jax.random.PRNGKey(bs + 1), reward_weights, base_reward_weight_arr,
             action_prior_weights
         )
-        outs.append(_batch_metrics(traj, eval_summary))
+        bm = _batch_metrics(traj, eval_summary)
+        # Task failure signal (tasks.task_failure_signal). The base metrics are never masked by
+        # it; alongside them we emit CALM-conditioned aggregates (episodes where the mistake
+        # indicator never fired) so a task's graded objective can refuse to pay for progress
+        # achieved by making the mistake (e.g. reach via knocking).
+        fail_any = np.asarray(fail_signal).any(axis=0)                       # [E]
+        es = np.asarray(eval_summary)
+        bm["eval_failure_rate"] = round(float(fail_any.mean()), 6)
+        bm["eval_calm_frac"] = round(float((~fail_any).mean()), 6)
+        bm["eval_reach_rate_calm"] = round(float(((es[:, 2] >= 1.0) & ~fail_any).mean()), 6)
+        bm["eval_summary_calm"] = ([round(float(x), 6) for x in es[~fail_any].mean(axis=0)]
+                                   if (~fail_any).any() else None)
+        outs.append(bm)
         if return_obs:
             obs_list.append(jax.device_get(traj[0]))
+            fail_list.append(np.asarray(jax.device_get(fail_signal)))
     if len(outs) == 1:
         out = dict(outs[0])
     else:  # pooled = mean over equal-size batches (all fields are per-episode means)
         out = {}
         for k, v in outs[0].items():
-            if isinstance(v, list):
+            vals = [o[k] for o in outs]
+            if any(x is None for x in vals):  # e.g. eval_summary_calm with zero calm episodes
+                vals = [x for x in vals if x is not None]
+                if not vals:
+                    out[k] = None
+                elif isinstance(vals[0], list):
+                    out[k] = [round(float(sum(x[i] for x in vals) / len(vals)), 6)
+                              for i in range(len(vals[0]))]
+                else:
+                    out[k] = round(float(sum(vals) / len(vals)), 6)
+            elif isinstance(v, list):
                 out[k] = [round(float(sum(o[k][i] for o in outs) / len(outs)), 6)
                           for i in range(len(v))]
             else:
@@ -455,6 +502,9 @@ def evaluate_ppo_policy(
         out["eval_batches"] = outs
     if return_obs:  # [T, n_batches*E, obs_dim] visited states, for stage occupancy
         out["eval_obs"] = (np.concatenate(obs_list, axis=1) if len(obs_list) > 1 else obs_list[0])
+        # [T, n_batches*E] task failure signal aligned with eval_obs, for failure attribution.
+        out["eval_fail_steps"] = (np.concatenate(fail_list, axis=1) if len(fail_list) > 1
+                                  else fail_list[0])
     return out
 
 
@@ -545,7 +595,11 @@ def make_collect(
         eval_summary = jax.vmap(lambda x: jp.asarray([
             x[:, 0].min(), x[:, 1].min(), x[:, 2].max(), x[:, 3].max(), x[:, 4].max(), x[:, 5].max()
         ]), in_axes=1)(eval_traj)
-        return state, traj[:13], last_value, eval_summary
+        # Task-defined per-step MISTAKE indicator [T, E] (tasks.task_failure_signal -- injected
+        # task data; the framework only applies it). Consumed by failure termination in training
+        # and by failure-attribution diagnostics in eval.
+        fail = task_failure_signal(task, eval_traj)
+        return state, traj[:13], last_value, eval_summary, fail
 
     return jax.jit(collect)
 

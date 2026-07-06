@@ -61,16 +61,53 @@ def task_graded_objective(task: str, ev: dict[str, Any]) -> float:
         # only as far as there is a grasp, so lifting WITHOUT a secure grip (throwing/knocking the
         # object up) scores ~0 on the lift terms.
         lift_thresh = 0.05  # m; matches this task's success definition above
-        reach = float(ev.get("eval_reach_rate", 0.0))
+        # Reach and proximity count only on CALM episodes -- ones where the task failure signal
+        # (object knocked beyond the recoverable radius) never fired. Ungated, they paid for
+        # violent approach: a striking prior scored 0.09 while knocking the cube in 85% of
+        # episodes, so selection pushed against the gentleness its own procedure account
+        # demanded. Falls back to the ungated fields when the calm aggregates are absent
+        # (archived eval dicts predating them).
+        reach = float(ev.get("eval_reach_rate_calm",
+                             ev.get("eval_reach_rate", 0.0)) or 0.0)
         grasp = float(ev.get("eval_grasp_rate", 0.0))
         lift_reached = float(ev.get("eval_lift_reached_rate", 0.0))
         lift_max_norm = min(float(ev.get("eval_lift_max", 0.0)) / lift_thresh, 1.0)
         succ = float(ev.get("eval_success_rate", 0.0))
+        # Dense proximity floor: mean-over-CALM-episodes of the episode-MIN palm-object distance.
+        # Candidates that never make contact all score ~0 on every rate above, so selection
+        # between them degenerates to sampling noise (observed: a whole refinement run ranked
+        # within +-2 sigma of zero). Small and bounded (<= 0.05) so it can never compete with
+        # actual contact/grasp progress; zero when no episode stayed calm.
+        summary = ev.get("eval_summary_calm", ev.get("eval_summary")) or []
+        prox = 0.0
+        di = FIELD_INDEX["palm_obj_dist"]
+        if len(summary) > di:
+            prox = max(0.0, 1.0 - float(summary[di]) / 0.3)
+        calm = ev.get("eval_calm_frac")
+        if calm is not None:
+            prox *= float(calm)
         return (1.0 * succ + 0.5 * grasp + 0.2 * reach
-                + 0.3 * min(lift_reached, grasp) + 0.1 * min(lift_max_norm, grasp))
+                + 0.3 * min(lift_reached, grasp) + 0.1 * min(lift_max_norm, grasp)
+                + 0.05 * prox)
     if task in ("push", "stabilize"):
         return float(ev.get("eval_success_rate", 0.0))
     raise KeyError(f"unknown task {task!r}")
+
+
+def task_failure_signal(task: str, eval_traj: jp.ndarray) -> jp.ndarray:
+    """Per-step MISTAKE indicator [T, E] from the per-step eval trajectory [T, E, F].
+
+    Marks steps at which the episode has gone irrecoverably wrong for `task`. The framework masks
+    training credit after the first SUSTAINED firing (failure termination, the mirror of success
+    termination): everything after the mistake carries no reward, value target, or loss weight, so
+    the pre-mistake actions bear its full cost. This is task data, not framework logic -- each
+    task defines what counts as a major mistake over its own eval fields.
+    """
+    if task == "lift":
+        # Object knocked beyond a recoverable radius: past this displacement from its spawn the
+        # episode is a knock-and-chase, not a grasp attempt (observed knock-lifts travel ~0.8m).
+        return eval_traj[..., FIELD_INDEX["obj_xy_disp"]] > 0.25
+    return jp.zeros(eval_traj.shape[:-1], dtype=bool)
 
 
 def task_progress_metrics(task: str) -> tuple[str, ...]:
