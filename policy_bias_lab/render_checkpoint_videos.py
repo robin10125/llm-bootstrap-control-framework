@@ -29,7 +29,7 @@ if str(BOOTSTRAPPING) not in sys.path:
 
 import ppo
 import eval_metrics as EM
-from mjx_env import EnvConfig, _SHADOW_CLOSE, _SHADOW_FINGERTIPS, _SHADOW_OPEN, load_model
+from mjx_env import EnvConfig, MjxEnv, _SHADOW_CLOSE, _SHADOW_FINGERTIPS, _SHADOW_OPEN, load_model
 
 SHADOW_XML = ROOT.parent / "hand-manipulation" / "env" / "models" / "shadow_hand" / "scene_cube.xml"
 
@@ -85,9 +85,29 @@ class CpuShadowEnv:
         ]
         self.hand_qadr = [int(self.model.jnt_qposadr[j]) for j in hand_jids]
         self.hand_vadr = [int(self.model.jnt_dofadr[j]) for j in hand_jids]
-        # prefix (q + v + constraint-force blocks) + [obj_pos, obj_vel, palm_pos, obj_rel] + ctrl
+        # Per-region contact-force maps (mirror MjxEnv; CPU force via mj_contactForce).
+        self.contact_groups = ("thumb", "index", "middle", "ring", "little", "palm")
+        self._obj_geoms = set()
+        self._geom_region = np.full(int(self.model.ngeom), -1, np.int32)
+        for gid in range(int(self.model.ngeom)):
+            if not (self.model.geom_contype[gid] or self.model.geom_conaffinity[gid]):
+                continue
+            bid = int(self.model.geom_bodyid[gid])
+            if bid == self.object_bid:
+                self._obj_geoms.add(gid)
+                continue
+            reg = MjxEnv._contact_region(self.model.body(bid).name)
+            if reg is not None:
+                self._geom_region[gid] = self.contact_groups.index(reg)
+        # World-frame position of every robot body (all except world/object) -- mirrors MjxEnv obs.
+        self.body_pos_names = tuple(self.model.body(i).name for i in range(self.model.nbody)
+                                    if self.model.body(i).name not in ("world", "object"))
+        self.body_pos_bids = np.asarray([int(self.model.body(n).id) for n in self.body_pos_names],
+                                        dtype=np.int32)
+        # prefix (q + v + body_pos block + contact block) + [obj_pos, obj_vel, palm_pos, obj_rel] + ctrl
         self.obs_size = (len(self.base_qadr) + len(self.base_vadr) + len(self.hand_qadr)
-                         + len(self.hand_vadr) + len(self.base_vadr) + len(self.hand_vadr)
+                         + len(self.hand_vadr) + 3 * len(self.body_pos_names)
+                         + len(self.contact_groups)
                          + 12 + self.nu)
         act_names = [self.model.actuator(i).name for i in range(self.nu)]
         self.base_act_ids = [i for i, n in enumerate(act_names) if n in ("base_x", "base_y", "base_z")]
@@ -143,19 +163,38 @@ class CpuShadowEnv:
             "lift": float(eval_vec[EM.FIELD_INDEX["lift"]]),
         }
 
+    def contact_forces(self) -> np.ndarray:
+        """Per-region normal contact force (N) with the object; order = self.contact_groups."""
+        out = np.zeros(len(self.contact_groups), np.float32)
+        buf = np.zeros(6, np.float64)
+        for i in range(int(self.data.ncon)):
+            con = self.data.contact[i]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            o1, o2 = g1 in self._obj_geoms, g2 in self._obj_geoms
+            r1, r2 = int(self._geom_region[g1]), int(self._geom_region[g2])
+            if o1 and r2 >= 0:
+                reg = r2
+            elif o2 and r1 >= 0:
+                reg = r1
+            else:
+                continue
+            mujoco.mj_contactForce(self.model, self.data, i, buf)
+            out[reg] += abs(buf[0])
+        return out
+
     def observe(self) -> np.ndarray:
         base_q = self.data.qpos[self.base_qadr]
         base_v = self.data.qvel[self.base_vadr]
         hand_q = self.data.qpos[self.hand_qadr]
         hand_v = self.data.qvel[self.hand_vadr]
-        base_f = self.data.qfrc_constraint[self.base_vadr]
-        hand_f = self.data.qfrc_constraint[self.hand_vadr]
+        contact = self.contact_forces()
+        body_pos = self.data.xpos[self.body_pos_bids].reshape(-1)  # world xyz of every robot body
         obj_pos = self.data.xpos[self.object_bid]
         obj_vel = self.data.cvel[self.object_bid, 3:6]
         palm_pos = self.data.xpos[self.palm_bid]
         grasp_pos = self.data.site_xpos[self.grasp_sid]
         obj_rel = obj_pos - grasp_pos
-        return np.concatenate([base_q, base_v, hand_q, hand_v, base_f, hand_f,
+        return np.concatenate([base_q, base_v, hand_q, hand_v, body_pos, contact,
                                obj_pos, obj_vel, palm_pos, obj_rel, self.data.ctrl]).astype(np.float32)
 
     def eval_vec(self) -> np.ndarray:
@@ -165,7 +204,7 @@ class CpuShadowEnv:
         tip_pos = self.data.xpos[self.fingertip_bids]
         tip_d = np.linalg.norm(tip_pos - obj_pos[None, :], axis=-1)
         min_finger_dist = tip_d.min()
-        n_contacts = float(np.sum(tip_d < self.cfg.contact_eps))
+        n_contacts = float(np.sum(self.contact_forces() > self.cfg.contact_force_floor))
         closure = float(np.mean(np.clip((self.data.ctrl[self._hand_ids] - self._open_hand) / (self._close_dir + 1e-6), 0.0, 1.0)))
         lift = obj_pos[2] - self._obj_start_z
         obj_xy_disp = np.linalg.norm(obj_pos[:2] - self._obj_start_xy)
@@ -383,7 +422,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=20)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--episode-seconds", type=float, default=2.5)
+    parser.add_argument("--episode-seconds", type=float, default=5.0)
     parser.add_argument("--control-dt", type=float, default=0.025)
     parser.add_argument("--physics-dt", type=float, default=0.01)
     parser.add_argument("--obj-xy-range", type=float, default=0.04)

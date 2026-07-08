@@ -28,7 +28,7 @@ import jax.numpy as jp
 import numpy as np
 
 from policy_bias_lab.composed_priors import make_signal_fn, _calibration, _gates
-from policy_bias_lab.symbolic_control import group_masks, make_rule_action_fn, encode_rules
+from policy_bias_lab.symbolic_control import group_masks
 from policy_bias_lab.schema import ACTION_GROUPS
 
 # ----------------------------------------------------------------------------------------------
@@ -52,6 +52,157 @@ def _target_speed_doc(env: Any, action_scale: float) -> str:
             f"for.")
 
 
+def _actuator_motions(m: Any) -> list[dict[str, Any]]:
+    """Per-actuator kinematic motion descriptor, computed at the home pose (qpos0) via one forward
+    pass: the WORLD-FRAME axis each actuator's value moves the part about (hinge) or along (slide)
+    -- so an author knows which physical DIRECTION a positive q_/ctrl_ value indicates -- plus the
+    joint's travel range = the SCALE of the bend. Task-agnostic (pure kinematics)."""
+    import mujoco
+    data = mujoco.MjData(m)
+    data.qpos[:] = m.qpos0
+    mujoco.mj_forward(m, data)
+    trntype = np.asarray(m.actuator_trntype).reshape(-1)
+    kinds = {0: "free", 1: "ball", 2: "slide", 3: "hinge"}
+    out: list[dict[str, Any]] = []
+    for i in range(m.nu):
+        if int(trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+            out.append({"kind": "coupled",
+                        "note": "coupled/tendon transmission -- no single joint axis"})
+            continue
+        jid = int(m.actuator_trnid[i, 0])
+        kind = kinds.get(int(m.jnt_type[jid]), "other")
+        axis = [round(float(x), 3) for x in np.asarray(data.xaxis[jid])]
+        rng = [round(float(m.jnt_range[jid, 0]), 3), round(float(m.jnt_range[jid, 1]), 3)]
+        span = round(rng[1] - rng[0], 3)
+        if kind == "hinge":
+            deg = [round(rng[0] * 180.0 / np.pi, 1), round(rng[1] * 180.0 / np.pi, 1)]
+            span_deg = round(span * 180.0 / np.pi, 1)
+            note = (f"+ctrl/+q rotates this part about world axis {axis} by the right-hand rule; "
+                    f"travel {rng} rad = [{deg[0]} deg, {deg[1]} deg] ({span_deg} deg full bend)")
+        elif kind == "slide":
+            note = f"+ctrl/+q translates this part along world axis {axis}; travel {rng} m"
+        else:
+            note = f"{kind} joint on world axis {axis}"
+        out.append({"kind": kind, "world_axis": axis, "range": rng, "note": note})
+    return out
+
+
+def _spawn_attitude(env: Any) -> dict[str, Any] | None:
+    """Home-pose ORIENTATION + reorientation capability of each kinematic segment, from FK.
+
+    The per-actuator `motion` field already gives each joint's rotation/translation axis and range.
+    What it does NOT convey is the resting ATTITUDE of the hand -- which way each segment points in
+    the world at spawn, and which segments can change attitude at all. Without this an author cannot
+    tell that (e.g.) the whole hand hangs straight down and the base cannot rotate it. This computes,
+    at qpos0: each segment's world pointing axis (from parent->child body origins, convention-free),
+    the palm's face normal (perpendicular to the hand axis and the knuckle-spread axis), and whether
+    the segment can reorient (hinge joints) or is translation-only. Pure kinematics -- no task info.
+    """
+    import mujoco
+    m = env.model
+    try:
+        data = mujoco.MjData(m)
+    except Exception:
+        return None
+    data.qpos[:] = m.qpos0
+    mujoco.mj_forward(m, data)
+    body_names = {m.body(i).name for i in range(m.nbody)}
+
+    def opos(name: str):
+        return np.asarray(data.body(name).xpos) if name in body_names else None
+
+    def unit(v):
+        if v is None:
+            return None
+        n = float(np.linalg.norm(v))
+        v = v / n if n > 1e-9 else v
+        return [round(float(x), 3) for x in v]
+
+    def points(parent: str, child: str):
+        a, b = opos(parent), opos(child)
+        return unit(b - a) if a is not None and b is not None else None
+
+    # Base carriage: attitude is fixed iff every base actuator is a SLIDE (pure translation).
+    base_ids = [int(i) for i in getattr(env, "base_act_ids", ())]
+    trntype = np.asarray(m.actuator_trntype).reshape(-1)
+    base_all_slide = bool(base_ids) and all(
+        int(trntype[i]) == int(mujoco.mjtTrn.mjTRN_JOINT)
+        and int(m.jnt_type[int(m.actuator_trnid[i, 0])]) == int(mujoco.mjtJoint.mjJNT_SLIDE)
+        for i in base_ids)
+
+    # Convention-free segment pointing axes along the finger/arm chain (skip any missing body).
+    forearm_axis = points("rh_forearm", "rh_wrist") or points("rh_wrist", "rh_palm")
+    wrist_axis = points("rh_wrist", "rh_palm")
+    hand_axis = points("rh_palm", "rh_mfdistal") or wrist_axis
+    fingers = {"index": ("rh_ffknuckle", "rh_ffdistal"), "middle": ("rh_mfknuckle", "rh_mfdistal"),
+               "ring": ("rh_rfknuckle", "rh_rfdistal"), "little": ("rh_lfknuckle", "rh_lfdistal"),
+               "thumb": ("rh_thbase", "rh_thdistal")}
+    finger_axes = {k: points(*v) for k, v in fingers.items() if points(*v) is not None}
+
+    # Palm face normal = perpendicular to the hand (long) axis and the knuckle-spread axis.
+    palm_normal = None
+    ff, lf = opos("rh_ffknuckle"), opos("rh_lfknuckle")
+    ha = opos("rh_mfdistal")
+    hp = opos("rh_palm")
+    if ff is not None and lf is not None and ha is not None and hp is not None:
+        palm_normal = unit(np.cross(ha - hp, lf - ff))
+
+    if hand_axis is None:
+        return None
+
+    # Wrist joint DIRECTION semantics: perturb each wrist-group hinge at the home pose and measure
+    # whether it changes the palm FACING (flexion/extension) or only rolls the hand (deviation), and
+    # with which sign -- so the author gets flexion/extension named and directed correctly. Pure FK.
+    wrist_dirs: list[dict[str, Any]] = []
+    if palm_normal is not None and opos("rh_mfdistal") is not None and opos("rh_palm") is not None:
+        pn0 = np.asarray(palm_normal, dtype=float)
+        ha0 = opos("rh_mfdistal") - opos("rh_palm"); ha0 = ha0 / (float(np.linalg.norm(ha0)) or 1.0)
+        try:
+            anames = [m.actuator(i).name for i in range(m.nu)]
+        except Exception:
+            anames = []
+        for i, an in enumerate(anames):
+            if _semantic_group(an) != "wrist" or int(trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
+                continue
+            jid = int(m.actuator_trnid[i, 0])
+            if int(m.jnt_type[jid]) != int(mujoco.mjtJoint.mjJNT_HINGE):
+                continue
+            jadr = int(m.jnt_qposadr[jid])
+            q = np.asarray(m.qpos0).copy(); q[jadr] = float(np.radians(10.0))
+            data.qpos[:] = q; mujoco.mj_forward(m, data)
+            n = np.cross(opos("rh_mfdistal") - opos("rh_palm"), opos("rh_lfknuckle") - opos("rh_ffknuckle"))
+            n = n / (float(np.linalg.norm(n)) or 1.0)
+            t = opos("rh_mfdistal") - opos("rh_palm"); t = t / (float(np.linalg.norm(t)) or 1.0)
+            dz = float(n[2] - pn0[2])            # +q effect on palm-facing world-z
+            flex_dot = float(np.dot(t - ha0, pn0))  # >0 => +q swings fingertips toward palmar side = flexion
+            if abs(dz) >= 0.05:                  # this joint changes the palm facing => flexion/extension
+                flex_sign = "+q" if flex_dot > 0 else "-q"
+                ext_sign = "-q" if flex_dot > 0 else "+q"
+                dz_ext = dz if ext_sign == "+q" else -dz
+                wrist_dirs.append({"actuator": an, "role": "flexion_extension",
+                                   "flexion_sign": flex_sign, "extension_sign": ext_sign,
+                                   "extension_tilts_palm_toward": "table (-world_z)" if dz_ext < 0
+                                   else "up and back (+world_z)"})
+            else:                                # palm facing ~unchanged => deviation / roll
+                wrist_dirs.append({"actuator": an, "role": "deviation",
+                                   "note": "rocks the hand side-to-side; does not change which way the "
+                                           "palm faces"})
+        data.qpos[:] = m.qpos0; mujoco.mj_forward(m, data)  # restore home pose
+
+    return {
+        "base_translation_only": base_all_slide,
+        "forearm_points": forearm_axis,
+        "wrist_points": wrist_axis,
+        "hand_points": hand_axis,
+        "palm_face_normal": palm_normal,
+        "finger_points": finger_axes,
+        "wrist_directions": wrist_dirs,
+        "note": ("world axes are [x, y, z]; +z is up, so [0, 0, -1] points straight down at the "
+                 "table. `*_points` is the world direction a segment extends toward at the home "
+                 "pose; `palm_face_normal` is the direction the flat of the palm faces."),
+    }
+
+
 def robot_spec(env: Any) -> dict[str, Any]:
     """Injectable, robot-agnostic description of every controllable DOF.
 
@@ -71,6 +222,10 @@ def robot_spec(env: Any) -> dict[str, Any]:
                 "ctrl_increases_world": ("+" if s > 0 else "-") + axis,
                 "note": f"+{names[idx]} ctrl moves the grasp toward {'+' if s>0 else '-'}world_{axis}",
             }
+    # Forward-kinematics at the home pose so each actuator can carry the WORLD-FRAME axis its value
+    # moves about/along (the DIRECTION a q_/ctrl_ value indicates) and its travel range (the SCALE
+    # of the bend). Pure kinematics -- no task content.
+    motions = _actuator_motions(m)
     actuators = []
     gain = np.asarray(m.actuator_gainprm[:, 0])
     for i, n in enumerate(names):
@@ -80,12 +235,27 @@ def robot_spec(env: Any) -> dict[str, Any]:
             "index": i,
             "joint": m.joint(jid).name if jid >= 0 else None,
             "ctrlrange": [float(cr[i, 0]), float(cr[i, 1])],
+            "motion": motions[i],
             "servo_gain": float(gain[i]),
             "group": _semantic_group(n),
         })
+    # Initial (home) target the servos hold at t=0 -- injected so the author reasons from the
+    # ACTUAL spawn configuration instead of assuming the hand starts interaction-ready. Under the
+    # incremental-position control law q_<name> settles to ~ this value at spawn.
+    ctrl_init = getattr(env, "ctrl_open", None)
+    if ctrl_init is None:
+        ctrl_init = getattr(env, "_ctrl_init", None)
+    initial_pose = None
+    if ctrl_init is not None:
+        ci = np.asarray(ctrl_init)
+        if ci.shape[0] == len(names):
+            initial_pose = {names[i]: round(float(ci[i]), 4) for i in range(len(names))}
     return {
         "n_actuators": env.nu,
         "actuators": actuators,
+        "initial_pose": initial_pose,
+        "spawn_attitude": _spawn_attitude(env),
+        "rollout_seconds": round(float(getattr(env.cfg, "episode_seconds", 0.0)) or 20.0, 1),
         "control_law": {
             "type": "incremental_position",
             "rule": "target = current_ctrl + action * action_scale",
@@ -95,9 +265,11 @@ def robot_spec(env: Any) -> dict[str, Any]:
             "target_speed": _target_speed_doc(env, cal["action_scale"]),
             "applied_force": ("each actuator is a position servo: the steady-state force/torque "
                               "it applies to its joint is ~ servo_gain * (ctrl_<name> - q_<name>)"
-                              " -- the same tracking gap that detects contact also MEASURES how "
-                              "hard the servo is pressing, so commanded force is controllable "
-                              "through how far ctrl is driven past q"),
+                              " -- so you control how hard a region presses by how far you drive "
+                              "ctrl past the measured q. This is the COMMANDED push; the resulting "
+                              "NORMAL force the object actually feels is observed directly as "
+                              "c_<region> (zero until real contact), and the two agree only once "
+                              "the region is truly loaded against the object"),
         },
         "base_world_sign": base_world,
         "semantic_groups": {g: [a["name"] for a in actuators if a["group"] == g]
@@ -118,6 +290,17 @@ def _semantic_group(name: str) -> str:
         if name.startswith(pre):
             return tag
     return "other"
+
+
+def _contact_region_of_actuator(name: str) -> str | None:
+    """The contact region (finger/palm) an actuator belongs to -- matches env.contact_groups so
+    `c_self` resolves to the right c_<region> observable. None = no contact region (base carriage)."""
+    g = _semantic_group(name)
+    if g in ("thumb", "index", "middle", "ring", "little"):
+        return g
+    if g == "wrist":
+        return "palm"
+    return None
 
 
 def all_actuator_names(env: Any) -> list[str]:
@@ -148,22 +331,16 @@ def _resolve_actuators(env: Any, tokens: list[str]) -> list[int]:
 
 
 def addressed_actuators(env: Any, candidate: dict[str, Any]) -> set[str]:
-    """Set of actuator names a candidate touches (DSL rules or free-form channels)."""
+    """Set of actuator names a candidate touches (free-form channels)."""
     names = all_actuator_names(env)
     idx: set[int] = set()
-    if candidate.get("mode") == "freeform":
-        for ch in candidate.get("channels", []):
-            idx.update(_resolve_actuators(env, ch.get("actuators", [])))
-    elif candidate.get("mode") == "freeform_staged":
+    if candidate.get("mode") == "freeform_staged":
         for st in candidate.get("stages", []):
             for ch in st.get("channels", []):
                 idx.update(_resolve_actuators(env, ch.get("actuators", [])))
-    else:  # DSL: rules with a 'group'
-        rules = candidate.get("rules", [])
-        for sub in candidate.get("library", []):  # gated library form
-            rules = rules + list(sub.get("rules", []))
-        for r in rules:
-            idx.update(_resolve_actuators(env, [r.get("group", "")]))
+    else:  # freeform: flat list of channels
+        for ch in candidate.get("channels", []):
+            idx.update(_resolve_actuators(env, ch.get("actuators", [])))
     return {names[i] for i in idx}
 
 
@@ -245,7 +422,11 @@ def _names_of(env: Any, tokens: list[str]) -> list[str]:
 # Free-form expression compiler (restricted AST safe-eval -> JAX)
 # ----------------------------------------------------------------------------------------------
 
-_ALLOWED_FUNCS = {"clip", "sigmoid", "min", "max", "abs", "exp", "sqrt", "tanh"}
+_ALLOWED_FUNCS = {"clip", "sigmoid", "min", "max", "abs", "exp", "sqrt", "tanh", "arrive", "within"}
+# Expected argument count per function; checked at validation so a wrong-arity call is rejected
+# cleanly instead of crashing at eval time.
+_FUNC_ARITY = {"clip": 3, "sigmoid": 1, "min": 2, "max": 2, "abs": 1, "exp": 1, "sqrt": 1,
+               "tanh": 1, "arrive": 3, "within": 2}
 
 
 def _validate_ast(node: ast.AST, signals: set[str]) -> None:
@@ -270,6 +451,9 @@ def _validate_ast(node: ast.AST, signals: set[str]) -> None:
             raise ValueError(f"only calls to {sorted(_ALLOWED_FUNCS)} allowed")
         if node.keywords:
             raise ValueError("keyword args not allowed")
+        want = _FUNC_ARITY.get(node.func.id)
+        if want is not None and len(node.args) != want:
+            raise ValueError(f"{node.func.id}() takes {want} args, got {len(node.args)}")
         for a in node.args:
             _validate_ast(a, signals)
     elif isinstance(node, ast.Compare):
@@ -305,6 +489,16 @@ def _eval_ast(node: ast.AST, sig: dict[str, jp.ndarray]) -> jp.ndarray:
         if f == "abs": return jp.abs(a[0])
         if f == "sqrt": return jp.sqrt(jp.maximum(a[0], 0.0))
         if f == "tanh": return jp.tanh(a[0])
+        if f == "arrive":
+            # Cruise-to-target-then-halt: a saturated velocity command toward err=0. The large fixed
+            # gain pins the output at +-vmax (constant cruise) until |err| is small, where it drops
+            # into the linear zone and the -damp*v term brakes to a clean stop -- a trapezoidal move.
+            # a = [err (= target - current), v (the part's velocity), vmax (cruise speed cap)].
+            return jp.clip(10.0 * a[0] - 0.6 * a[1], -a[2], a[2])
+        if f == "within":
+            # Position-only completion: > 0 exactly when |err| < tol. Use in a stage's gate/success so
+            # the hand-off fires ON ARRIVAL -- NO velocity term, so a fast stage does not wait to stop.
+            return a[1] - jp.abs(a[0])
         return jp.exp(a[0])
     if isinstance(node, ast.Compare):
         l = _eval_ast(node.left, sig); r = _eval_ast(node.comparators[0], sig); op = node.ops[0]
@@ -327,7 +521,7 @@ def compile_expr(src: str, signal_names: set[str]) -> Callable[[dict[str, jp.nda
 # quantities as ctrl_<name>/q_<name>, resolved mechanically from the obs layout). One channel can
 # thereby give each of its actuators an individual reactive response -- without this, per-joint
 # shapes need one channel per actuator, which no candidate can afford to author.
-CHANNEL_SELF_SIGNALS = {"ctrl_self", "q_self", "v_self", "f_self"}
+CHANNEL_SELF_SIGNALS = {"ctrl_self", "q_self", "v_self", "c_self"}
 
 
 def _compile_channel(env: Any, ch: dict, signal_names: set[str],
@@ -359,19 +553,35 @@ def _compile_channel(env: Any, ch: dict, signal_names: set[str],
                              "observable: " + ", ".join(missing))
         return jp.asarray([obs_idx[f"{prefix}_{an}"] for an in names], jp.int32)
 
+    def _contact_idx():
+        # c_self binds each actuator to its hand region's CONTACT-force observable (c_<region>).
+        # Base-carriage actuators have no contact region, so c_self is a compile error there.
+        cols, missing = [], []
+        for an in names:
+            reg = _contact_region_of_actuator(an)
+            key = f"c_{reg}" if reg else None
+            if key is None or key not in obs_idx:
+                missing.append(an)
+            else:
+                cols.append(obs_idx[key])
+        if missing:
+            raise ValueError("c_self is not available for actuators with no contact region "
+                             "(e.g. the base carriage): " + ", ".join(missing))
+        return jp.asarray(cols, jp.int32)
+
     q_idx = _self_idx("q") if "q_self" in self_used else None
     v_idx = _self_idx("v") if "v_self" in self_used else None
-    f_idx = _self_idx("f") if "f_self" in self_used else None
+    c_idx = _contact_idx() if "c_self" in self_used else None
 
-    def ev_self(obs, sig, _ev=ev, _c=ctrl_idx, _q=q_idx, _v=v_idx, _f=f_idx):
+    def ev_self(obs, sig, _ev=ev, _c=ctrl_idx, _q=q_idx, _v=v_idx, _cf=c_idx):
         s = dict(sig)
         s["ctrl_self"] = obs[_c]
         if _q is not None:
             s["q_self"] = obs[_q]
         if _v is not None:
             s["v_self"] = obs[_v]
-        if _f is not None:
-            s["f_self"] = obs[_f]
+        if _cf is not None:
+            s["c_self"] = obs[_cf]
         return _ev(s)
 
     return idx, ev_self
@@ -432,43 +642,17 @@ def make_freeform_prior_fn(env: Any, program: dict[str, Any]) -> tuple[Callable[
 def compile_subprior(env: Any, spec: dict[str, Any]) -> Callable[[jp.ndarray], jp.ndarray]:
     """Compile one phase sub-prior into fn(obs) -> mean_shift.
 
-    DSL form: {"rules": [{kind:"operator", group, direction, weight} | {kind:"basis", group, sign,
-    weight}]}. Operator rules use the calibrated symbolic operators; basis rules drive a group's
-    actuators toward +/- ctrl (the robot-derived motion basis -- makes any DOF, incl. the wrist,
-    movable). Free-form form: {"channels": [{actuators, expr}]}.
+    Free-form form: {"channels": [{actuators, expr}]} -- each channel is a normalized mean-shift
+    expression over the observables for a set of actuators.
     """
-    action_dim = int(env.action_size)
-    if "channels" in spec:
-        fn, _dw, _info = make_freeform_prior_fn(env, {"channels": spec["channels"]})
-        return lambda obs: fn(obs, None)
-    rules = list(spec.get("rules", []))
-    op_rules = [r for r in rules if r.get("kind", "operator") == "operator" and r.get("direction")]
-    basis_rules = [r for r in rules if r.get("kind") == "basis"]
-    rule_action_fn, _ = make_rule_action_fn(env)
-    enc = None
-    if op_rules:
-        e = encode_rules([{ "group": r.get("group", "all"), "direction": r["direction"],
-                            "weight": float(r.get("weight", 0.0))} for r in op_rules])
-        enc = (jp.asarray(e["group_ids"], jp.int32), jp.asarray(e["direction_ids"], jp.int32),
-               jp.asarray(e["weights"], jp.float32))
-    basis = [(jp.asarray(_resolve_actuators(env, [r.get("group", "")]), jp.int32),
-              float(r.get("sign", 1.0)) * float(r.get("weight", 0.0))) for r in basis_rules]
-
-    def fn(obs):
-        out = jp.zeros((action_dim,), jp.float32)
-        if enc is not None:
-            out = out + rule_action_fn(obs, enc[0], enc[1], enc[2])
-        for idx, val in basis:
-            out = out.at[idx].add(val)
-        return out
-
-    return fn
+    fn, _dw, _info = make_freeform_prior_fn(env, {"channels": spec.get("channels", [])})
+    return lambda obs: fn(obs, None)
 
 
 def make_stacked_prior_fn(env: Any, program: dict[str, Any]):
     """Compile a stacked-gate program {subpriors:[approach, grasp, lift], gates:{}} into
-    (prior_fn(obs, weights)->mean_shift, default_weights, info). Each sub-prior may be DSL or
-    free-form. The stacked gate (composed_priors._gates) blends them on observable signals."""
+    (prior_fn(obs, weights)->mean_shift, default_weights, info). Each sub-prior is a set of
+    free-form channels. The stacked gate (composed_priors._gates) blends them on observable signals."""
     action_dim = int(env.action_size)
     signals, _ = make_signal_fn(env)
     gate_params = dict(program.get("gates", {}))
@@ -489,32 +673,30 @@ def make_stacked_prior_fn(env: Any, program: dict[str, Any]):
     }
 
 
-DEFAULT_BLEND = "softmax"
 DEFAULT_BLEND_TAU = 0.1
 
 
-def blend_weights(gates: jp.ndarray, blend: str, tau: float = DEFAULT_BLEND_TAU) -> jp.ndarray:
-    """Normalized stage weights from raw gate values -- the ONE place the blend semantics live,
-    shared by the prior itself, make_stage_weight_fn, and stage_occupancy so the executed mixture
-    and every diagnostic see identical weights.
+def blend_weights(gates: jp.ndarray, tau: float = DEFAULT_BLEND_TAU) -> jp.ndarray:
+    """Stage weights from raw gate values -- the ONE place the blend semantics live, shared by the
+    prior itself, make_stage_weight_fn, and stage_occupancy so the executed mixture and every
+    diagnostic see identical weights.
 
-    softmax (default): sharp but continuous hand-offs. Invariant to a shared additive gate offset,
-    so authored constant gate floors cannot leak permanent weight to every stage (the relu-norm
-    failure mode where a 4-stage program degenerates into one static averaged pose).
-    soft: legacy relu(gate)/sum. hard: one-hot on argmax (ties split evenly).
+    HARD one-stage selection: exactly one stage is ever active, even at a hand-off -- no cross-fade,
+    no mixing of adjacent stages' channels. Gates are clipped to [0, 1] before the argmax so a
+    later stage whose raw ladder gate saturates large (e.g. 1 - done_k with an unbounded, far-from-
+    done measurement) cannot outbid a nearly-finished current stage; among stages that saturate to
+    1 the argmax's lowest-index tie-break selects the EARLIEST (first-unfinished) one. `tau` is
+    retained for signature compatibility but no longer softens the selection.
     """
-    if blend == "hard":
-        top = (gates >= jp.max(gates)).astype(jp.float32)
-        return top / (jp.sum(top) + 1e-8)
-    if blend == "soft":
-        pos = jp.maximum(gates, 0.0)
-        return pos / (jp.sum(pos) + 1e-8)
-    return jax.nn.softmax(gates / jp.maximum(tau, 1e-4))
+    n = int(gates.shape[0])
+    if n == 0:
+        return gates
+    idx = jp.argmax(jp.clip(gates, 0.0, 1.0))  # ties -> lowest index = earliest unfinished stage
+    return jax.nn.one_hot(idx, n, dtype=gates.dtype)
 
 
-def _blend_of(program: dict[str, Any]) -> tuple[str, float]:
-    return (str(program.get("blend", DEFAULT_BLEND)),
-            float(program.get("temperature", DEFAULT_BLEND_TAU)))
+def _tau_of(program: dict[str, Any]) -> float:
+    return float(program.get("temperature", DEFAULT_BLEND_TAU))
 
 
 def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
@@ -526,15 +708,16 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
     STATELESSLY -- pure functions of the CURRENT signals, no phase latch/pointer/hysteresis (PPO
     recomputes the prior on shuffled minibatches, so any hidden state breaks the importance ratio).
 
-    program = {"mode":"freeform_staged", "blend":"softmax"|"soft"|"hard", "temperature": <tau>,
+    program = {"mode":"freeform_staged", "temperature": <tau>,
                "stages":[{"name", "gate":"<expr>", "channels":[{actuators, expr}, ...]}, ...]}
-    Blend semantics live in blend_weights(); softmax (sharp, continuous) is the default.
+    Stage weights are a HARD one-stage selection over the gate values -- clip to [0,1] then argmax,
+    exactly one stage active (the only blend; see blend_weights()). `temperature` is vestigial.
     Per-stage gains are the tunable `weights` vector (default ones).
     """
     action_dim = int(env.action_size)
     signals, signal_names = program_signal_fn(env, program)
     obs_idx = dict(raw_obs_entries(env)[0])
-    blend, tau = _blend_of(program)
+    tau = _tau_of(program)
     stages = list(program.get("stages", []))
     compiled: list[tuple[Callable, list[tuple[jp.ndarray, Callable]]]] = []
     for st in stages:
@@ -555,13 +738,13 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
         sig = signals(obs)
         gates = jp.stack([g(sig) for g, _ in compiled]) if n else jp.zeros((0,), jp.float32)
         gates = jp.asarray(gates, jp.float32)
-        w = blend_weights(gates, blend, tau)
+        w = blend_weights(gates, tau)
         out = jp.zeros((action_dim,), jp.float32)
         for i, (_g, chans) in enumerate(compiled):
             out = out + (w[i] * gains[i]) * _stage_out(chans, obs, sig)
         return jp.clip(out, -1.0, 1.0)
 
-    info = {"mode": "freeform_staged", "blend": blend, "n_stages": n, "n_weights": n,
+    info = {"mode": "freeform_staged", "blend": "argmax_onehot", "n_stages": n, "n_weights": n,
             "stage_names": [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]}
     return prior_fn, jp.ones((n,), jp.float32), info
 
@@ -569,13 +752,13 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
 def make_stage_weight_fn(env: Any, program: dict[str, Any]):
     """Expose ONLY the per-stage activation weights of a freeform_staged program (not the action).
 
-    Returns (weight_fn, stage_names). weight_fn(obs) -> w[n_stages], the SAME soft/hard-normalized
-    stage weights make_freeform_staged_prior_fn uses internally. Used by the diagnostic to localize
+    Returns (weight_fn, stage_names). weight_fn(obs) -> w[n_stages], the SAME hard one-stage
+    (clip+argmax) weights make_freeform_staged_prior_fn uses internally. Used by the diagnostic to localize
     WHICH authored stage a trained policy stalls in -- task-agnostic, since it reads only the model's
     own gates over the shared signals.
     """
     signals, signal_names = program_signal_fn(env, program)
-    blend, tau = _blend_of(program)
+    tau = _tau_of(program)
     stages = list(program.get("stages", []))
     gate_evs = [compile_expr(str(st.get("gate", "1")), signal_names) for st in stages]
     n = len(gate_evs)
@@ -584,7 +767,7 @@ def make_stage_weight_fn(env: Any, program: dict[str, Any]):
     def weight_fn(obs):
         sig = signals(obs)
         gates = jp.stack([g(sig) for g in gate_evs]) if n else jp.zeros((0,), jp.float32)
-        return blend_weights(jp.asarray(gates, jp.float32), blend, tau)
+        return blend_weights(jp.asarray(gates, jp.float32), tau)
 
     return weight_fn, names
 
@@ -629,9 +812,19 @@ def raw_obs_entries(env: Any) -> tuple[list[tuple[str, int]], list[str]]:
         entries.append((f"obj_rel_{axes[i]}", n_pre + 9 + i))
     for i, an in enumerate(act_names):
         entries.append((f"ctrl_{an}", n_pre + 12 + i))
+    # Per-region CONTACT force block (the entries just before obj_pos): c_thumb..c_palm.
+    groups = list(getattr(env, "contact_groups", ()))
+    for k, g in enumerate(groups):
+        entries.append((f"c_{g}", n_pre - len(groups) + k))
+    # World-frame BODY POSITION block: <body>_x/y/z for every robot body, sitting immediately BEFORE
+    # the contact block (see _observe). Indexed tail-relative so it self-corrects with obs_size.
+    body_names = list(getattr(env, "body_pos_names", ()))
+    body_start = n_pre - len(groups) - 3 * len(body_names)
+    for j, bn in enumerate(body_names):
+        for a in range(3):
+            entries.append((f"{bn}_{axes[a]}", body_start + 3 * j + a))
     no_q = []
     vmap = actuator_obs_qvel_map(env)
-    fmap = actuator_obs_qforce_map(env)
     for i, an in enumerate(act_names):
         if qmap[i] is not None:
             entries.append((f"q_{an}", int(qmap[i])))
@@ -639,8 +832,6 @@ def raw_obs_entries(env: Any) -> tuple[list[tuple[str, int]], list[str]]:
             no_q.append(an)
         if vmap[i] is not None:
             entries.append((f"v_{an}", int(vmap[i])))
-        if fmap[i] is not None:
-            entries.append((f"f_{an}", int(fmap[i])))
     return entries, no_q
 
 
@@ -669,16 +860,27 @@ def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
         "  obj_vel_x/y/z: object linear velocity, world frame (m/s)\n"
         "  palm_pos_x/y/z: palm position, world frame (m)\n"
         "  obj_rel_x/y/z: object position minus grasp-site position, world frame (m)\n"
+        "  <body>_x/y/z: WORLD-FRAME position (m) of every robot body -- so you can read where any "
+        "part is in space (e.g. a fingertip's height above the table to keep it from digging in). "
+        "+z is up; the table/floor is at world z = 0, so a part's _z IS its height above the table. "
+        "The FINGERTIP bodies (the parts most likely to catch on the table -- gate descent so their "
+        "_z stays above a small margin) are: "
+        + ", ".join(getattr(env.cfg, "fingertip_bodies", ()) or ()) + ". All bodies: "
+        + ", ".join(getattr(env, "body_pos_names", ())) + "\n"
         "  ctrl_<actuator>: current commanded target of that actuator (its ctrl units/range)\n"
         "  q_<actuator>: MEASURED position of the joint that actuator drives (differs from "
         "ctrl_<actuator> when the joint is blocked or saturated)\n"
         "  v_<actuator>: MEASURED velocity of that joint (position units per second) -- the "
         "damping/feedback term a position error alone cannot provide\n"
-        "  f_<actuator>: measured CONSTRAINT force/torque on that joint (N or N*m): the "
-        "GROUND-TRUTH contact signal -- exactly zero in free air no matter how fast the joint "
-        "moves, nonzero when the joint's link chain is pressing on something (sign follows the "
-        "joint axis)"
-        + (f"; q_/v_/f_ not available (no single-joint transmission): {', '.join(no_q)}" if no_q else "")
+        "  c_<region>: measured NORMAL CONTACT FORCE (N) between that hand region and the object, "
+        "regions = " + ", ".join(getattr(env, "contact_groups", ())) + ". This is the GROUND-TRUTH "
+        "touch signal: exactly zero in free air, and exactly zero when a joint merely loads its "
+        "OWN LIMIT (unlike a joint force, it is read only from real object<->hand contacts). It "
+        "rises the instant a region presses the object and grows with how hard it presses. It is "
+        "in newtons; use the per-actuator servo_gain values and CONTROL law in this spec (force per "
+        "unit tracking error) as the reference for what a light vs firm press means on this hand. "
+        "c_self inside a channel binds each actuator to its own region's contact force"
+        + (f"; q_/v_ not available (no single-joint transmission): {', '.join(no_q)}" if no_q else "")
     )
     return signals, set(names), doc
 
@@ -686,13 +888,17 @@ def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
 def program_signal_fn(env: Any, program: dict[str, Any]) -> tuple[Callable, set[str]]:
     """The signal vocabulary for ONE program: raw observables + the program's own authored
     `signals: {name: expr}` (evaluated in insertion order; later signals may reference earlier
-    ones). Programs WITHOUT authored signals get the legacy derived vocabulary as well, so
-    archived candidates replay unchanged -- new candidates are expected to author their own."""
+    ones). `parameters` are scalar constants made available by name to every expression, so an
+    exploration/calibration pass can tune thresholds and gains without rewriting the structure.
+    Programs WITHOUT authored signals get the legacy derived vocabulary as well, so archived
+    candidates replay unchanged -- new candidates are expected to author their own."""
     raw_fn, raw_names, _doc = raw_signal_fn(env)
+    params = _parameter_values(program)
+    param_names = set(params)
     authored = program.get("signals")
     if isinstance(authored, dict) and authored:
         compiled: list[tuple[str, Callable]] = []
-        avail = set(raw_names)
+        avail = set(raw_names) | param_names
         for name, expr in authored.items():
             ev = compile_expr(str(expr), avail)  # raises -> validation rejects the candidate
             compiled.append((str(name), ev))
@@ -700,6 +906,8 @@ def program_signal_fn(env: Any, program: dict[str, Any]) -> tuple[Callable, set[
 
         def signals(obs: jp.ndarray) -> dict[str, jp.ndarray]:
             sig = raw_fn(obs)
+            for name, value in params.items():
+                sig[name] = jp.asarray(value, jp.float32)
             for name, ev in compiled:
                 sig[name] = jp.asarray(ev(sig), jp.float32)
             return sig
@@ -711,10 +919,33 @@ def program_signal_fn(env: Any, program: dict[str, Any]) -> tuple[Callable, set[
 
     def signals(obs: jp.ndarray) -> dict[str, jp.ndarray]:
         sig = raw_fn(obs)
+        for name, value in params.items():
+            sig[name] = jp.asarray(value, jp.float32)
         sig.update(legacy_fn(obs))
         return sig
 
-    return signals, raw_names | legacy_names
+    return signals, raw_names | legacy_names | param_names
+
+
+def _parameter_values(program: dict[str, Any]) -> dict[str, float]:
+    """Return scalar parameter values from a candidate's parameter schema.
+
+    Accepted forms:
+      {"p": 0.2}
+      {"p": {"init": 0.2, "range": [0.0, 1.0]}}
+      {"p": {"value": 0.2, "range": [0.0, 1.0]}}
+    The compiler uses the current value/init only; calibration code can rewrite these values.
+    """
+    out: dict[str, float] = {}
+    raw = program.get("parameters")
+    if not isinstance(raw, dict):
+        return out
+    for name, spec in raw.items():
+        if isinstance(spec, (int, float)):
+            out[str(name)] = float(spec)
+        elif isinstance(spec, dict):
+            out[str(name)] = float(spec.get("value", spec.get("init", 0.0)))
+    return out
 
 
 def actuator_obs_qpos_map(env: Any) -> list[int | None]:
@@ -761,31 +992,6 @@ def actuator_obs_qvel_map(env: Any) -> list[int | None]:
             out.append(base_off + base_vadr.index(vadr))
         elif vadr in hand_vadr:
             out.append(hand_off + hand_vadr.index(vadr))
-        else:
-            out.append(None)
-    return out
-
-
-def actuator_obs_qforce_map(env: Any) -> list[int | None]:
-    """Per actuator: the obs index of the CONSTRAINT FORCE on the joint it drives (base_f ++
-    hand_f block, i.e. qfrc_constraint -- ground-truth contact/limit load, zero in free air), or
-    None when the transmission is not a single joint. Mirrors actuator_obs_qpos_map."""
-    import mujoco
-    m = env.model
-    base_vadr = [int(a) for a in env.base_vadr]
-    hand_vadr = [int(a) for a in getattr(env, "hand_vadr", ())]
-    fb = (len(env.base_qadr) + len(base_vadr)
-          + len(getattr(env, "hand_qadr", ())) + len(hand_vadr))  # force block start
-    out: list[int | None] = []
-    for i in range(int(env.nu)):
-        if int(m.actuator_trntype[i]) != int(mujoco.mjtTrn.mjTRN_JOINT):
-            out.append(None)
-            continue
-        vadr = int(m.jnt_dofadr[int(m.actuator_trnid[i, 0])])
-        if vadr in base_vadr:
-            out.append(fb + base_vadr.index(vadr))
-        elif vadr in hand_vadr:
-            out.append(fb + len(base_vadr) + hand_vadr.index(vadr))
         else:
             out.append(None)
     return out
@@ -868,8 +1074,8 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     pushing stage k harder, which is exactly wrong when the stage is diverging the signal it acts
     on). So, restricted to timesteps where the stall stage is active, we report each generic
     signal's mean over the first vs second half of the episode, the raw gate values of the stall
-    stage and its successor over the same split, and a hard-blend self-lock flag (stall occupies
-    ~all steps and the successor is ~never reached => the argmax gate never yields).
+    stage and its successor over the same split, and a self-lock flag (stall occupies ~all steps
+    and the successor is ~never reached => under the hard one-stage selection the gate never wins).
     Purely structural -- no task labels -- so it generalizes to any staged prior on any task.
     """
     import re
@@ -877,7 +1083,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
 
     signals, signal_names = program_signal_fn(env, program)
     sig_keys = sorted(signal_names)
-    blend, tau = _blend_of(program)
+    tau = _tau_of(program)
     stages = list(program.get("stages", []))
     names = [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]
     gate_exprs = [str(st.get("gate", "1")) for st in stages]
@@ -907,7 +1113,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     def _all(o):
         sig = signals(o)
         gates = jp.asarray(jp.stack([g(sig) for g in gate_evs]), jp.float32)
-        w = blend_weights(gates, blend, tau)
+        w = blend_weights(gates, tau)
         succ = jp.stack([(jp.asarray(ev(sig), jp.float32) if ev is not None
                           else jp.asarray(0.0, jp.float32)) for ev in succ_evs])
         stage_act = []
@@ -1054,6 +1260,57 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     if reaches_terminal and n > 1:
         weakest = int(_np.argmin([h if h is not None else 1.0 for h in handoff[:-1]]))
 
+    # TIMING report: how long each stage actually occupies the rollout vs the author's estimate, so
+    # the reviser can tell "this hand-off never fires" (broken) apart from "this stage just runs too
+    # long and the rollout ends inside it" (slow -- speed it up / loosen its tolerance, don't rewrite
+    # the gate). Per-stage measured seconds = mean over episodes of dominant-step count * control_dt.
+    dt_s = float(getattr(env.cfg, "control_dt", 1.0))
+    episode_seconds = round(T * dt_s, 2)
+    active_counts = _np.stack([(active == i).sum(axis=0) for i in range(n)], axis=1)  # [E, n]
+    measured_seconds = [round(float(active_counts[:, i].mean()) * dt_s, 2) for i in range(n)]
+    ended_in = active[-1]                                           # [E] stage active at the last step
+    ended_in_frac = [round(float((ended_in == i).mean()), 4) for i in range(n)]
+    est_seconds = []
+    for st in stages:
+        v = st.get("est_seconds", st.get("expected_seconds"))
+        est_seconds.append(float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+    have_est = any(x is not None for x in est_seconds)
+    total_est = round(sum(x for x in est_seconds if x is not None), 2) if have_est else None
+    # Per-stage OVERRUN ratio (measured / author estimate): the reviser's clearest signal that a
+    # stage is far slower than intended -- a high ratio on a stage that DID run means its channel is
+    # crawling asymptotically toward its target, not that its gate is broken. Only meaningful where
+    # the stage was actually reached (measured > 0) and the author gave an estimate.
+    measured_vs_est = [
+        (round(measured_seconds[i] / est_seconds[i], 1)
+         if (est_seconds[i] and est_seconds[i] > 0 and measured_seconds[i] > 0) else None)
+        for i in range(n)]
+    worst_overrun = None
+    cand = [(measured_vs_est[i], i) for i in range(n) if measured_vs_est[i] is not None]
+    if cand:
+        r, i = max(cand)
+        if r >= 1.5:
+            worst_overrun = {"stage": i, "name": names[i], "ratio": r,
+                             "measured_seconds": measured_seconds[i], "est_seconds": est_seconds[i]}
+    time_report = {
+        "rollout_seconds": episode_seconds,
+        "per_stage_measured_seconds": measured_seconds,
+        "ended_in_stage_frac": ended_in_frac,
+        "authored_est_seconds": est_seconds,
+        "authored_total_est_seconds": total_est,
+        "fits_rollout": (bool(total_est <= episode_seconds) if total_est is not None else None),
+        "measured_vs_est_ratio": measured_vs_est,
+        "worst_overrun": worst_overrun,
+    }
+    # Time-limited stall: the flagged hand-off is likely SLOW not broken when the episode still ends
+    # inside the stall stage (or shallower) in a large fraction of runs, or the author's own estimate
+    # over-runs the budget. Surfaced so the reviser speeds stages up instead of rewriting a fine gate.
+    if stall is not None:
+        ended_at_or_before_stall = round(float((ended_in <= stall).mean()), 4)
+        time_report["stall_measured_seconds"] = measured_seconds[stall]
+        time_report["stall_ends_within_frac"] = ended_at_or_before_stall
+        time_report["stall_time_limited"] = bool(
+            ended_at_or_before_stall >= 0.4 or (total_est is not None and total_est > episode_seconds))
+
     out = {
         "stage_names": names,
         "occupancy": [round(x, 4) for x in occupancy],
@@ -1071,6 +1328,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
         "weakest_name": (names[weakest] if weakest is not None else None),
         "authored_success_frac": [round(x, 4) if x is not None else None for x in authored],
         "success_discrepancy": discrepancy,
+        "time_report": time_report,
         "body_motion": body_motion,
         "commanded_motion": {"units": "ctrl-units per second, |delta ctrl|/dt, mean over steps "
                                       "where the stage is dominant",
@@ -1214,6 +1472,6 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
         "stall_gate": {"expr": gate_exprs[k], "value_early_late": _early_late(gates_te[:, :, k])},
         "next_gate": {"index": nk, "name": names[nk], "expr": gate_exprs[nk],
                       "signals": next_sigs, "value_early_late": _early_late(gates_te[:, :, nk])},
-        "self_lock": bool(blend in ("hard", "softmax") and occupancy[k] >= 0.95 and reached[nk] <= 0.05),
+        "self_lock": bool(occupancy[k] >= 0.95 and reached[nk] <= 0.05),
     })
     return out

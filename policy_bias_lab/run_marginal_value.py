@@ -48,7 +48,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--task", default="grasp and lift a 5cm cube off the table")
-    ap.add_argument("--rep", choices=["dsl", "freeform"], default="freeform")
+    ap.add_argument("--rep", choices=["freeform"], default="freeform")
     ap.add_argument("--dof-mode", choices=["consider", "encourage"], default="encourage")
     ap.add_argument("--llm-backend", default="codex")
     ap.add_argument("--llm-model", default=None)

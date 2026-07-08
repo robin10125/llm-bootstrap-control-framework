@@ -28,10 +28,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--task", default="grasp and lift a 5cm cube off the table")
-    ap.add_argument("--rep", choices=["dsl", "freeform", "freeform_staged"], default="freeform",
+    ap.add_argument("--rep", choices=["freeform", "freeform_staged"], default="freeform",
                     help="output representation. freeform_staged = free-form prior with model-authored "
                     "stages (each its own gate + channels), generalizing the fixed 3-phase gate.")
-    ap.add_argument("--dof-mode", choices=["consider", "encourage"], default="encourage")
+    ap.add_argument("--dof-mode", choices=["consider"], default="consider")
     ap.add_argument("--llm-backend", default="codex")
     ap.add_argument("--llm-model", default=None)
     ap.add_argument("--budget", type=int, default=10,
@@ -60,8 +60,9 @@ def main() -> int:
     ap.add_argument("--eval-batches", type=int, default=1,
                     help="rollout batches per prior_only evaluation (mean objective; per-batch "
                          "spread reported -- variance control).")
-    ap.add_argument("--episode-seconds", type=float, default=2.5,
-                    help="env episode length (horizon = episode_seconds / control_dt).")
+    ap.add_argument("--episode-seconds", type=float, default=20.0,
+                    help="env episode length / rollout budget (horizon = episode_seconds / control_dt); "
+                         "the stage-timing fit check budgets against this value.")
     ap.add_argument("--terminate-on-success", type=float, default=None, metavar="SECONDS",
                     help="early termination for credit assignment: once the per-step success "
                          "metric holds this long, later steps carry no reward/value/loss.")

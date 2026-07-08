@@ -23,28 +23,23 @@ import numpy as np
 from policy_bias_lab.bias import compile_bias
 from policy_bias_lab.composed_priors import make_composed_prior_fn
 from policy_bias_lab.freeform_priors import (
-    DEFAULT_BLEND, MAX_EVALS, MAX_PROBES, addressed_actuators, all_actuator_names, _semantic_group,
+    MAX_EVALS, MAX_PROBES, addressed_actuators, all_actuator_names, _semantic_group,
 )
 from policy_bias_lab.llm_util import candidate_score
+from policy_bias_lab.prior_ir import normalize_candidate, structural_issues
 from policy_bias_lab.symbolic_control import sustained_bool
 
 
 def flatten_for_dofcheck(prog: dict, rep: str) -> dict:
-    """Flatten a program's phases/stages into a single rules/channels candidate for DOF accounting."""
+    """Flatten a program's phases/stages into a single channels candidate for DOF accounting."""
+    chans: list = []
     if rep == "freeform_staged":
-        chans: list = []
         for st in prog.get("stages", []):
             chans += list(st.get("channels", []))
-        return {"mode": "freeform", "channels": chans}
-    if rep == "freeform":
-        chans = []
+    else:  # freeform: stacked phase sub-priors, each a set of channels
         for s in prog["subpriors"]:
             chans += list(s.get("channels", []))
-        return {"mode": "freeform", "channels": chans}
-    rules: list = []
-    for s in prog["subpriors"]:
-        rules += list(s.get("rules", []))
-    return {"mode": "dsl", "rules": rules}
+    return {"mode": "freeform", "channels": chans}
 
 
 def validate_program(env: Any, cand: dict, rep: str,
@@ -55,22 +50,37 @@ def validate_program(env: Any, cand: dict, rep: str,
     movable; the model is only required to CONSIDER each -- accounting is reported separately).
     Reject only on a hard compile failure.
     """
+    cand, ir_issues = normalize_candidate(cand, rep)
+    for issue in ir_issues:
+        if issue.severity == "error":
+            if errors is not None:
+                errors.append(issue.message)
+            return None
+
+    static = structural_issues(env, cand, rep)
+    for issue in static:
+        if issue.severity == "error":
+            if errors is not None:
+                errors.append(issue.message)
+            return None
+
     if rep == "freeform_staged":
         stages = cand.get("stages")
         if not isinstance(stages, list) or not stages:
             if errors is not None:
                 errors.append(f"candidate {cand.get('name')!r}: no 'stages' list")
             return None
-        # Blend is NOT author-selectable: sharp softmax is the only gate semantics for new
-        # candidates (relu-norm "soft" degenerated into a static average and hard argmax chatters;
-        # see the 2026-07-03 blend comparison). Legacy soft/hard remain in blend_weights only so
-        # archived programs replay unchanged.
-        prog = {"mode": "freeform_staged", "blend": DEFAULT_BLEND, "stages": stages}
+        # Blend is NOT author-selectable: HARD one-stage selection (clip to [0,1] + argmax, exactly
+        # one stage active) is the only gate semantics -- chosen for strict no-overlap sequencing
+        # (orient-before-move). `temperature` is carried but vestigial (no longer softens selection).
+        prog = {"mode": "freeform_staged", "stages": stages}
         # LLM-authored derived signals (the only derived vocabulary; raw observables otherwise).
         # A candidate WITH `signals` compiles strictly against raw + its own names; compile
         # failures below reject it.
         if isinstance(cand.get("signals"), dict) and cand["signals"]:
             prog["signals"] = {str(k): str(v) for k, v in cand["signals"].items()}
+        if isinstance(cand.get("parameters"), dict) and cand["parameters"]:
+            prog["parameters"] = cand["parameters"]
         if cand.get("temperature") is not None:
             prog["temperature"] = float(cand["temperature"])
         # LLM-authored diagnostic probes ride on the program (measured by stage_occupancy; a bad

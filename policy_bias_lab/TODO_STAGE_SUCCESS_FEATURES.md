@@ -218,6 +218,34 @@ isolated the sub-prior representation. Secondary readout: whether hard blend's c
 separation makes the occupancy/hand-off diagnostics sharper enough to matter for the feedback loop.
 Until run, treat **soft as the default recommendation**.
 
+## Future feature — Pacing curriculum: learn the slow rollout, then learn it sped up
+
+**What.** Two-phase training over rollout length / pace. **Phase 1:** learn the task at a GENEROUS
+rollout (long episode, the prior's slow asymptotic pacing acceptable) so the policy actually reaches
+the terminal stage and gets the grasp/lift at all. **Phase 2:** progressively SHORTEN the episode
+budget (and/or tighten a pace/speed requirement) across a curriculum so the *same* accomplished
+behavior is compressed into the target 20 s budget. Separates "can it do the task at all" from "can
+it do it fast" — a slow-but-correct prior/policy is accelerated instead of discarded for missing the
+budget.
+
+**Why.** The timing/fit work (`est_seconds`, `time_report.measured_vs_est_ratio`, the `PACE`
+directive) makes a slow prior FAIL the 20 s rollout (later stages never run) even when the early
+behavior is correct. Those features *diagnose* slowness and push the author toward saturated
+(non-asymptotic) channels; this feature is the complementary *recovery* path — when the correct
+motion is inherently multi-stage and simply needs the budget first, learn it long, then compress.
+
+**Implementation sketch.** In the PPO arbiter / training loop (`evaluate_candidate_ppo`): a schedule
+that starts `episode_seconds` high (e.g. 40–60 s) and decays toward the target (20 s) as training
+progresses, advancing the compression only once the chain reaches terminal at the current horizon
+(use the existing `time_report` / conversion stats as the curriculum gate). Alternative lever: a
+reward term that increasingly rewards reaching each stage EARLIER. Stays task-agnostic — the
+curriculum is over the generic rollout-length/pace hyperparameter, never task nouns.
+
+**Feasibility: medium** (training-loop change; horizon is already a config hyperparam).
+**Usefulness: high for slow-but-correct priors** — the natural partner to the est_seconds/pace
+diagnostics: they DIAGNOSE slowness, this one RECOVERS from it by learning the fast version rather
+than requiring it be authored up front.
+
 ## Build order
 
 1. **Increment 1 (diagnostic):** Feature 1 + Feature 3 + Feature 6 — all in `stage_occupancy` +

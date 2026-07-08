@@ -10,14 +10,14 @@ $representation_doc
 
 $dof_requirement
 
-FAILURE MODES to steer away from and the upstream CONTEXT:
+The upstream CONTEXT (comprehensive body-action account + embodied procedure):
 $context_block
 
 The context above includes a moment-by-moment account of what COMPLETING this task looks like (the
-embodied procedure: its phases, contacts, budgets, and end conditions). Before choosing an edit,
-locate the measured behavior on that account: which phase does the policy actually reach, judged by
-the DIAGNOSTICS below (not by which gates fire)? Your edit should be the one that carries the
-behavior into the NEXT phase of that account.
+embodied procedure: its phases, interactions, budgets, forbidden motions/exploits, and per-phase
+observable exit conditions). Before choosing an edit, locate the measured behavior on that account:
+which phase does the policy actually reach, judged by the DIAGNOSTICS below (not by which gates
+fire)? Your edit should be the one that carries the behavior into the NEXT phase of that account.
 
 CURRENT CANDIDATE (program JSON):
 $candidate
@@ -32,18 +32,31 @@ CHANNELS asked for, per stage and actuator group (ctrl-units/s) -- compare it wi
 with the CONTROL law's units bridge to separate commanded aggression from passive drift. Read both
 against your intent -- decide yourself which motion is progress and which is a side effect of your
 channels, and revise accordingly.
+The stage report's `time_report` block is decisive for telling SLOW apart from STUCK. It gives, per
+stage, your `authored_est_seconds` vs the `per_stage_measured_seconds` it actually took, the
+`rollout_seconds` budget, and `ended_in_stage_frac` (how often the rollout ENDED inside each stage).
+If a hand-off looks broken but the rollout keeps ending inside that stage (`stall_time_limited`), or
+the measured seconds greatly exceed your estimate, the stage is TOO SLOW, not stuck: speed it up
+(drive fast and decelerate late, widen its handoff tolerance to a real margin) so later stages get
+rollout time -- do NOT rewrite a gate that would fire fine given more time. If `fits_rollout` is
+false, the whole chain is over-budget; cut the coarse stages' durations so it fits.
 One general principle: if you judge this to be a dexterous manipulation task, be gentle -- manage
 velocity and force EXPLICITLY: first contact at near-zero relative speed, a ceiling on contact
 force, and only the MINIMUM force each interaction needs (the spec's CONTROL law maps
 commanded-vs-measured gaps to applied force). A revision that gains objective by moving faster
 while the body_motion evidence shows it striking or displacing items is the wrong direction --
-keep the budgets as explicit signal/gate conditions.
+keep the budgets as explicit signal/gate conditions. AVOID BUMPING into other objects and surfaces
+unless the contact is INTENTIONAL: keep every part clear of anything it is not deliberately acting on
+-- use the body world-positions the spec exposes for clearance (a part's position lets you keep it a
+margin clear of a surface it must not touch) and the region-contact observables to catch a stray
+press, and add a clearance floor as a gate/channel condition where a stage risks it.
 
 WHERE THE POLICY STALLS (revise here):
 $stage_focus
 
-Diagnose what is limiting the objective from these diagnostics and the upstream failure modes, and
-make a focused change to fix the stalling stage named above. A stall usually means that stage's
+Diagnose what is limiting the objective from these diagnostics and the upstream procedure account
+(including its forbidden-motion/exploit notes), and make a focused change to fix the stalling stage
+named above. A stall usually means that stage's
 channels never drive the signals into the NEXT stage's gate condition (so the hand-off never fires),
 or the stage's own gate never activates -- fix whichever it is.
 
@@ -85,4 +98,9 @@ response shape (gentler, decelerating, or sign-corrected) or the gate hand-off i
 diagnostics list `prior_failed_revisions`, those edits were already tried and scored WORSE than the
 current candidate -- propose a genuinely different approach, not a variant of them. Keep
 weights conservative (<=0.6).
+
+Preserve the typed candidate structure: derived `signals` first, optional tunable `parameters`
+second, then stage `success` exit measurements, progress-ladder gates, channels, probes, and evals.
+Parameter names are scalar constants available in expressions; use `{init, range:[lo,hi]}` for any
+threshold or gain that should be calibrated empirically later.
 Return JSON ONLY: {"candidate": {name, rationale, $output_item, unused_dofs:[{actuator, reason}]}}

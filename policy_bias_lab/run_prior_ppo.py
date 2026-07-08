@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prior-logit-clip", type=float, default=0.95)
     p.add_argument("--success-hold-seconds", type=float, default=0.5)
     p.add_argument("--success-lift-threshold", type=float, default=0.05)
-    p.add_argument("--episode-seconds", type=float, default=2.5)
+    p.add_argument("--episode-seconds", type=float, default=5.0)
     p.add_argument("--control-dt", type=float, default=0.025)
     p.add_argument("--physics-dt", type=float, default=0.01)
     p.add_argument("--obj-xy-range", type=float, default=0.04)

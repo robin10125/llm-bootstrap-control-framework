@@ -2,9 +2,10 @@
 
 Pipeline, all grounded in robot-spec-derived vocabulary (no hardcoded ACTION_GROUPS):
 
-  Stage 0  context generation -- parallel single-job LLM calls (C1 execution account, C2 failure
-           modes, C3 kinematics, optional C4 human analogy). Outputs injected as CONTEXT; NOT
-           counted against the rollout budget.
+  Stage 0  context generation -- two chained LLM calls: C0 produces a comprehensive account of
+           completing the task with every robot body part, C1 expands it into a moment-by-moment
+           embodied procedure whose per-phase exit_conditions are validated to compile over the
+           observables. Outputs injected as CONTEXT; NOT counted against the rollout budget.
   Stage 2  diverse seed candidates -- one LLM call returns up to n_seeds genuinely different
            compilable candidates.
   Stage 3  empirical evaluation -- each candidate compiled + rolled out under the contact-gated
@@ -26,7 +27,6 @@ import pickle
 import re
 import signal
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -44,18 +44,141 @@ from policy_bias_lab.run_dsl_vs_freeform import OPERATORS, PHASES, fallback, _tm
 # Prompt assembly (shared spec block + staged single-job prompts)
 # ----------------------------------------------------------------------------------------------
 
+def _dir_words(v: list | None) -> str:
+    """Plain-language reading of a world unit vector [x, y, z] (+z up)."""
+    if not v:
+        return "unknown"
+    x, y, z = (v + [0, 0, 0])[:3]
+    if abs(z) >= 0.85:
+        return "straight down" if z < 0 else "straight up"
+    parts = []
+    has_vertical = abs(z) >= 0.3
+    if has_vertical:
+        parts.append("downward" if z < 0 else "upward")
+    for mag, lo, hi in ((x, "-x", "+x"), (y, "-y", "+y")):
+        if abs(mag) >= 0.3:
+            parts.append(hi if mag > 0 else lo)
+    if not parts:
+        return "horizontal"
+    return f"{'angled' if has_vertical else 'horizontal'} ({', '.join(parts)})"
+
+
+def _render_spawn_attitude(sa: dict) -> str:
+    """Readable SPAWN ATTITUDE block from the FK-derived spawn_attitude (data only, no task)."""
+    L = ["SPAWN ATTITUDE (home-pose orientation + which segments can reorient, from forward "
+         "kinematics; world axes [x, y, z], +z up, so [0,0,-1] = straight down at the table):"]
+    if sa.get("base_translation_only"):
+        L.append("  - BASE/FOREARM: moves by x/y/z translation ONLY and CANNOT change angle. The "
+                 f"forearm points {_dir_words(sa.get('forearm_points'))} {sa.get('forearm_points')} "
+                 "and that attitude is FIXED -- only the wrist and finger joints below can bend the "
+                 "hand; the base cannot reorient it.")
+    ha = sa.get("hand_points")
+    L.append(f"  - HAND as a whole: at spawn the wrist, palm and fingers START in line as one column "
+             f"pointing {_dir_words(ha)} {ha}. This is only the home pose: the wrist joints below "
+             "reorient this column away from that start -- see each wrist actuator's `motion` for its "
+             "world axis and the travel range it can rotate through.")
+    pn = sa.get("palm_face_normal")
+    if pn:
+        L.append(f"  - PALM face: at the home pose the flat of the palm faces {_dir_words(pn)} {pn} "
+                 "(the palm plane starts perpendicular to the table). The wrist joints turn the palm "
+                 "away from this starting facing within their `motion` ranges; work out from those "
+                 "ranges which facings are reachable and which are not.")
+    fp = sa.get("finger_points") or {}
+    if fp:
+        pretty = "; ".join(f"{k} {_dir_words(v)}" for k, v in fp.items())
+        L.append(f"  - FINGERS at spawn point: {pretty}. They are in line with the hand column and "
+                 "close by curling at their own joints (see each actuator's `motion`).")
+    wd = sa.get("wrist_directions") or []
+    for w in wd:
+        if w.get("role") == "flexion_extension":
+            L.append(f"  - WRIST {w['actuator']} is the FLEXION/EXTENSION joint: {w['flexion_sign']} is "
+                     f"FLEXION (bends the hand toward the side the palm faces) and {w['extension_sign']} "
+                     f"is EXTENSION (bends it the other way); EXTENSION here tilts the palm face toward "
+                     f"{w['extension_tilts_palm_toward']}. See its `motion` for the degree limits of each "
+                     "direction.")
+        elif w.get("role") == "deviation":
+            L.append(f"  - WRIST {w['actuator']} is a DEVIATION/ROLL joint: it {w['note']} -- use it to "
+                     "aim the hand side-to-side, not to change the palm's up/down facing.")
+    L.append("  - WORK WITHIN THE LIMITS: the home pose is where the hand STARTS, not necessarily the "
+             "pose it should work in. Each hinge `motion` gives that joint's travel in DEGREES; the "
+             "reachable orientation of a segment is exactly its home direction rotated within those "
+             "degree limits, and NO further -- an orientation outside that envelope cannot be reached "
+             "no matter how it is commanded. Before deciding how to make contact, compute the EXTREME "
+             "reachable orientations (drive each relevant joint to its limit) and design the whole "
+             "approach around the best reachable pose, even if that pose is far from the home pose and "
+             "not the textbook orientation for this kind of contact. Do not plan a motion that assumes "
+             "an unreachable orientation; make the reachable extreme do the job.")
+    return "\n".join(L) + "\n"
+
+
 def build_spec_block(rs: dict) -> str:
     """The robot/task/env injection block shared by every staged prompt (data only, no task)."""
     base_sign = {k: v["note"] for k, v in rs["base_world_sign"].items()}
+    attitude_block = _render_spawn_attitude(rs["spawn_attitude"]) if rs.get("spawn_attitude") else ""
+    pose_block = ""
+    if rs.get("initial_pose"):
+        pose_block = (
+            "INITIAL POSE (home target the servos hold at t=0; each q_<name> starts at ~ this "
+            "value, and the hand's spawn ORIENTATION is exactly whatever these joint angles "
+            "produce -- see SPAWN ATTITUDE below for what that orientation actually is). Reason "
+            "from these actual values: do NOT assume the spawn pose already presents the hand for "
+            "the interaction; if it does not, an early step must actively establish orientation "
+            "using the actuators that can.\n"
+            f"{json.dumps(rs['initial_pose'])}\n"
+        )
     return (
         "ROBOT ACTUATORS (every one is ACTIVELY MOVABLE by the prior vocabulary -- the motion basis "
-        "spans all DOF in both directions):\n"
+        "spans all DOF in both directions). Each entry's `motion` gives, at the home pose, the "
+        "WORLD-FRAME axis a positive q_/ctrl_ value moves the part about (hinge) or along (slide) "
+        "and the joint's travel range -- i.e. the physical DIRECTION each value indicates and the "
+        "SCALE of the bend:\n"
         f"{json.dumps(rs['actuators'], indent=1)}\n"
         f"SEMANTIC GROUPS: {json.dumps(rs['semantic_groups'])}\n"
         f"BASE WORLD-SIGN: {json.dumps(base_sign)}\n"
+        f"{attitude_block}"
+        f"{pose_block}"
         f"CONTROL: {json.dumps(rs['control_law'])}\n"
-        f"{rs['observables_doc']}"
+        + (f"ROLLOUT BUDGET: each evaluation is a single rollout of {rs['rollout_seconds']} seconds of "
+           "simulated time. The WHOLE staged prior runs in that one rollout, one stage at a time in "
+           "order, so the sum of all stages' durations must fit well inside this budget with time to "
+           "spare for the final stage. Budget your stages: a slow, asymptotically-settling positioning "
+           "stage can eat the entire rollout by itself and starve every later stage. Give each stage an "
+           "`est_seconds` (your estimate of how long it should take) and make sure they sum to less "
+           "than the budget.\n" if rs.get("rollout_seconds") else "")
+        + f"{rs['observables_doc']}"
     )
+
+
+def _render_body_actions(account: dict) -> str:
+    """Compact readable rendering of the comprehensive body-action context call."""
+    lines = [str(account.get("execution_account", "")).strip()]
+    for part in account.get("body_parts", []) or []:
+        lines.append(f"- {part.get('part')}: role={part.get('role')}; "
+                     f"moves_when={part.get('moves_when')}; holds_when={part.get('holds_when')}; "
+                     f"evidence={part.get('observable_evidence')}; "
+                     f"interference={part.get('observable_interference')}")
+    req = account.get("global_requirements") or []
+    if req:
+        lines.append("GLOBAL REQUIREMENTS:")
+        lines += [f"  - {x}" for x in req]
+    return "\n".join(l for l in lines if l)
+
+
+def _render_procedure(proc: dict) -> str:
+    """Compact readable rendering of the C1 procedure (vs raw pretty-JSON dump)."""
+    lines: list[str] = []
+    for i, ph in enumerate(proc.get("procedure", []) or []):
+        lines.append(f"PHASE {i} -- {ph.get('phase')}")
+        for f in ("moving", "still", "interactions", "contacts", "precision", "must_not", "end_when"):
+            if ph.get(f):
+                lines.append(f"  {f}: {ph[f]}")
+        if ph.get("exit_condition"):
+            lines.append(f"  exit_condition: {ph['exit_condition']}")
+    inv = proc.get("global_invariants") or []
+    if inv:
+        lines.append("GLOBAL INVARIANTS:")
+        lines += [f"  - {x}" for x in inv]
+    return "\n".join(lines)
 
 
 def _representation_doc(rep: str, rs: dict) -> str:
@@ -76,13 +199,18 @@ def _framework_doc(rep: str) -> str:
 
 def _output_item(rep: str) -> str:
     if rep == "freeform_staged":
-        return ("signals:{'<name>':'<expr over observables>'} (your derived-signal definitions), "
-                "stages:[{name, gate:'<expr>', success:'<expr>' (optional), "
+        return ("ir_version:1, "
+                "signals:{'<name>':'<expr over observables or earlier signals>'} "
+                "(your derived-signal definitions), "
+                "parameters:{'<name>':{init:<number>, range:[lo,hi]}} (optional tunable scalar "
+                "constants available by name in expressions), "
+                "stages:[{name, gate:'<expr>', success:'<expr>' (the stage exit measurement), "
+                "est_seconds:<number> (your estimate of how long this stage should take; all "
+                "stages must sum to well under the ROLLOUT BUDGET), "
                 "channels:[{actuators:[...], expr:'<expr>'}]}], "
                 "probes:[{name, expr, stage:'<stage name>' (optional)}] (optional, <=8), "
                 "evals:[{name, expr, when:'ever'|'end'}] (optional, <=8)")
-    field_name = "rules" if rep == "dsl" else "channels"
-    return (f"subpriors: [{{name, {field_name}:[...]}}] -- one per phase, in order: "
+    return (f"subpriors: [{{name, channels:[...]}}] -- one per phase, in order: "
             f"{', '.join(PHASES)}")
 
 
@@ -217,7 +345,8 @@ class AgenticOrchestrator:
                                      # EVERY authored stage is guaranteed that many improvement
                                      # attempts if it becomes the (poor) frontier. Overrides budget.
     eps: float = 1e-3                # improvement tolerance
-    use_human_analogy: bool = False  # C4 flag
+    use_human_analogy: bool = False  # deprecated no-op: Stage-0 now always starts with a generic
+                                     # comprehensive body-action account
     arbiter: str = "short_ppo"       # "short_ppo" (trained-success, the real objective) |
                                      # "prior_only" (untrained, one rollout batch -- pure prior
                                      # quality, no training/reward confound) | "open_loop" (legacy)
@@ -395,44 +524,76 @@ class AgenticOrchestrator:
         return _call_llm(self.llm_backend, prompt, model=self.llm_model,
                          log_dir=self.out_dir / "llm", tag=tag)
 
-    # -- Stage 0: parallel context -------------------------------------------------------------
+    # -- Stage 0: sequential context (C0 body-action account -> C1 embodied procedure) ----------
     def gather_context(self) -> str:
-        calls = [
-            ("context_procedure", "C0_procedure"),
-            ("context_execution", "C1_execution"),
-            ("context_failure_modes", "C2_failure_modes"),
-            ("context_kinematics", "C3_kinematics"),
-        ]
-        if self.use_human_analogy:
-            calls.append(("context_human_analogy", "C4_human_analogy"))
-
-        def run_one(tmpl_name: str, tag: str) -> tuple[str, dict | None, str]:
-            prompt = _tmpl(f"{tmpl_name}.md").substitute(
-                task=self.task, spec_block=self.spec_block)
-            txt = self._llm(prompt, tag)
-            return tag, parse_json_obj(txt), txt
-
-        results: dict[str, dict | None] = {}
-        with ThreadPoolExecutor(max_workers=len(calls)) as pool:
-            for tag, parsed, txt in pool.map(lambda c: run_one(*c), calls):
-                results[tag] = parsed
-                (self.out_dir / f"{tag}.json").write_text(json.dumps(parsed, indent=2)
-                                                          if parsed else (txt or ""))
-        self.log["context"] = results
-        # Assemble a readable CONTEXT block; fall back to a stub if a call returned nothing.
+        """Two chained calls: C0 produces a comprehensive body-action account; C1 expands it into
+        a moment-by-moment procedure whose per-phase exit_conditions are validated to COMPILE over
+        the observables (so the ladder's done_<stage> gates start from real, observable predicates).
+        Each call has a schema/quality gate with one retry."""
+        body = self._context_call(
+            "context_body_actions", "C0_body_actions",
+            dict(task=self.task, spec_block=self.spec_block),
+            required=("execution_account", "body_parts"))
+        body_block = _render_body_actions(body) if body else "(no body-action account produced)"
+        proc = self._context_call(
+            "context_procedure", "C1_procedure",
+            dict(task=self.task, spec_block=self.spec_block, body_account=body_block),
+            required=("procedure",), validate=self._validate_procedure)
+        self.log["context"] = {"C0_body_actions": body, "C1_procedure": proc}
         parts = []
-        labels = {
-            "C0_procedure": ("EMBODIED PROCEDURE ACCOUNT (moment-by-moment: what moves, what stays "
-                             "still, contacts, precision, forbidden motions)"),
-            "C1_execution": "PER-ACTUATOR EXECUTION ACCOUNT",
-            "C2_failure_modes": "FAILURE MODES / EXPLOITS TO AVOID",
-            "C3_kinematics": "KINEMATIC / AFFORDANCE ANALYSIS",
-            "C4_human_analogy": "HUMAN ANALOGY (DOF mapping)",
-        }
-        for tag, label in labels.items():
-            if tag in results and results[tag]:
-                parts.append(f"[{label}]\n{json.dumps(results[tag], indent=1)}")
+        if body:
+            parts.append("[COMPREHENSIVE BODY-ACTION ACCOUNT]\n" + body_block)
+        if proc:
+            parts.append("[EMBODIED PROCEDURE ACCOUNT (moment-by-moment: phases, contacts, "
+                         "budgets, forbidden motions, and a per-phase observable exit condition)]\n"
+                         + _render_procedure(proc))
         return "\n\n".join(parts) if parts else "(no upstream context available)"
+
+    def _context_call(self, tmpl_name: str, tag: str, subs: dict,
+                      required: tuple[str, ...] = (), validate=None) -> dict | None:
+        """One context LLM call behind a schema/quality gate with a single retry on failure.
+        Writes <tag>.json and returns the parsed dict (None if even the retry produced no JSON).
+        A validation failure that survives the retry is non-fatal -- context is best-effort."""
+        base = _tmpl(f"{tmpl_name}.md").substitute(**subs)
+        parsed: dict | None = None
+        note = ""
+        for attempt in range(2):
+            txt = self._llm(base if attempt == 0 else base + "\n" + note, tag)
+            parsed = parse_json_obj(txt)
+            errs = (["response was not valid JSON"] if not parsed
+                    else [f"missing required key {k!r}" for k in required if k not in parsed])
+            if not errs and validate is not None and parsed:
+                errs = validate(parsed)
+            if not errs:
+                break
+            note = ("NOTE: your previous response was rejected; fix these and resend JSON only:\n- "
+                    + "\n- ".join(errs[:6]))
+            print(f"  [context] {tag} rejected (attempt {attempt + 1}/2): {errs[0]}")
+        (self.out_dir / f"{tag}.json").write_text(json.dumps(parsed, indent=2) if parsed else "")
+        return parsed
+
+    def _validate_procedure(self, parsed: dict) -> list[str]:
+        """Quality gate for C1: every phase's exit_condition must COMPILE over the raw observables
+        (the point-1 fix -- prose end conditions were yielding un-observable / non-monotone
+        done_<stage> gates downstream). Compilation is the enforceable half; monotonicity /
+        not-true-at-spawn is asked for in the template but not checked here."""
+        from policy_bias_lab.freeform_priors import raw_obs_entries, compile_expr
+        names = {n for n, _ in raw_obs_entries(self.env)[0]}
+        phases = parsed.get("procedure") or []
+        if not phases:
+            return ["'procedure' is empty"]
+        errs: list[str] = []
+        for i, ph in enumerate(phases):
+            ec = ph.get("exit_condition")
+            if not ec:
+                errs.append(f"phase {i} ('{ph.get('phase')}') has no exit_condition")
+                continue
+            try:
+                compile_expr(str(ec), names)
+            except Exception as e:  # noqa: BLE001
+                errs.append(f"phase {i} ('{ph.get('phase')}') exit_condition {ec!r} does not "
+                            f"compile over the observables: {e}")
+        return errs[:6]
 
     # -- Stage 2: diverse seeds ----------------------------------------------------------------
     def generate_seeds(self, context_block: str, retry_note: str | None = None) -> list[dict]:
@@ -825,228 +986,323 @@ def _brief_diag(score: dict) -> dict:
     return {k: round(float(score.get(k, 0.0)), 4) for k in keys}
 
 
-def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
-    """Turn the stage-occupancy report into a focused revision directive (task-agnostic).
+# ----------------------------------------------------------------------------------------------
+# Stage-focus directive rendering (task-agnostic). Decomposed into: focus selection, the headline
+# + directive, and one small renderer per evidence type (collected in _EVIDENCE, applied in order).
+# Behaviour is intentionally byte-identical to the previous monolithic version (golden-master
+# tested) -- this is a structural split, not a rewording.
+# ----------------------------------------------------------------------------------------------
 
-    Points the LLM at the broken hand-off and asks for a single-stage edit so each refine is a
-    controlled ablation. `focus_side` picks which side of the hand-off to revise: "entry" = the
-    successor stage's gate/channels (tried first -- the cheap fix), "exit" = the stalling stage
-    itself (the rollback, after entry-side attempts were rejected; those attempts appear as
-    prior_failed_revisions in the diagnostics). None keeps the neutral either-side directive.
-    Falls back to a no-op line when there is no staged report.
-    """
-    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
-    rep = diagnostics.get("stage_report")
-    tr = diagnostics.get("training_report") or {}
-    train_note = ""
+def _pct(v) -> str:
+    return "?" if v is None else f"{100.0 * float(v):.0f}%"
+
+
+def _fmt(pair) -> str:
+    if not pair or pair[0] is None or pair[1] is None:
+        return "n/a"
+    return f"{pair[0]:+.3f} -> {pair[1]:+.3f}"
+
+
+def _train_note(tr: dict) -> str:
     if tr.get("verdict") == "undertrained":
         rising = ", ".join(tr.get("still_improving") or [])
-        train_note = (f"\nTRAINING BUDGET CAVEAT: the training curve was STILL RISING when the "
-                      f"budget ran out ({rising} improving mid->late training), so the low score "
-                      f"may reflect UNDER-TRAINING rather than a defect in the prior. Prefer a "
-                      f"MINIMAL change (or gate/hand-off polish) over restructuring -- do not "
-                      f"'fix' behavior the policy was still in the middle of learning.")
-    elif tr.get("verdict") == "converged":
-        train_note = ("\nTraining had CONVERGED (no metric still rising at budget end): the prior, "
-                      "not the training budget, is the limiter -- a real change is warranted.")
-    if not isinstance(rep, dict) or not rep.get("stage_names"):
-        return ("No per-stage report available; make one focused change against the diagnostics."
-                + train_note)
+        return (f"\nTRAINING BUDGET CAVEAT: the training curve was STILL RISING when the "
+                f"budget ran out ({rising} improving mid->late training), so the low score "
+                f"may reflect UNDER-TRAINING rather than a defect in the prior. Prefer a "
+                f"MINIMAL change (or gate/hand-off polish) over restructuring -- do not "
+                f"'fix' behavior the policy was still in the middle of learning.")
+    if tr.get("verdict") == "converged":
+        return ("\nTraining had CONVERGED (no metric still rising at budget end): the prior, "
+                "not the training budget, is the limiter -- a real change is warranted.")
+    return ""
+
+
+def _residence_table(rep: dict) -> str:
     names = rep["stage_names"]
     occ = rep.get("occupancy") or []
     reached = rep.get("reached_frac") or []
-    table = "; ".join(f"{i}:{names[i]} (occ={occ[i] if i < len(occ) else '?'}, "
-                      f"reached={reached[i] if i < len(reached) else '?'})" for i in range(len(names)))
-    def _pct(v):
-        return "?" if v is None else f"{100.0 * float(v):.0f}%"
+    return "; ".join(f"{i}:{names[i]} (occ={occ[i] if i < len(occ) else '?'}, "
+                     f"reached={reached[i] if i < len(reached) else '?'})" for i in range(len(names)))
 
-    handoff = rep.get("handoff_frac") or []
+
+def _directive(rep: dict, k: int, focus_side: str | None) -> str:
+    names = rep["stage_names"]
     entered = rep.get("entered_frac") or []
-    reverse = rep.get("reverse_frac") or []
-    conv = rep.get("conversion") or []
+    nxt = names[k + 1] if k + 1 < len(names) else "?"
+    entry_valid = k < len(entered) and entered[k] is not None and entered[k] >= 0.1
+    if focus_side == "entry" and entry_valid:
+        return (f"FOCUS = ENTRY side of the hand-off: revise ONLY stage {k + 1} ('{nxt}') -- its "
+                f"GATE (this hand-off's entry condition) and/or its channels -- so it takes over "
+                f"in the states stage {k} actually produces (see the signal table below). Return "
+                f"every OTHER stage byte-identical to the input.")
+    if focus_side == "exit":
+        return (f"FOCUS = EXIT side of the hand-off: the entry side (stage {k + 1}) was already "
+                f"tried and rejected -- see prior_failed_revisions in the diagnostics. Now revise "
+                f"ONLY stage {k} -- change WHAT IT DELIVERS: its channels (move the signals into "
+                f"the next gate's region) and/or its own gate (yield earlier or elsewhere). "
+                f"Return every OTHER stage byte-identical to the input.")
+    return (f"Revise ONLY stage {k} -- its gate (its exit/hand-off condition) and/or its "
+            f"channels -- so the policy can make the transition. Return every OTHER stage "
+            f"byte-identical to the input.")
 
-    def _directive(k: int) -> str:
-        nxt = names[k + 1] if k + 1 < len(names) else "?"
-        entry_valid = k < len(entered) and entered[k] is not None and entered[k] >= 0.1
-        if focus_side == "entry" and entry_valid:
-            return (f"FOCUS = ENTRY side of the hand-off: revise ONLY stage {k + 1} ('{nxt}') -- its "
-                    f"GATE (this hand-off's entry condition) and/or its channels -- so it takes over "
-                    f"in the states stage {k} actually produces (see the signal table below). Return "
-                    f"every OTHER stage byte-identical to the input.")
-        if focus_side == "exit":
-            return (f"FOCUS = EXIT side of the hand-off: the entry side (stage {k + 1}) was already "
-                    f"tried and rejected -- see prior_failed_revisions in the diagnostics. Now revise "
-                    f"ONLY stage {k} -- change WHAT IT DELIVERS: its channels (move the signals into "
-                    f"the next gate's region) and/or its own gate (yield earlier or elsewhere). "
-                    f"Return every OTHER stage byte-identical to the input.")
-        return (f"Revise ONLY stage {k} -- its gate (its exit/hand-off condition) and/or its "
-                f"channels -- so the policy can make the transition. Return every OTHER stage "
-                f"byte-identical to the input.")
 
+def _select_focus(rep: dict) -> tuple[str, int | None]:
+    """Pick the stage to focus on and the situation mode:
+    terminal_weakest | terminal_none | stall_none | flicker | stall_normal."""
     if rep.get("reaches_terminal"):
         k = rep.get("weakest_stage")
-        if k is None:
-            return (f"Stage residence [{table}]. The policy completes the stage chain; refine "
-                    f"whichever stage the diagnostics implicate, keep the others UNCHANGED."
-                    + train_note)
+        return ("terminal_none" if k is None else "terminal_weakest", k)
+    k = rep.get("stall_stage")
+    if k is None:
+        return ("stall_none", None)
+    # UNSTABLE ENTRY (flicker): the stall stage is entered but almost immediately loses dominance
+    # BACK to its predecessor. The broken boundary is then k-1 <-> k, not k -> k+1; entry-side
+    # edits to stage k+1 cannot fix it, so the directive overrides the focus side.
+    occ = rep.get("occupancy") or []
+    entered = rep.get("entered_frac") or []
+    reverse = rep.get("reverse_frac") or []
+    rev_in = reverse[k - 1] if (k >= 1 and k - 1 < len(reverse)
+                                and reverse[k - 1] is not None) else None
+    occ_k = occ[k] if k < len(occ) else None
+    ent_k = entered[k] if k < len(entered) else None
+    flicker = (rev_in is not None and ent_k and rev_in >= 0.5 * float(ent_k)
+               and occ_k is not None and float(occ_k) < 0.2 * float(ent_k))
+    return ("flicker" if flicker else "stall_normal", k)
+
+
+def _focus_headline(mode: str, k: int, rep: dict, table: str, focus_side: str | None) -> list[str]:
+    occ = rep.get("occupancy") or []
+    entered = rep.get("entered_frac") or []
+    reverse = rep.get("reverse_frac") or []
+    handoff = rep.get("handoff_frac") or []
+    conv = rep.get("conversion") or []
+    if mode == "terminal_weakest":
         rev = reverse[k] if k < len(reverse) else None
         rev_note = (f", and in {_pct(rev)} of episodes the policy FALLS BACK from stage {k + 1} to "
                     f"stage {k} (unstable hand-off)") if rev and rev >= 0.2 else ""
-        lines = [
+        return [
             f"Stage residence [{table}]. The policy COMPLETES the stage chain, but its WEAKEST "
             f"hand-off is stage {k} ('{rep.get('weakest_name')}') -> stage {k + 1}: only "
             f"{_pct(handoff[k] if k < len(handoff) else None)} of episodes make a dwell-qualified "
             f"transition{rev_note}.",
-            _directive(k)]
-    else:
-        k = rep.get("stall_stage")
-        if k is None:
-            return (f"Stage residence [{table}]. Make one focused change against the diagnostics."
-                    + train_note)
-        # UNSTABLE ENTRY (flicker): the stall stage is entered but almost immediately loses
-        # dominance BACK to its predecessor. The broken boundary is then k-1 <-> k, not k -> k+1;
-        # entry-side edits to stage k+1 cannot fix it, so the directive overrides the focus side.
-        rev_in = reverse[k - 1] if (k >= 1 and k - 1 < len(reverse)
-                                    and reverse[k - 1] is not None) else None
+            _directive(rep, k, focus_side)]
+    if mode == "flicker":
         occ_k = occ[k] if k < len(occ) else None
         ent_k = entered[k] if k < len(entered) else None
-        flicker = (rev_in is not None and ent_k and rev_in >= 0.5 * float(ent_k)
-                   and occ_k is not None and float(occ_k) < 0.2 * float(ent_k))
-        if flicker:
-            lines = [
-                f"Stage residence [{table}]. UNSTABLE ENTRY into stage {k} "
-                f"('{rep.get('stall_name')}'): it is entered in {_pct(ent_k)} of episodes but holds "
-                f"dominance for only {_pct(occ_k)} of steps, and in {_pct(rev_in)} of episodes the "
-                f"policy FALLS BACK to stage {k - 1} after entering. The stage {k - 1} <-> {k} "
-                f"boundary oscillates: stage {k - 1}'s gate retakes control in the states stage {k} "
-                f"produces (or stage {k}'s own channels immediately break its gate condition).",
-                f"FOCUS = this unstable boundary: revise stages {k - 1} and {k} COHERENTLY (edit "
-                f"menu option d) -- separate their gate conditions so each clearly dominates its own "
-                f"region, and make stage {k}'s channels KEEP its own gate condition true while the "
-                f"stage acts. Return every OTHER stage byte-identical to the input."]
-        else:
-            hand_line = ""
-            if k < len(entered) and k < len(handoff) and handoff[k] is not None:
-                hand_line = (f" Dwell-qualified: stage {k} is ENTERED in {_pct(entered[k])} of "
-                             f"episodes but HANDS OFF to stage {k + 1} in only {_pct(handoff[k])} "
-                             f"(conversion {_pct(conv[k] if k < len(conv) else None)}).")
-            lines = [
-                f"Stage residence [{table}]. The policy STALLS in stage {k} "
-                f"('{rep.get('stall_name')}'): it reliably reaches this stage but rarely advances "
-                f"to stage {k + 1}.{hand_line}",
-                _directive(k)]
+        rev_in = reverse[k - 1] if (k >= 1 and k - 1 < len(reverse)
+                                    and reverse[k - 1] is not None) else None
+        return [
+            f"Stage residence [{table}]. UNSTABLE ENTRY into stage {k} "
+            f"('{rep.get('stall_name')}'): it is entered in {_pct(ent_k)} of episodes but holds "
+            f"dominance for only {_pct(occ_k)} of steps, and in {_pct(rev_in)} of episodes the "
+            f"policy FALLS BACK to stage {k - 1} after entering. The stage {k - 1} <-> {k} "
+            f"boundary oscillates: stage {k - 1}'s gate retakes control in the states stage {k} "
+            f"produces (or stage {k}'s own channels immediately break its gate condition).",
+            f"FOCUS = this unstable boundary: revise stages {k - 1} and {k} COHERENTLY (edit "
+            f"menu option d) -- separate their gate conditions so each clearly dominates its own "
+            f"region, and make stage {k}'s channels KEEP its own gate condition true while the "
+            f"stage acts. Return every OTHER stage byte-identical to the input."]
+    # stall_normal
+    hand_line = ""
+    if k < len(entered) and k < len(handoff) and handoff[k] is not None:
+        hand_line = (f" Dwell-qualified: stage {k} is ENTERED in {_pct(entered[k])} of "
+                     f"episodes but HANDS OFF to stage {k + 1} in only {_pct(handoff[k])} "
+                     f"(conversion {_pct(conv[k] if k < len(conv) else None)}).")
+    return [
+        f"Stage residence [{table}]. The policy STALLS in stage {k} "
+        f"('{rep.get('stall_name')}'): it reliably reaches this stage but rarely advances "
+        f"to stage {k + 1}.{hand_line}",
+        _directive(rep, k, focus_side)]
 
-    # Dominance-success discrepancy (authored `success` expr vs the hand-off predicate).
+
+# -- Evidence renderers: each returns its line(s) for focus stage k, or None if not applicable. ----
+
+def _ev_discrepancy(rep: dict, diag: dict, k: int) -> str | None:
+    """Dominance-success discrepancy (authored `success` expr vs the hand-off predicate)."""
     disc = rep.get("success_discrepancy") or []
     asf = rep.get("authored_success_frac") or []
-    if k < len(disc) and disc[k]:
-        a = _pct(asf[k] if k < len(asf) else None)
-        h = _pct(handoff[k] if k < len(handoff) else None)
-        if disc[k] == "handoff_without_success":
-            lines.append(
-                f"DISCREPANCY: your own success test for stage {k} passes in only {a} of episodes "
+    handoff = rep.get("handoff_frac") or []
+    entered = rep.get("entered_frac") or []
+    if not (k < len(disc) and disc[k]):
+        return None
+    a = _pct(asf[k] if k < len(asf) else None)
+    h = _pct(handoff[k] if k < len(handoff) else None)
+    if disc[k] == "handoff_without_success":
+        return (f"DISCREPANCY: your own success test for stage {k} passes in only {a} of episodes "
                 f"even though the hand-off to stage {k + 1} fires in {h} -- either stage {k}'s gate "
                 f"hands off BEFORE the stage has done its job, or the success expression is wrong. "
                 f"Fix whichever is mistaken.")
-        elif disc[k] == "success_without_handoff":
-            lines.append(
-                f"DISCREPANCY: your success test for stage {k} passes in {a} of episodes but the "
+    if disc[k] == "success_without_handoff":
+        return (f"DISCREPANCY: your success test for stage {k} passes in {a} of episodes but the "
                 f"hand-off to stage {k + 1} fires in only {h} -- stage {k + 1}'s entry gate looks "
                 f"too strict; align it with the states where the success test holds.")
-        elif disc[k] == "entered_without_success":
-            lines.append(
-                f"DISCREPANCY: the terminal stage {k} is entered in {_pct(entered[k] if k < len(entered) else None)} "
+    if disc[k] == "entered_without_success":
+        return (f"DISCREPANCY: the terminal stage {k} is entered in {_pct(entered[k] if k < len(entered) else None)} "
                 f"of episodes but your success test passes in only {a} -- the stage runs without "
                 f"accomplishing its post-condition; fix its channels (or the success expression).")
+    return None
 
-    def _fmt(pair):
-        if not pair or pair[0] is None or pair[1] is None:
-            return "n/a"
-        return f"{pair[0]:+.3f} -> {pair[1]:+.3f}"
 
+def _ev_failure_attribution(rep: dict, diag: dict, k: int) -> str | None:
     fa = rep.get("failure_attribution")
-    if isinstance(fa, dict) and (fa.get("failure_rate") or 0) > 0.05:
-        by = fa.get("by_stage_at_first_failure") or {}
-        top = ", ".join(f"{nm} {100*v:.0f}%" for nm, v in
-                        sorted(by.items(), key=lambda kv: -kv[1])[:3])
-        lines.append(
-            f"TASK FAILURE SIGNAL: the task's mistake indicator fires in "
+    if not (isinstance(fa, dict) and (fa.get("failure_rate") or 0) > 0.05):
+        return None
+    by = fa.get("by_stage_at_first_failure") or {}
+    top = ", ".join(f"{nm} {100*v:.0f}%" for nm, v in
+                    sorted(by.items(), key=lambda kv: -kv[1])[:3])
+    return (f"TASK FAILURE SIGNAL: the task's mistake indicator fires in "
             f"{_pct(fa.get('failure_rate'))} of episodes; the stage IN CONTROL at the first "
             f"failing step: {top}. The mistake belongs to that stage's channels -- fixing it "
             f"outranks advancing the chain.")
 
+
+def _ev_skipped(rep: dict, diag: dict, k: int) -> str | None:
+    names = rep["stage_names"]
     skipped = rep.get("skipped_entry_stages") or []
-    if skipped:
-        lines.append(
-            f"Note: stage(s) {skipped} ({', '.join(repr(names[i]) for i in skipped)}) are SKIPPED "
+    if not skipped:
+        return None
+    return (f"Note: stage(s) {skipped} ({', '.join(repr(names[i]) for i in skipped)}) are SKIPPED "
             f"-- never dwell-entered while deeper stages run. That is gate arithmetic (another "
             f"gate wins in those states), NOT necessarily a failure: if the deeper chain performs, "
             f"leave the skipped stage alone rather than forcing it to dominate.")
-    pre = diagnostics.get("pretrained_prior")
-    if isinstance(pre, dict) and pre:
-        keys = ("success_rate", "grasp_rate", "reach_rate", "lift_reached_rate", "lift_max")
-        row = "; ".join(f"{m} {pre.get(m)} -> {diagnostics.get(m)}" for m in keys
-                        if pre.get(m) is not None or diagnostics.get(m) is not None)
-        lines.append(
-            f"PRE-TRAIN vs POST-TRAIN (prior alone at PPO iteration 0 -> after training): {row}. "
+
+
+def _ev_pretrain(rep: dict, diag: dict, k: int) -> str | None:
+    pre = diag.get("pretrained_prior")
+    if not (isinstance(pre, dict) and pre):
+        return None
+    keys = ("success_rate", "grasp_rate", "reach_rate", "lift_reached_rate", "lift_max")
+    row = "; ".join(f"{m} {pre.get(m)} -> {diag.get(m)}" for m in keys
+                    if pre.get(m) is not None or diag.get(m) is not None)
+    return (f"PRE-TRAIN vs POST-TRAIN (prior alone at PPO iteration 0 -> after training): {row}. "
             f"A weakness already present pre-train is a PRIOR defect; one that appears (or a "
             f"strength that vanishes) only after training implicates the reward/training side, "
             f"not the prior -- do not 'fix' the prior for it.")
+
+
+def _ev_signal_trend(rep: dict, diag: dict, k: int) -> str | None:
     trend = rep.get("stall_signal_trend")
-    if isinstance(trend, dict) and trend:
-        rows = "; ".join(f"{s} {_fmt(p)}" for s, p in trend.items())
-        lines.append(f"While stage {k} is active, mean signal values over the FIRST -> SECOND half "
-                     f"of the episode: {rows}.")
+    if not (isinstance(trend, dict) and trend):
+        return None
+    rows = "; ".join(f"{s} {_fmt(p)}" for s, p in trend.items())
+    return (f"While stage {k} is active, mean signal values over the FIRST -> SECOND half "
+            f"of the episode: {rows}.")
+
+
+def _ev_intent_execution(rep: dict, diag: dict, k: int) -> str | None:
     ie = [r for r in (rep.get("intent_execution") or []) if r.get("gap", 0) >= 0.05]
-    if ie:
-        rows = "; ".join(f"{r['actuator']}: stage commands {r['stage_cmd']:+.2f} but "
-                         f"{r['executed']:+.2f} executes (gap {r['gap']:.2f})" for r in ie[:4])
-        lines.append(f"EXECUTED vs INTENDED while stage {k} is active -- the blended action "
-                     f"differs from this stage's own channel commands on: {rows}. A large gap "
-                     f"means other stages' channels dilute or cancel this stage's intent there.")
+    if not ie:
+        return None
+    rows = "; ".join(f"{r['actuator']}: stage commands {r['stage_cmd']:+.2f} but "
+                     f"{r['executed']:+.2f} executes (gap {r['gap']:.2f})" for r in ie[:4])
+    return (f"EXECUTED vs INTENDED while stage {k} is active -- the blended action "
+            f"differs from this stage's own channel commands on: {rows}. A large gap "
+            f"means other stages' channels dilute or cancel this stage's intent there.")
+
+
+def _ev_tracking(rep: dict, diag: dict, k: int) -> str | None:
     tr_rows = [r for r in (rep.get("tracking") or [])
                if r.get("cmd_vs_measured_frac_of_range", 0) >= 0.15]
-    if tr_rows:
-        rows = "; ".join(f"{r['actuator']} {r['cmd_vs_measured_frac_of_range']:.2f}"
-                         for r in tr_rows[:4])
-        lines.append(f"COMMAND vs MEASURED position while stage {k} is active (mean |target - "
-                     f"actual| as a fraction of the actuator's range): {rows}. A persistent gap "
-                     f"means the joint is saturated, blocked by contact, or physically stopped -- "
-                     f"commanding it harder cannot close that gap.")
+    if not tr_rows:
+        return None
+    rows = "; ".join(f"{r['actuator']} {r['cmd_vs_measured_frac_of_range']:.2f}"
+                     for r in tr_rows[:4])
+    return (f"COMMAND vs MEASURED position while stage {k} is active (mean |target - "
+            f"actual| as a fraction of the actuator's range): {rows}. A persistent gap "
+            f"means the joint is saturated, blocked by contact, or physically stopped -- "
+            f"commanding it harder cannot close that gap.")
+
+
+def _ev_probes(rep: dict, diag: dict, k: int) -> str | None:
     pr = rep.get("probe_report")
-    if isinstance(pr, dict) and pr:
-        prows = []
-        for pname, e in pr.items():
-            if e.get("error"):
-                prows.append(f"{pname}: FAILED TO COMPILE ({e['error']})")
-            else:
-                el = e.get("early_late_mean") or [None, None]
-                scope = f" [stage {e['stage']}]" if e.get("stage") is not None else ""
-                prows.append(f"{pname}{scope} = {_fmt(el)} (min {e.get('min')}, max {e.get('max')})")
-        lines.append("YOUR PROBES (the measurements you requested, early -> late episode means): "
-                     + "; ".join(prows))
+    if not (isinstance(pr, dict) and pr):
+        return None
+    prows = []
+    for pname, e in pr.items():
+        if e.get("error"):
+            prows.append(f"{pname}: FAILED TO COMPILE ({e['error']})")
+        else:
+            el = e.get("early_late_mean") or [None, None]
+            scope = f" [stage {e['stage']}]" if e.get("stage") is not None else ""
+            prows.append(f"{pname}{scope} = {_fmt(el)} (min {e.get('min')}, max {e.get('max')})")
+    return ("YOUR PROBES (the measurements you requested, early -> late episode means): "
+            + "; ".join(prows))
+
+
+def _ev_next_gate(rep: dict, diag: dict, k: int) -> str | None:
     ng = rep.get("next_gate")
-    if isinstance(ng, dict):
-        pair = ng.get("value_early_late")
-        lines.append(f"The NEXT stage's gate is `{ng.get('expr')}` (signals it reads: "
-                     f"{', '.join(ng.get('signals') or []) or 'none'}); its raw value went "
-                     f"{_fmt(pair)} while stage {k} was active.")
-        if pair and pair[0] is not None and pair[1] is not None and pair[1] <= pair[0] + 1e-4:
-            lines.append(
-                "That gate value is NOT rising, so the current stage's channels are moving its "
-                "signals AWAY from the hand-off (or not moving them). Find the gate signal trending "
-                "the wrong way in the table above and change the stage so that signal reverses -- "
-                "when a signal diverges under the current channels, pushing the same direction "
-                "HARDER makes it worse; prefer a gentler or decelerating response, or reshape the "
-                "hand-off between the two gates, over raising magnitudes.")
-    if rep.get("self_lock"):
-        lines.append(
-            f"HARD-BLEND SELF-LOCK: stage {k} dominates ~100% of steps and stage {k + 1} is almost "
-            f"never reached -- with blend='hard' the argmax never yields, so no channel change alone "
-            f"can exit the stage. Fix the GATES: lower/narrow stage {k}'s gate or raise stage "
+    if not isinstance(ng, dict):
+        return None
+    pair = ng.get("value_early_late")
+    line = (f"The NEXT stage's gate is `{ng.get('expr')}` (signals it reads: "
+            f"{', '.join(ng.get('signals') or []) or 'none'}); its raw value went "
+            f"{_fmt(pair)} while stage {k} was active.")
+    if pair and pair[0] is not None and pair[1] is not None and pair[1] <= pair[0] + 1e-4:
+        line += ("\nThat gate value is NOT rising, so the current stage's channels are moving its "
+                 "signals AWAY from the hand-off (or not moving them). Find the gate signal trending "
+                 "the wrong way in the table above and change the stage so that signal reverses -- "
+                 "when a signal diverges under the current channels, pushing the same direction "
+                 "HARDER makes it worse; prefer a gentler or decelerating response, or reshape the "
+                 "hand-off between the two gates, over raising magnitudes.")
+    return line
+
+
+def _ev_self_lock(rep: dict, diag: dict, k: int) -> str | None:
+    if not rep.get("self_lock"):
+        return None
+    return (f"SELF-LOCK: stage {k} dominates ~100% of steps and stage {k + 1} is almost never "
+            f"reached -- under the hard one-stage selection stage {k}'s gate never yields, so no channel change "
+            f"alone can exit the stage. Fix the GATES: lower/narrow stage {k}'s gate or raise stage "
             f"{k + 1}'s gate over the states where the hand-off should occur (see the signal ranges "
             f"above), rather than strengthening stage {k}'s channels.")
-    # Edit-menu suggestion (menu defined in revise_candidate.md): smallest edit the evidence supports.
+
+
+def _ev_timing(rep: dict, diag: dict, k: int) -> str | None:
+    """Slow-vs-stuck: if the rollout ends INSIDE the stall stage (or the authored budget over-runs),
+    the hand-off is likely SLOW, not broken -- direct the fix at pace, not the gate."""
+    tr = rep.get("time_report") or {}
+    if not tr:
+        return None
+    budget = tr.get("rollout_seconds")
+    meas = tr.get("per_stage_measured_seconds") or []
+    k_meas = meas[k] if k < len(meas) else None
+    parts = []
+    # A SELF-LOCKED stage also ends the rollout inside itself, but that is structural (its gate can
+    # never yield), NOT slowness -- the self-lock renderer gives the correct "fix the gate" directive,
+    # so suppress the "just slow, speed it up" claim here to avoid contradicting it.
+    if tr.get("stall_time_limited") and not rep.get("self_lock"):
+        frac = tr.get("stall_ends_within_frac")
+        parts.append(
+            f"TIMING: this hand-off may be SLOW, not broken -- stage {k} occupies ~{k_meas}s of the "
+            f"{budget}s rollout and the episode still ends at or before stage {k} in "
+            f"{int((frac or 0) * 100)}% of runs. Prefer making the stalling stage (and any slow "
+            "earlier stage) FASTER -- BEFORE touching the gate. A coarse free-space positioning stage "
+            "should not need many seconds to settle.")
+    # Overrun ratio: the stage running farthest past its own est_seconds is the real time sink (it may
+    # be an EARLIER stage than the stall). Name it and prescribe the non-asymptotic channel forms.
+    wo = tr.get("worst_overrun")
+    if wo and not rep.get("self_lock"):
+        parts.append(
+            f"PACE: stage '{wo['name']}' ran {wo['ratio']}x its own est_seconds ({wo['measured_seconds']}s "
+            f"vs {wo['est_seconds']}s) -- a proportional servo `gain*(target - q)` decays its command as "
+            "q nears target, so it CRAWLS the last stretch and a tight/velocity-quiet exit waits out that "
+            "crawl. To make coarse free-space moves fast: (1) SATURATE -- raise the gain so `clip(gain*"
+            "(target-q) - damp*v, -vmax, vmax)` sits at +-vmax (constant cruise speed) for most of the "
+            "travel and only tapers in the last little bit; (2) hand off within a REAL margin and do NOT "
+            "require velocity ~ 0; (3) keep this ONLY for free-space positioning -- contact/dexterous "
+            "stages should stay gentle.")
+    total_est, fits = tr.get("authored_total_est_seconds"), tr.get("fits_rollout")
+    if total_est is not None and fits is False:
+        parts.append(
+            f"BUDGET: your own est_seconds sum to {total_est}s > the {budget}s rollout, so later "
+            "stages cannot be reached in time. Cut the earlier stages' durations (faster motion / "
+            "looser tolerances) so the whole chain fits with margin.")
+    return " ".join(parts) if parts else None
+
+
+def _ev_edit_menu(rep: dict, diag: dict, k: int) -> str | None:
+    """Smallest edit the evidence supports (menu defined in revise_candidate.md). Always emitted."""
+    tr = diag.get("training_report") or {}
     pair = (rep.get("next_gate") or {}).get("value_early_late") or [None, None]
     rising = (pair[0] is not None and pair[1] is not None
               and pair[1] > pair[0] + max(0.05 * abs(pair[0]), 1e-3))
@@ -1059,5 +1315,45 @@ def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
                 "approaching, so the boundary is likely misplaced")
     else:
         menu = "(a) reshape a channel's response (gentler / decelerating / sign-corrected)"
-    lines.append(f"Suggested EDIT MENU entry: {menu}.")
+    return f"Suggested EDIT MENU entry: {menu}."
+
+
+# Evidence renderers, applied in this fixed order (the order matters for the rendered prompt).
+_EVIDENCE = (_ev_timing, _ev_discrepancy, _ev_failure_attribution, _ev_skipped, _ev_pretrain,
+             _ev_signal_trend, _ev_intent_execution, _ev_tracking, _ev_probes, _ev_next_gate,
+             _ev_self_lock, _ev_edit_menu)
+
+
+def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
+    """Turn the stage-occupancy report into a focused revision directive (task-agnostic).
+
+    Points the LLM at the broken hand-off and asks for a single-stage edit so each refine is a
+    controlled ablation. `focus_side` picks which side of the hand-off to revise: "entry" = the
+    successor stage's gate/channels (tried first -- the cheap fix), "exit" = the stalling stage
+    itself (the rollback, after entry-side attempts were rejected; those attempts appear as
+    prior_failed_revisions in the diagnostics). None keeps the neutral either-side directive.
+    Falls back to a no-op line when there is no staged report.
+
+    Thin driver: pick the focus (_select_focus), render the headline + directive (_focus_headline),
+    then append each applicable evidence renderer in _EVIDENCE order.
+    """
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    rep = diagnostics.get("stage_report")
+    train_note = _train_note(diagnostics.get("training_report") or {})
+    if not isinstance(rep, dict) or not rep.get("stage_names"):
+        return ("No per-stage report available; make one focused change against the diagnostics."
+                + train_note)
+    table = _residence_table(rep)
+    mode, k = _select_focus(rep)
+    if mode == "terminal_none":
+        return (f"Stage residence [{table}]. The policy completes the stage chain; refine "
+                f"whichever stage the diagnostics implicate, keep the others UNCHANGED." + train_note)
+    if mode == "stall_none":
+        return (f"Stage residence [{table}]. Make one focused change against the diagnostics."
+                + train_note)
+    lines = _focus_headline(mode, k, rep, table, focus_side)
+    for render in _EVIDENCE:
+        line = render(rep, diagnostics, k)
+        if line:
+            lines.append(line)
     return "\n".join(lines) + train_note
