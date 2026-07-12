@@ -8,7 +8,7 @@ What it changes:
 - Simulator state is carried from one fragment to the next until the full episode horizon is tiled.
 - Dense shaping comes from each staged prior's own `success` expression, using progress in that expression's sigmoid potential plus a small threshold-crossing bonus.
 - The policy emits extra control outputs that map to a `[0, 1]` prior **strength** scale via `clip(bias + gain*out, 0, 1)` (defaults `bias=gain=1`), so it starts at exactly `1.0` (full prior) at init and the controller can scale it all the way down to `0` when the residual policy no longer needs it. This scales only the prior's action strength -- the prior's gates, limits, and stage conditions are unaffected.
-  - `--prior-scale-mode` sets the granularity: `scalar` (one knob for the whole prior, default), `group` (one knob per **semantic actuator group** -- `base_xy`, `base_z`, `wrist`, `thumb`, `index`, `middle`, `ring`, `little` -- so the policy can hold the prior on the fingers while releasing `base_z` to lift, without dissolving the prior into per-joint noise), or `per_joint` (one knob per actuator; most expressive, weakest prior). Per-group means are reported in `eval_prior_scale_group_means` and each training row's `prior_scale_group_means`.
+  - `--prior-scale-mode` sets the granularity: `group` by default (one knob per **semantic actuator group**, mechanically derived from the robot actuator names), `scalar` (one knob for the whole prior, mainly for replay compatibility), or `per_joint` (one knob per actuator; most expressive, weakest prior). Per-group means are reported in `eval_prior_scale_group_means` and each training row's `prior_scale_group_means`.
 
 Run example:
 

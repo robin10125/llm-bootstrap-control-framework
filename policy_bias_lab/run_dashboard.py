@@ -164,12 +164,24 @@ def bar_chart(title: str, groups: list[str], series: list[dict], *, w: int = 520
 # Payload -> page
 # ----------------------------------------------------------------------------------------------
 
-def _rec_frontier(rec: dict) -> int | None:
+def _rec_frontier(rec: dict, completion_frac: float = 0.25) -> int | None:
     sr = (rec.get("diagnostics") or {}).get("stage_report")
     if not isinstance(sr, dict) or not sr.get("stage_names"):
         return None
+    names = sr.get("stage_names") or []
+    entered = sr.get("entered_frac")
+    handoff = sr.get("handoff_frac")
+    threshold = max(0.0, min(1.0, float(completion_frac)))
+    if entered and handoff and len(entered) == len(names):
+        if entered[0] is None or float(entered[0]) < threshold:
+            return 0
+        d = 0
+        while (d < len(names) - 1 and d < len(handoff) and handoff[d] is not None
+               and float(handoff[d]) >= threshold):
+            d += 1
+        return len(names) if d == len(names) - 1 else d
     if sr.get("reaches_terminal"):
-        return len(sr["stage_names"])
+        return len(names)
     s = sr.get("stall_stage")
     return None if s is None else int(s)
 
@@ -205,7 +217,8 @@ def _guidance(config: dict, state: dict, evaluated: list[dict]) -> list[str]:
                    f"(rising: {', '.join(tr.get('still_improving') or [])}) -- scores may be "
                    "understating the priors; consider resuming with a larger --ppo-train-seconds.")
     recent = evaluated[-3:]
-    fr = [f for f in (_rec_frontier(r) for r in recent) if f is not None]
+    completion_frac = float(config.get("frontier_completion_frac", 0.25))
+    fr = [f for f in (_rec_frontier(r, completion_frac) for r in recent) if f is not None]
     if len(fr) >= 2 and fr[-1] > fr[0]:
         out.append(f"Stage frontier advanced recently ({fr[0]} -> {fr[-1]}): structural progress "
                    f"is still happening -- worth continuing.")
@@ -229,6 +242,7 @@ def build_dashboard(payload: dict) -> str:
     budget = state.get("budget", config.get("budget", 0))
     iters = state.get("iters", 0)
     patience = state.get("patience", config.get("patience", 3))
+    completion_frac = float(config.get("frontier_completion_frac", 0.25))
 
     # -- header stats ---------------------------------------------------------------------------
     best = max(evaluated, key=lambda r: r.get("objective", -1e18)) if evaluated else None
@@ -296,7 +310,7 @@ def build_dashboard(payload: dict) -> str:
     fr_by_chain: dict[str, list] = {}
     n_stages_max = 0
     for r in evaluated:
-        f = _rec_frontier(r)
+        f = _rec_frontier(r, completion_frac)
         if f is None:
             continue
         sr = (r.get("diagnostics") or {}).get("stage_report") or {}
@@ -352,7 +366,7 @@ def build_dashboard(payload: dict) -> str:
         d = r.get("diagnostics") or {}
         fm = d.get("likely_failure_modes")
         fm = ", ".join(f.split(" ")[0] for f in fm) if isinstance(fm, list) else "--"
-        f = _rec_frontier(r)
+        f = _rec_frontier(r, completion_frac)
         rows_html.append(
             f"<tr><td>{r['iter']}</td><td>{html.escape(str(r.get('source')))}</td>"
             f"<td>{html.escape(str(r.get('name')))}</td><td>{r.get('objective', 0):+.4f}</td>"

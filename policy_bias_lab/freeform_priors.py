@@ -3,8 +3,8 @@
 For the preliminary experiment comparing a constrained robot-derived DSL against a free-form
 symbolic representation (see PRELIM_dsl_vs_freeform.md). A free-form candidate gives, per channel
 (a set of named actuators), a symbolic EXPRESSION for the mean-shift over observable signals; a
-restricted AST evaluator compiles it into a stateless JAX ``fn(obs, weights) -> mean_shift`` (same
-contract as composed_priors, so PPO/the scorer use it unchanged).
+restricted AST evaluator compiles it into JAX prior functions. Flat/free-form laws remain stateless;
+staged laws may also expose a rollout-carried stage cursor so normal stage progress is monotone.
 
 Two shared utilities live here too:
   - ``robot_spec(env)``: enumerate ALL actuators/DOF (name, joint, range, driven body, world-sign)
@@ -517,11 +517,12 @@ def compile_expr(src: str, signal_names: set[str]) -> Callable[[dict[str, jp.nda
 
 
 # Per-actuator SELF observables, available ONLY inside channel expressions: bound, per actuator in
-# the channel's set, to that actuator's own commanded target / measured joint position (the same
-# quantities as ctrl_<name>/q_<name>, resolved mechanically from the obs layout). One channel can
-# thereby give each of its actuators an individual reactive response -- without this, per-joint
-# shapes need one channel per actuator, which no candidate can afford to author.
-CHANNEL_SELF_SIGNALS = {"ctrl_self", "q_self", "v_self", "c_self"}
+# the channel's set, to that actuator's own commanded target / measured joint position / contact
+# region (the same quantities as ctrl_<name>/q_<name>/c_<region>/env_c_<region>, resolved
+# mechanically from the obs layout). One channel can thereby give each of its actuators an
+# individual reactive response -- without this, per-joint shapes need one channel per actuator,
+# which no candidate can afford to author.
+CHANNEL_SELF_SIGNALS = {"ctrl_self", "q_self", "v_self", "c_self", "env_c_self"}
 
 
 def _compile_channel(env: Any, ch: dict, signal_names: set[str],
@@ -553,27 +554,29 @@ def _compile_channel(env: Any, ch: dict, signal_names: set[str],
                              "observable: " + ", ".join(missing))
         return jp.asarray([obs_idx[f"{prefix}_{an}"] for an in names], jp.int32)
 
-    def _contact_idx():
-        # c_self binds each actuator to its hand region's CONTACT-force observable (c_<region>).
-        # Base-carriage actuators have no contact region, so c_self is a compile error there.
+    def _contact_idx(prefix: str, self_name: str):
+        # *_self binds each actuator to its hand region's CONTACT-force observable
+        # (<prefix>_<region>). Base-carriage actuators have no contact region, so this is a compile
+        # error there.
         cols, missing = [], []
         for an in names:
             reg = _contact_region_of_actuator(an)
-            key = f"c_{reg}" if reg else None
+            key = f"{prefix}_{reg}" if reg else None
             if key is None or key not in obs_idx:
                 missing.append(an)
             else:
                 cols.append(obs_idx[key])
         if missing:
-            raise ValueError("c_self is not available for actuators with no contact region "
+            raise ValueError(f"{self_name} is not available for actuators with no contact region "
                              "(e.g. the base carriage): " + ", ".join(missing))
         return jp.asarray(cols, jp.int32)
 
     q_idx = _self_idx("q") if "q_self" in self_used else None
     v_idx = _self_idx("v") if "v_self" in self_used else None
-    c_idx = _contact_idx() if "c_self" in self_used else None
+    c_idx = _contact_idx("c", "c_self") if "c_self" in self_used else None
+    env_c_idx = _contact_idx("env_c", "env_c_self") if "env_c_self" in self_used else None
 
-    def ev_self(obs, sig, _ev=ev, _c=ctrl_idx, _q=q_idx, _v=v_idx, _cf=c_idx):
+    def ev_self(obs, sig, _ev=ev, _c=ctrl_idx, _q=q_idx, _v=v_idx, _cf=c_idx, _ecf=env_c_idx):
         s = dict(sig)
         s["ctrl_self"] = obs[_c]
         if _q is not None:
@@ -582,6 +585,8 @@ def _compile_channel(env: Any, ch: dict, signal_names: set[str],
             s["v_self"] = obs[_v]
         if _cf is not None:
             s["c_self"] = obs[_cf]
+        if _ecf is not None:
+            s["env_c_self"] = obs[_ecf]
         return _ev(s)
 
     return idx, ev_self
@@ -695,8 +700,53 @@ def blend_weights(gates: jp.ndarray, tau: float = DEFAULT_BLEND_TAU) -> jp.ndarr
     return jax.nn.one_hot(idx, n, dtype=gates.dtype)
 
 
+def stage_progression_mode(program: dict[str, Any]) -> str:
+    """Stage cursor semantics for freeform_staged programs.
+
+    Default is monotone: ordinary stages may advance but not regress. A legacy/reactive mode remains
+    available for archived programs or explicit experiments that need pure current-observation gates.
+    """
+    mode = str(program.get("stage_progression", program.get("progression", "monotone"))).lower()
+    return "reactive" if mode in {"reactive", "stateless"} else "monotone"
+
+
+def advance_stage_index(gates: jp.ndarray, prev_stage: jp.ndarray, tau: float = DEFAULT_BLEND_TAU,
+                        *, mode: str = "monotone") -> jp.ndarray:
+    """Return the selected stage index under the program's cursor semantics.
+
+    The raw stage is still the authored hard-argmax gate result. Monotone progression treats it as an
+    advancement request: it can keep the current stage or move to the next reached frontier, but a
+    current-signal regression cannot reopen an already-passed stage.
+    """
+    n = int(gates.shape[0])
+    if n == 0:
+        return jp.asarray(0, jp.int32)
+    raw = jp.argmax(jp.clip(gates, 0.0, 1.0)).astype(jp.int32)
+    if mode == "reactive":
+        return raw
+    prev = jp.clip(prev_stage.astype(jp.int32), 0, n - 1)
+    return jp.minimum(jp.maximum(prev, raw), jp.minimum(prev + 1, n - 1))
+
+
 def _tau_of(program: dict[str, Any]) -> float:
     return float(program.get("temperature", DEFAULT_BLEND_TAU))
+
+
+def _compile_staged_components(env: Any, program: dict[str, Any]):
+    action_dim = int(env.action_size)
+    signals, signal_names = program_signal_fn(env, program)
+    obs_idx = dict(raw_obs_entries(env)[0])
+    tau = _tau_of(program)
+    progression = stage_progression_mode(program)
+    stages = list(program.get("stages", []))
+    compiled: list[tuple[Callable, list[tuple[jp.ndarray, Callable]]]] = []
+    for st in stages:
+        gate_ev = compile_expr(str(st.get("gate", "1")), signal_names)
+        chans = [_compile_channel(env, ch, signal_names, obs_idx)
+                 for ch in st.get("channels", [])]
+        compiled.append((gate_ev, chans))
+    names = [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]
+    return action_dim, signals, signal_names, tau, progression, stages, compiled, names
 
 
 def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
@@ -705,8 +755,9 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
 
     Generalizes the fixed 3-phase near/gripped stacked gate: arbitrary stage count and author-defined
     transitions, expressed symbolically over the same signals as the channels. Stages are combined
-    STATELESSLY -- pure functions of the CURRENT signals, no phase latch/pointer/hysteresis (PPO
-    recomputes the prior on shuffled minibatches, so any hidden state breaks the importance ratio).
+    by default with a rollout-carried monotone stage cursor; legacy/reactive mode can still select
+    purely from current gates. PPO uses the cursor only during rollout collection, not in minibatch
+    loss recomputation.
 
     program = {"mode":"freeform_staged", "temperature": <tau>,
                "stages":[{"name", "gate":"<expr>", "channels":[{actuators, expr}, ...]}, ...]}
@@ -714,17 +765,8 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
     exactly one stage active (the only blend; see blend_weights()). `temperature` is vestigial.
     Per-stage gains are the tunable `weights` vector (default ones).
     """
-    action_dim = int(env.action_size)
-    signals, signal_names = program_signal_fn(env, program)
-    obs_idx = dict(raw_obs_entries(env)[0])
-    tau = _tau_of(program)
-    stages = list(program.get("stages", []))
-    compiled: list[tuple[Callable, list[tuple[jp.ndarray, Callable]]]] = []
-    for st in stages:
-        gate_ev = compile_expr(str(st.get("gate", "1")), signal_names)
-        chans = [_compile_channel(env, ch, signal_names, obs_idx)
-                 for ch in st.get("channels", [])]
-        compiled.append((gate_ev, chans))
+    action_dim, signals, _signal_names, tau, progression, stages, compiled, names = (
+        _compile_staged_components(env, program))
     n = len(compiled)
 
     def _stage_out(chans, obs, sig):
@@ -744,9 +786,43 @@ def make_freeform_staged_prior_fn(env: Any, program: dict[str, Any]):
             out = out + (w[i] * gains[i]) * _stage_out(chans, obs, sig)
         return jp.clip(out, -1.0, 1.0)
 
-    info = {"mode": "freeform_staged", "blend": "argmax_onehot", "n_stages": n, "n_weights": n,
-            "stage_names": [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]}
+    info = {"mode": "freeform_staged", "blend": "argmax_onehot", "stage_progression": progression,
+            "n_stages": n, "n_weights": n, "stage_names": names}
     return prior_fn, jp.ones((n,), jp.float32), info
+
+
+def make_freeform_staged_step_fn(env: Any, program: dict[str, Any]):
+    """Compile a rollout-stateful freeform_staged prior step.
+
+    Returns step_fn(obs, weights, prev_stage) -> (action, new_stage). This is used during actual
+    rollouts so stage progress can be monotone without adding task-specific state to the environment
+    observation or changing authored signal vocabulary.
+    """
+    action_dim, signals, _signal_names, tau, progression, _stages, compiled, names = (
+        _compile_staged_components(env, program))
+    n = len(compiled)
+
+    def _stage_out(chans, obs, sig):
+        out = jp.zeros((action_dim,), jp.float32)
+        for idx, ev in chans:
+            out = out.at[idx].add(jp.clip(ev(obs, sig), -1.0, 1.0))
+        return out
+
+    def step_fn(obs, weights, prev_stage):
+        gains = jp.ones((n,), jp.float32) if weights is None else jp.asarray(weights, jp.float32)[:n]
+        sig = signals(obs)
+        gates = jp.stack([g(sig) for g, _ in compiled]) if n else jp.zeros((0,), jp.float32)
+        gates = jp.asarray(gates, jp.float32)
+        stage_idx = advance_stage_index(gates, jp.asarray(prev_stage, jp.int32), tau, mode=progression)
+        w = jax.nn.one_hot(stage_idx, n, dtype=jp.float32) if n else jp.zeros((0,), jp.float32)
+        out = jp.zeros((action_dim,), jp.float32)
+        for i, (_g, chans) in enumerate(compiled):
+            out = out + (w[i] * gains[i]) * _stage_out(chans, obs, sig)
+        return jp.clip(out, -1.0, 1.0), stage_idx
+
+    info = {"mode": "freeform_staged", "blend": "argmax_onehot", "stage_progression": progression,
+            "n_stages": n, "n_weights": n, "stage_names": names}
+    return step_fn, jp.ones((n,), jp.float32), info
 
 
 def make_stage_weight_fn(env: Any, program: dict[str, Any]):
@@ -759,6 +835,7 @@ def make_stage_weight_fn(env: Any, program: dict[str, Any]):
     """
     signals, signal_names = program_signal_fn(env, program)
     tau = _tau_of(program)
+    progression = stage_progression_mode(program)
     stages = list(program.get("stages", []))
     gate_evs = [compile_expr(str(st.get("gate", "1")), signal_names) for st in stages]
     n = len(gate_evs)
@@ -812,14 +889,18 @@ def raw_obs_entries(env: Any) -> tuple[list[tuple[str, int]], list[str]]:
         entries.append((f"obj_rel_{axes[i]}", n_pre + 9 + i))
     for i, an in enumerate(act_names):
         entries.append((f"ctrl_{an}", n_pre + 12 + i))
-    # Per-region CONTACT force block (the entries just before obj_pos): c_thumb..c_palm.
+    # Per-region CONTACT force blocks (the entries just before obj_pos): object contact
+    # c_thumb..c_palm, optionally preceded by non-object environment contact env_c_thumb..env_c_palm.
     groups = list(getattr(env, "contact_groups", ()))
+    env_groups = list(getattr(env, "env_contact_groups", ()))
+    for k, g in enumerate(env_groups):
+        entries.append((f"env_c_{g}", n_pre - len(groups) - len(env_groups) + k))
     for k, g in enumerate(groups):
         entries.append((f"c_{g}", n_pre - len(groups) + k))
     # World-frame BODY POSITION block: <body>_x/y/z for every robot body, sitting immediately BEFORE
-    # the contact block (see _observe). Indexed tail-relative so it self-corrects with obs_size.
+    # the contact blocks (see _observe). Indexed tail-relative so it self-corrects with obs_size.
     body_names = list(getattr(env, "body_pos_names", ()))
-    body_start = n_pre - len(groups) - 3 * len(body_names)
+    body_start = n_pre - len(groups) - len(env_groups) - 3 * len(body_names)
     for j, bn in enumerate(body_names):
         for a in range(3):
             entries.append((f"{bn}_{axes[a]}", body_start + 3 * j + a))
@@ -837,7 +918,8 @@ def raw_obs_entries(env: Any) -> tuple[list[tuple[str, int]], list[str]]:
 
 def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
     """RAW observables only, mechanically enumerated from the env/robot: world positions and
-    velocities present in obs, commanded actuator targets, and measured joint positions.
+    velocities present in obs, contact-force sensors, commanded actuator targets, and measured joint
+    positions.
 
     NO derived quantities live here -- distances, proximity gates, closure fractions, alignment
     measures are TASK STRUCTURE and must be LLM-authored per candidate (`signals` on the program;
@@ -879,7 +961,13 @@ def raw_signal_fn(env: Any) -> tuple[Callable, set[str], str]:
         "rises the instant a region presses the object and grows with how hard it presses. It is "
         "in newtons; use the per-actuator servo_gain values and CONTROL law in this spec (force per "
         "unit tracking error) as the reference for what a light vs firm press means on this hand. "
-        "c_self inside a channel binds each actuator to its own region's contact force"
+        "c_self inside a channel binds each actuator to its own region's object-contact force\n"
+        "  env_c_<region>: measured NORMAL CONTACT FORCE (N) between that hand region and non-object "
+        "environment geometry, regions = " + ", ".join(getattr(env, "env_contact_groups", ())) +
+        ". It is separate from c_<region>: object contact does not raise env_c_<region>, and "
+        "environment contact does not raise c_<region>. It is sensory data for authoring explicit "
+        "environment-contact conditions, budgets, probes, evals, or channels. env_c_self inside a "
+        "channel binds each actuator to its own region's environment-contact force"
         + (f"; q_/v_ not available (no single-joint transmission): {', '.join(no_q)}" if no_q else "")
     )
     return signals, set(names), doc
@@ -1084,6 +1172,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     signals, signal_names = program_signal_fn(env, program)
     sig_keys = sorted(signal_names)
     tau = _tau_of(program)
+    progression = stage_progression_mode(program)
     stages = list(program.get("stages", []))
     names = [str(s.get("name", f"stage_{i}")) for i, s in enumerate(stages)]
     gate_exprs = [str(st.get("gate", "1")) for st in stages]
@@ -1130,9 +1219,20 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     flat = arr.reshape(T * E, -1)
     w, gates, sigv, succv, actv = (
         _np.asarray(x) for x in jax.jit(jax.vmap(_all))(jp.asarray(flat)))
-    active = w.argmax(axis=1).reshape(T, E)                          # dominant stage per step
-    w_te = w.reshape(T, E, n)
     gates_te = gates.reshape(T, E, n)
+    raw_active = w.argmax(axis=1).reshape(T, E)                       # raw gate winner per step
+    if progression == "monotone":
+        active = _np.zeros((T, E), dtype=_np.int32)
+        prev = _np.zeros((E,), dtype=_np.int32)
+        hi = max(n - 1, 0)
+        for t in range(T):
+            cur = _np.minimum(_np.maximum(prev, raw_active[t]), _np.minimum(prev + 1, hi))
+            active[t] = cur
+            prev = cur
+        w_te = _np.eye(n, dtype=_np.float32)[active]
+    else:
+        active = raw_active
+        w_te = w.reshape(T, E, n)
     sig_te = sigv.reshape(T, E, len(sig_keys))
     succ_te = succv.reshape(T, E, n)
     act_te = actv.reshape(T, E, n, action_dim)                       # per-stage channel intents
@@ -1204,8 +1304,41 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
     else:
         commanded_motion = []
 
+    # CONTACT-FORCE report: per-region object contact and non-object environment contact, attributed
+    # to whichever authored stage is dominant. This is purely structural force telemetry; whether a
+    # contact is intended or unwanted belongs to the authored stages/probes.
+    contact_groups = list(getattr(env, "contact_groups", ()))
+    env_contact_groups = list(getattr(env, "env_contact_groups", ()))
+    c_cols = [(g, _obs_idx0[f"c_{g}"]) for g in contact_groups if f"c_{g}" in _obs_idx0]
+    ec_cols = [(g, _obs_idx0[f"env_c_{g}"]) for g in env_contact_groups if f"env_c_{g}" in _obs_idx0]
+
+    def _force_rows(cols):
+        rows = []
+        for i in range(n):
+            m = active == i
+            row: dict[str, Any] = {"stage": names[i]}
+            maxes = []
+            for g, ix in cols:
+                v = arr[:, :, ix]
+                row[g] = {
+                    "mean": _masked(v, m),
+                    "max": round(float(v[m].max()), 4) if m.any() else None,
+                }
+                if row[g]["max"] is not None:
+                    maxes.append(row[g]["max"])
+            row["max_any_region"] = max(maxes) if maxes else None
+            rows.append(row)
+        return rows
+
+    contact_forces = {
+        "units": "N",
+        "object_contact": {"regions": [g for g, _ix in c_cols], "per_stage": _force_rows(c_cols)},
+        "environment_contact": {"regions": [g for g, _ix in ec_cols], "per_stage": _force_rows(ec_cols)},
+    }
+
     ts = stage_transition_stats(active, n)
     dwell, entered, handoff, reverse = ts["dwell"], ts["entered"], ts["handoff"], ts["reverse"]
+    raw_ts = stage_transition_stats(raw_active, n) if progression == "monotone" else None
     conversion = [(round(handoff[i] / max(reached[i], 1e-9), 4) if handoff[i] is not None else None)
                   for i in range(n)]
 
@@ -1313,6 +1446,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
 
     out = {
         "stage_names": names,
+        "stage_progression": progression,
         "occupancy": [round(x, 4) for x in occupancy],
         "reached_frac": [round(x, 4) for x in reached],
         "dwell": int(dwell),
@@ -1320,6 +1454,12 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
         "handoff_frac": [round(x, 4) if x is not None else None for x in handoff],
         "conversion": conversion,
         "reverse_frac": [round(x, 4) if x is not None else None for x in reverse],
+        **({} if raw_ts is None else {
+            "raw_gate_reverse_frac": [
+                round(x, 4) if x is not None else None for x in raw_ts["reverse"]
+            ],
+            "cursor_blocked_regression_frac": round(float((raw_active < active).mean()), 4),
+        }),
         "stall_stage": stall,
         "stall_name": (names[stall] if stall is not None else None),
         "reaches_terminal": bool(reaches_terminal),
@@ -1330,6 +1470,7 @@ def stage_occupancy(env: Any, program: dict[str, Any], obs: "np.ndarray",
         "success_discrepancy": discrepancy,
         "time_report": time_report,
         "body_motion": body_motion,
+        "contact_forces": contact_forces,
         "commanded_motion": {"units": "ctrl-units per second, |delta ctrl|/dt, mean over steps "
                                       "where the stage is dominant",
                              "per_stage": commanded_motion},

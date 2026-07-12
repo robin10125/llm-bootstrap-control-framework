@@ -30,6 +30,7 @@ if str(BOOTSTRAPPING) not in sys.path:
 import ppo
 import eval_metrics as EM
 from mjx_env import EnvConfig, MjxEnv, _SHADOW_CLOSE, _SHADOW_FINGERTIPS, _SHADOW_OPEN, load_model
+from policy_bias_lab.ppo_bias import FragmentedStagePPOConfig, _policy_dim, _scale_group_spec
 
 SHADOW_XML = ROOT.parent / "hand-manipulation" / "env" / "models" / "shadow_hand" / "scene_cube.xml"
 
@@ -87,7 +88,9 @@ class CpuShadowEnv:
         self.hand_vadr = [int(self.model.jnt_dofadr[j]) for j in hand_jids]
         # Per-region contact-force maps (mirror MjxEnv; CPU force via mj_contactForce).
         self.contact_groups = ("thumb", "index", "middle", "ring", "little", "palm")
+        self.env_contact_groups = self.contact_groups
         self._obj_geoms = set()
+        self._env_geoms = set()
         self._geom_region = np.full(int(self.model.ngeom), -1, np.int32)
         for gid in range(int(self.model.ngeom)):
             if not (self.model.geom_contype[gid] or self.model.geom_conaffinity[gid]):
@@ -99,6 +102,8 @@ class CpuShadowEnv:
             reg = MjxEnv._contact_region(self.model.body(bid).name)
             if reg is not None:
                 self._geom_region[gid] = self.contact_groups.index(reg)
+            else:
+                self._env_geoms.add(gid)
         # World-frame position of every robot body (all except world/object) -- mirrors MjxEnv obs.
         self.body_pos_names = tuple(self.model.body(i).name for i in range(self.model.nbody)
                                     if self.model.body(i).name not in ("world", "object"))
@@ -107,7 +112,7 @@ class CpuShadowEnv:
         # prefix (q + v + body_pos block + contact block) + [obj_pos, obj_vel, palm_pos, obj_rel] + ctrl
         self.obs_size = (len(self.base_qadr) + len(self.base_vadr) + len(self.hand_qadr)
                          + len(self.hand_vadr) + 3 * len(self.body_pos_names)
-                         + len(self.contact_groups)
+                         + len(self.env_contact_groups) + len(self.contact_groups)
                          + 12 + self.nu)
         act_names = [self.model.actuator(i).name for i in range(self.nu)]
         self.base_act_ids = [i for i, n in enumerate(act_names) if n in ("base_x", "base_y", "base_z")]
@@ -182,11 +187,31 @@ class CpuShadowEnv:
             out[reg] += abs(buf[0])
         return out
 
+    def env_contact_forces(self) -> np.ndarray:
+        """Per-region normal contact force (N) with non-object environment geometry."""
+        out = np.zeros(len(self.env_contact_groups), np.float32)
+        buf = np.zeros(6, np.float64)
+        for i in range(int(self.data.ncon)):
+            con = self.data.contact[i]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            e1, e2 = g1 in self._env_geoms, g2 in self._env_geoms
+            r1, r2 = int(self._geom_region[g1]), int(self._geom_region[g2])
+            if e1 and r2 >= 0:
+                reg = r2
+            elif e2 and r1 >= 0:
+                reg = r1
+            else:
+                continue
+            mujoco.mj_contactForce(self.model, self.data, i, buf)
+            out[reg] += abs(buf[0])
+        return out
+
     def observe(self) -> np.ndarray:
         base_q = self.data.qpos[self.base_qadr]
         base_v = self.data.qvel[self.base_vadr]
         hand_q = self.data.qpos[self.hand_qadr]
         hand_v = self.data.qvel[self.hand_vadr]
+        env_contact = self.env_contact_forces()
         contact = self.contact_forces()
         body_pos = self.data.xpos[self.body_pos_bids].reshape(-1)  # world xyz of every robot body
         obj_pos = self.data.xpos[self.object_bid]
@@ -194,7 +219,7 @@ class CpuShadowEnv:
         palm_pos = self.data.xpos[self.palm_bid]
         grasp_pos = self.data.site_xpos[self.grasp_sid]
         obj_rel = obj_pos - grasp_pos
-        return np.concatenate([base_q, base_v, hand_q, hand_v, body_pos, contact,
+        return np.concatenate([base_q, base_v, hand_q, hand_v, body_pos, env_contact, contact,
                                obj_pos, obj_vel, palm_pos, obj_rel, self.data.ctrl]).astype(np.float32)
 
     def eval_vec(self) -> np.ndarray:
@@ -225,19 +250,25 @@ def main() -> int:
     args = parse_args()
     run_dir = args.run_dir
     config = json.loads((run_dir / "config.json").read_text())
-    bias_spec = json.loads((run_dir / "bias_spec.json").read_text())
     env = CpuShadowEnv(
-        control_dt=float(config["ppo"].get("control_dt", 0.025) if "control_dt" in config["ppo"] else args.control_dt),
-        episode_seconds=float(config["ppo"].get("episode_seconds", args.episode_seconds)),
+        control_dt=float(config["ppo"].get("control_dt", args.control_dt)),
+        episode_seconds=float(config.get("episode_seconds", config["ppo"].get("episode_seconds", args.episode_seconds))),
         physics_dt=float(args.physics_dt),
         obj_xy_range=float(args.obj_xy_range),
     )
+    if config.get("learner") == "long_fragmented_stage_ppo":
+        return render_long_ppo_run(args, run_dir, config, env)
+
+    bias_spec = json.loads((run_dir / "bias_spec.json").read_text())
     net = ppo.ActorCritic(action_dim=env.action_size, hidden=tuple(config["ppo"]["hidden"]))
     action_transform = str(config["ppo"].get("action_transform", "raw"))
     prior_logit_clip = float(config["ppo"].get("prior_logit_clip", 0.95))
     out_dir = args.out or run_dir / "checkpoint_videos"
     out_dir.mkdir(parents=True, exist_ok=True)
-    manifest: list[dict[str, Any]] = []
+    manifest_file = out_dir / "manifest.json"
+    manifest: list[dict[str, Any]] = (
+        json.loads(manifest_file.read_text()) if manifest_file.exists() else []
+    )
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     for arm in arms:
@@ -293,10 +324,96 @@ def main() -> int:
                     "final_lift": stats.final_lift,
                     "attempts": [s.__dict__ for s in attempts],
                 }
+                manifest = [
+                    m for m in manifest
+                    if not (m.get("arm") == arm and m.get("checkpoint") == label
+                            and m.get("video") == str(video_path))
+                ]
                 manifest.append(rec)
                 print(json.dumps({k: rec[k] for k in ("arm", "checkpoint", "video", "success", "lift_max", "base_return")}))
             (ckpt_dir / "attempts.json").write_text(json.dumps([s.__dict__ for s in attempts], indent=2) + "\n")
-            (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+            manifest_file.write_text(json.dumps(manifest, indent=2) + "\n")
+    return 0
+
+
+def render_long_ppo_run(args: argparse.Namespace, run_dir: Path, config: dict[str, Any], env: CpuShadowEnv) -> int:
+    """Render a direct ``run_long_ppo`` output directory.
+
+    ``run_long_ppo`` stores ``best_params.pkl`` / ``params_final.pkl`` directly under the run
+    directory and uses the fragmented-stage policy head, where the policy may emit extra prior-scale
+    outputs. This path mirrors the action composition in ``ppo_bias.make_fragment_collect``.
+    """
+    program = json.loads((run_dir / "prior_program.json").read_text())
+    arm = str(config.get("arm", "baseline"))
+    if arm not in BIAS_ARMS:
+        raise KeyError(f"unknown arm {arm!r}")
+    ppo_cfg = dict(config["ppo"])
+    # Archived fragmented PPO runs created before per-group scaling became the default may not have
+    # recorded this field. Their policy head was scalar, so keep replay/rendering shape-compatible.
+    ppo_cfg.setdefault("prior_scale_mode", "scalar")
+    if isinstance(ppo_cfg.get("hidden"), list):
+        ppo_cfg["hidden"] = tuple(ppo_cfg["hidden"])
+    cfg = FragmentedStagePPOConfig(**{k: v for k, v in ppo_cfg.items()
+                                      if k in FragmentedStagePPOConfig.__dataclass_fields__})
+    bias = compile_bias({"name": "long_ppo_render", "action_priors": [], "prior_program": program}, env)
+    net = ppo.ActorCritic(action_dim=_policy_dim(env, cfg), hidden=tuple(cfg.hidden))
+    action_prior_weights = bias.default_action_prior_weights()
+    act_fn = make_fragmented_act_fn(env, net, bias, cfg, config["task"], action_prior_weights)
+
+    if args.checkpoints == "final":
+        checkpoints = [run_dir / "params_final.pkl"]
+    elif args.checkpoints == "best":
+        checkpoints = [run_dir / "best_params.pkl"]
+    else:
+        checkpoints = sorted(run_dir.glob("params_iter*.pkl")) + [run_dir / "params_final.pkl"]
+    checkpoints = [p for p in checkpoints if p.exists()]
+    if not checkpoints:
+        raise FileNotFoundError(f"no checkpoints found in {run_dir}")
+
+    out_dir = args.out or run_dir / "checkpoint_videos"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_file = out_dir / "manifest.json"
+    manifest: list[dict[str, Any]] = (
+        json.loads(manifest_file.read_text()) if manifest_file.exists() else []
+    )
+    for ckpt in checkpoints:
+        label = ckpt.stem.replace("params_", "")
+        with ckpt.open("rb") as f:
+            params = pickle.load(f)
+        attempts = [rollout_stats(env, act_fn, params, args.seed_base + i)
+                    for i in range(args.max_attempts)]
+        successes = [s for s in attempts if s.success]
+        selected = successes[:args.successes_per_checkpoint]
+        if not selected and attempts:
+            selected = [max(attempts, key=lambda s: (s.success, s.lift_max, s.base_return))]
+        ckpt_dir = out_dir / arm / label
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        for idx, stats in enumerate(selected):
+            video_path = ckpt_dir / f"rollout_{idx:02d}_seed{stats.seed}_success{int(stats.success)}_lift{stats.lift_max:.3f}.mp4"
+            if not video_path.exists() or args.overwrite:
+                render_rollout(env, act_fn, params, stats.seed, video_path,
+                               fps=args.fps, width=args.width, height=args.height)
+            rec = {
+                "arm": arm,
+                "checkpoint": label,
+                "checkpoint_path": str(ckpt),
+                "video": str(video_path),
+                "seed": stats.seed,
+                "success": stats.success,
+                "lift_max": stats.lift_max,
+                "base_return": stats.base_return,
+                "final_lift": stats.final_lift,
+                "attempts": [s.__dict__ for s in attempts],
+            }
+            manifest = [
+                m for m in manifest
+                if not (m.get("arm") == arm and m.get("checkpoint") == label
+                        and m.get("video") == str(video_path))
+            ]
+            manifest.append(rec)
+            print(json.dumps({k: rec[k] for k in ("arm", "checkpoint", "video", "success", "lift_max", "base_return")}))
+        (ckpt_dir / "attempts.json").write_text(json.dumps([s.__dict__ for s in attempts], indent=2) + "\n")
+        manifest_file.write_text(json.dumps(manifest, indent=2) + "\n")
     return 0
 
 
@@ -315,29 +432,75 @@ def make_act_fn(
     """
     _, use_action_prior, _, _ = BIAS_ARMS[arm]
 
-    def _act(params, obs):
+    def _act(params, obs, prior_stage_idx):
         mean, _log_std, _value = net.apply(params, obs[None, :])
         action = mean[0]
         if use_action_prior:
-            prior = bias.action_prior(obs, task)
+            if bias.prior_step_fn is not None:
+                prior, prior_stage_idx = bias.prior_step_fn(obs, bias.default_action_prior_weights(),
+                                                            prior_stage_idx)
+            else:
+                prior = bias.action_prior(obs, task)
             if action_transform == "tanh":
                 prior = _atanh_clipped(prior, prior_logit_clip)
             action = action + prior
         if action_transform == "tanh":
             action = jp.tanh(action)
-        return jp.clip(action, -1.0, 1.0)
+        return jp.clip(action, -1.0, 1.0), prior_stage_idx
+
+    return jax.jit(_act)
+
+
+def make_fragmented_act_fn(
+    env: CpuShadowEnv,
+    net: Any,
+    bias: CompiledBias,
+    cfg: FragmentedStagePPOConfig,
+    task: str,
+    action_prior_weights: jp.ndarray,
+) -> Any:
+    n_scale, scale_expand, _scale_names = _scale_group_spec(env, cfg.prior_scale_mode)
+
+    def _act(params, obs, prior_stage_idx):
+        mean, _log_std, _value = net.apply(params, obs[None, :])
+        pre_action = mean[0]
+        if cfg.action_transform == "tanh":
+            policy_action = jp.tanh(pre_action)
+        else:
+            policy_action = pre_action
+        residual = policy_action[:len(bias.action_names)] * float(cfg.residual_action_scale)
+        if cfg.learn_prior_scale:
+            scale_signal = policy_action[len(bias.action_names):len(bias.action_names) + n_scale]
+            prior_scale = jp.clip(
+                float(cfg.prior_scale_bias) + float(cfg.prior_scale_gain) * (scale_signal @ scale_expand),
+                0.0,
+                1.0,
+            )
+        else:
+            prior_scale = jp.ones((len(bias.action_names),), dtype=jp.float32)
+        if cfg.use_action_prior and bias.prior_fn is not None:
+            if bias.prior_step_fn is not None:
+                prior, prior_stage_idx = bias.prior_step_fn(obs, action_prior_weights, prior_stage_idx)
+            else:
+                prior = bias.weighted_action_prior(obs, action_prior_weights, task)
+            env_action = jp.clip(residual + prior_scale * prior, -1.0, 1.0)
+        else:
+            env_action = jp.clip(residual, -1.0, 1.0)
+        return env_action, prior_stage_idx
 
     return jax.jit(_act)
 
 
 def rollout_stats(env: CpuShadowEnv, act_fn: Any, params: Any, seed: int) -> RolloutStats:
     obs = env.reset(seed)
+    prior_stage_idx = jp.asarray(0, dtype=jp.int32)
     lift_max = -1e9
     total = 0.0
     success = False
     final_lift = 0.0
     for _ in range(env.horizon):
-        action = np.asarray(act_fn(params, jp.asarray(obs)), dtype=np.float32)
+        action_j, prior_stage_idx = act_fn(params, jp.asarray(obs), prior_stage_idx)
+        action = np.asarray(action_j, dtype=np.float32)
         obs, reward, metrics = env.step(action)
         total += reward
         final_lift = metrics["lift"]
@@ -364,6 +527,7 @@ def render_rollout(
     height: int,
 ) -> None:
     obs = env.reset(seed)
+    prior_stage_idx = jp.asarray(0, dtype=jp.int32)
     renderer = mujoco.Renderer(env.model, height=height, width=width)
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
@@ -393,7 +557,8 @@ def render_rollout(
                 frame = np.asarray(renderer.render(), dtype=np.uint8)
                 assert proc.stdin is not None
                 proc.stdin.write(frame.tobytes())
-            action = np.asarray(act_fn(params, jp.asarray(obs)), dtype=np.float32)
+            action_j, prior_stage_idx = act_fn(params, jp.asarray(obs), prior_stage_idx)
+            action = np.asarray(action_j, dtype=np.float32)
             obs, _reward, _metrics = env.step(action)
         renderer.update_scene(env.data, camera=camera)
         frame = np.asarray(renderer.render(), dtype=np.uint8)

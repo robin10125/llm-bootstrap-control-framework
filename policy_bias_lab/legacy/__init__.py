@@ -4,9 +4,10 @@
 - action_priors: the old pareto open-loop action-prior selection (superseded by the agentic
   generation in run_dsl_vs_freeform; reused helpers live in policy_bias_lab.llm_util).
 - run_ppo_experiment: old PPO runner (eval/CSV utils extracted to policy_bias_lab.report_utils).
-- run_dynamic_reward_experiment: the old orchestrator (coach/phase/pareto plumbing). Superseded by
-  policy_bias_lab.run_prior_ppo (the slim PPO runner: injected prior programs + fixed reward, no
-  coach/phase/pareto).
+- short_rollout_ppo / run_short_prior_ppo / run_long_short_ppo: the previous
+  full-horizon short-rollout PPO implementation, superseded by the fragmented-stage default in
+  policy_bias_lab.ppo_bias, policy_bias_lab.run_prior_ppo, and policy_bias_lab.run_long_ppo.
+- run_dynamic_reward_experiment: the old orchestrator (coach/phase/pareto plumbing).
 The active prior path (run_dsl_vs_freeform + run_prior_ppo + composed_priors/freeform_priors/
-bias/ppo_bias) does NOT import anything here.
+bias/ppo_bias) should not import anything here; compatibility-only legacy commands may.
 """

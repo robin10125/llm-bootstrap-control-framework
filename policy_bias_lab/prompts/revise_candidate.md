@@ -1,6 +1,6 @@
 Revise ONE action-prior candidate to score better on the objective. Keep the SAME framework and the
-same STATELESS constraint as before, and keep the candidate's structure. Output exactly one improved
-candidate -- a targeted edit of the one below, not a rewrite from scratch.
+same expression vocabulary as before, and keep the candidate's structure. Output exactly one
+improved candidate -- a targeted edit of the one below, not a rewrite from scratch.
 
 TASK: $task
 
@@ -32,42 +32,73 @@ CHANNELS asked for, per stage and actuator group (ctrl-units/s) -- compare it wi
 with the CONTROL law's units bridge to separate commanded aggression from passive drift. Read both
 against your intent -- decide yourself which motion is progress and which is a side effect of your
 channels, and revise accordingly.
+The stage report's `contact_forces` block gives per-region object-contact and environment-contact
+force separately, attributed per dominant stage. Treat these as separate sensed quantities: object
+contact and environment contact are not interchangeable. Decide from your own stage intent and the
+upstream procedure which contact belongs to the current stage, then revise the relevant signals,
+gates, channels, probes, or evals accordingly.
 The stage report's `time_report` block is decisive for telling SLOW apart from STUCK. It gives, per
 stage, your `authored_est_seconds` vs the `per_stage_measured_seconds` it actually took, the
 `rollout_seconds` budget, and `ended_in_stage_frac` (how often the rollout ENDED inside each stage).
 If a hand-off looks broken but the rollout keeps ending inside that stage (`stall_time_limited`), or
 the measured seconds greatly exceed your estimate, the stage is TOO SLOW, not stuck: speed it up
-(drive fast and decelerate late, widen its handoff tolerance to a real margin) so later stages get
-rollout time -- do NOT rewrite a gate that would fire fine given more time. If `fits_rollout` is
-false, the whole chain is over-budget; cut the coarse stages' durations so it fits.
+(use a capped, damped, non-oscillating command and widen its handoff tolerance to a real margin) so
+later stages get rollout time -- do NOT rewrite a gate that would fire fine given more time. If
+`fits_rollout` is false, the whole chain is over-budget; shorten coarse stages by improving their
+motion shape and tolerances, not by removing speed ceilings.
+With `stage_progression:'monotone'`, the stage report's main transition fields use the monotone
+cursor. If present, `raw_gate_reverse_frac` and `cursor_blocked_regression_frac` show how often the
+raw current-signal gates would have regressed without the cursor; use that evidence to improve gate
+stability, but do not rely on backward regression as normal progress.
 One general principle: if you judge this to be a dexterous manipulation task, be gentle -- manage
 velocity and force EXPLICITLY: first contact at near-zero relative speed, a ceiling on contact
 force, and only the MINIMUM force each interaction needs (the spec's CONTROL law maps
-commanded-vs-measured gaps to applied force). A revision that gains objective by moving faster
-while the body_motion evidence shows it striking or displacing items is the wrong direction --
-keep the budgets as explicit signal/gate conditions. AVOID BUMPING into other objects and surfaces
-unless the contact is INTENTIONAL: keep every part clear of anything it is not deliberately acting on
--- use the body world-positions the spec exposes for clearance (a part's position lets you keep it a
-margin clear of a surface it must not touch) and the region-contact observables to catch a stray
-press, and add a clearance floor as a gate/channel condition where a stage risks it.
+commanded-vs-measured gaps to applied force). Translating body motion is different from
+rotational/articulated joint motion: in dexterous tasks, keep explicit hard speed ceilings for body
+translation stages, use monotone approach commands with damping near the target, and avoid high-gain
+distance/error terms or competing terms that can reverse direction and oscillate when far from the
+target. A revision that gains objective by moving faster while the body_motion evidence shows excess
+speed, reversal, or displacement is the wrong direction -- keep the budgets as explicit signal/gate
+conditions. AVOID BUMPING into other objects and surfaces unless the contact is INTENTIONAL: keep
+every part clear of anything it is not deliberately acting on -- use the body world-positions the spec
+exposes for clearance (a part's position lets you keep it a margin clear of a surface it must not
+touch), the object-contact observables to confirm intended interaction, and the environment-contact
+observables to catch contact with other geometry. Add clearance floors, object-contact force
+ceilings, and environment-contact force ceilings as gate/channel conditions where a stage risks
+unintended contact.
 
 WHERE THE POLICY STALLS (revise here):
 $stage_focus
 
 Diagnose what is limiting the objective from these diagnostics and the upstream procedure account
 (including its forbidden-motion/exploit notes), and make a focused change to fix the stalling stage
-named above. A stall usually means that stage's
+named above. For staged candidates, your primary local objective is to advance the FRONTIER: make
+the earliest stalled hand-off reliably reach the successor stage, while preserving the already
+working earlier stages and improving the overall objective. A stall usually means that stage's
 channels never drive the signals into the NEXT stage's gate condition (so the hand-off never fires),
-or the stage's own gate never activates -- fix whichever it is.
+or the stage's own gate never activates -- fix whichever blocks the frontier. Also check the numeric
+gate competition under hard argmax: the framework clips gates to [0, 1] and runs the single highest
+gate as the advancement request for the monotone stage cursor. A post-condition margin that barely
+becomes positive can pass `success > 0` while still leaving `1 - done_<stage>` near 1, so the current
+stage self-locks and the next gate never wins. If the condition is met within tolerance, make a
+separate completion activation fire near 1 and use THAT in the ladder; keep raw signed margins
+separate when you need them for success or diagnostics. If the current stage legitimately has an
+alternative safe handoff, author it explicitly as an OR-like completion activation, for example
+`done_stage = max(done_primary, done_fallback)`, and use it consistently in the gate and success
+expression. Once the monotone cursor advances, earlier ordinary stages remain closed; do not rely on
+accidental regression to repair a later state. Author recovery deliberately as a later stage or as
+stage-local channels/constraints.
 
 EDIT MENU -- pick the SMALLEST edit the evidence supports (a suggestion is given above):
  (a) reshape a channel's response (gentler / decelerating / sign-corrected) -- when a signal is
-     trending the wrong way under the current channels;
+     trending the wrong way under the current channels, or commanded/body motion oscillates,
+     reverses, or exceeds the intended speed budget;
  (b) nudge a gate threshold -- when the next gate's value is approaching but not yet firing;
  (c) REWRITE a gate condition -- when training has converged and the hand-off is not approaching:
      the gate reads the wrong signals or fires in the wrong region; do not just rescale it;
  (d) restructure the hand-off between two adjacent gates -- when they overlap or leave a dead zone
-     (e.g. a hard-blend self-lock): change BOTH sides of the boundary coherently.
+     (e.g. a hard-argmax self-lock): change BOTH sides of the boundary coherently and rescale the
+     `done_<stage>` activations so the completed stage loses and the successor wins.
 
 PROBES -- request your own measurements. You may include `probes: [{name, expr, stage: '<stage
 name>' (optional)}]` (up to 8) in the candidate. Each probe expression is evaluated by the framework
@@ -80,7 +111,9 @@ needs a quantity that is not yet defined), plus two probe-only, episode-relative
 `obj_speed` (object's translational speed, m/s). With `stage` set, statistics are restricted to
 steps where that stage is dominant. Use probes to TEST A HYPOTHESIS about why the policy fails --
 ask for the measurement that discriminates between your candidate explanations, then act on the
-numbers next iteration. Probes you authored earlier persist until you replace them.
+numbers next iteration. If contact type matters, probe object-contact and environment-contact
+signals separately; do not infer intended contact from a generic tracking gap. Probes you authored
+earlier persist until you replace them.
 
 EVALS -- author acceptance tests. You may include `evals: [{name, expr, when: 'ever'|'end'}]` (up
 to 8): pass/fail checks scored per episode ('ever' = the expression exceeds 0 for a sustained run

@@ -61,6 +61,7 @@ class PriorIR:
     probes: list[dict[str, Any]]
     evals: list[dict[str, Any]]
     unused_dofs: list[Any]
+    stage_progression: str = "monotone"
     temperature: float | None = None
 
     def to_candidate(self) -> dict[str, Any]:
@@ -78,6 +79,8 @@ class PriorIR:
             out["probes"] = self.probes
         if self.evals:
             out["evals"] = self.evals
+        if self.stage_progression:
+            out["stage_progression"] = self.stage_progression
         if self.temperature is not None:
             out["temperature"] = self.temperature
         return out
@@ -137,6 +140,7 @@ def normalize_candidate(raw: dict[str, Any], rep: str) -> tuple[dict[str, Any], 
         probes=list(src.get("probes") or [])[:8] if isinstance(src.get("probes"), list) else [],
         evals=list(src.get("evals") or [])[:8] if isinstance(src.get("evals"), list) else [],
         unused_dofs=list(src.get("unused_dofs") or []),
+        stage_progression=str(src.get("stage_progression", src.get("progression", "monotone"))),
         temperature=(float(src["temperature"]) if src.get("temperature") is not None else None),
     )
     return ir.to_candidate(), issues
@@ -150,6 +154,7 @@ def structural_issues(env: Any, cand: dict[str, Any], rep: str) -> list[Issue]:
     issues: list[Issue] = []
     try:
         from policy_bias_lab.freeform_priors import (
+            CHANNEL_SELF_SIGNALS,
             all_actuator_names,
             compile_expr,
             raw_signal_fn,
@@ -192,7 +197,7 @@ def structural_issues(env: Any, cand: dict[str, Any], rep: str) -> list[Issue]:
             acts = [str(a) for a in (ch.get("actuators") or [])]
             touched.update(a for a in acts if a in all_actuators)
             try:
-                compile_expr(str(ch.get("expr", "0")), available | {"ctrl_self", "q_self", "v_self", "c_self"})
+                compile_expr(str(ch.get("expr", "0")), available | CHANNEL_SELF_SIGNALS)
             except Exception as e:  # noqa: BLE001
                 issues.append(Issue("error", f"stage {i} channel {j} expr does not compile: {e}"))
     if not stages:

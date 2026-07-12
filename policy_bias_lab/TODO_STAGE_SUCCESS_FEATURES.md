@@ -199,6 +199,30 @@ comparability resets). **Usefulness: medium, high ceiling** — the only feature
 pre-shape/close/verify); must come last since its value depends on 1/2/6 correctly ruling out
 budget and gate-boundary causes first.
 
+## Feature 8 — LLM-authored parallel stage tracks (overlapping stage execution)
+
+**What.** Allow a candidate to author independent stage tracks whose active intervals can overlap,
+instead of forcing every useful behavior through one global first-unfinished ladder. A track would
+still be stateless and gate-driven, but it could run concurrently with another track when both of
+their observable conditions hold. This is for mechanisms whose progress conditions are independent
+enough to be maintained or prepared in parallel while the main chain advances.
+
+**Implementation sketch.** Extend the staged representation with optional `tracks`, each containing
+its own ordered progress ladder and per-track stages. The executor combines active stages across
+tracks by summing channels, with explicit conflict rules when two active stages command the same
+actuator/group (for example: reject at validation unless the candidate declares a priority,
+exclusive group, or blend rule). Diagnostics need per-track occupancy, cross-track overlap
+fractions, actuator-conflict counts, and hand-off stats within each track. Revision prompts should
+ask the author to keep track dependencies observable: a parallel stage must have a clear entry
+condition, exit activation, and suppression condition if it should stop when another track changes
+state.
+
+**Feasibility: medium.** Requires representation/schema changes, staged executor changes, validation
+for actuator conflicts, and new diagnostics. **Usefulness: potentially high** when the one-stage
+ladder serializes independent preparation/maintenance work and consumes the rollout budget, but it
+adds a new failure surface: hidden cross-track competition, persistent stale commands, and harder
+attribution when a shared signal moves the wrong way.
+
 ---
 
 ## Future experiment: soft vs hard blend (controlled)

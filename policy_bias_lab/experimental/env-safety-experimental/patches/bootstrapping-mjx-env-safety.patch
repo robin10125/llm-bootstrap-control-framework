@@ -1,0 +1,336 @@
+diff --git a/mjx_env.py b/mjx_env.py
+index 32654f9..671daf9 100644
+--- a/mjx_env.py
++++ b/mjx_env.py
+@@ -147,10 +147,14 @@ class EnvConfig:
+     # meshes (notably the large forearm collision mesh). Empty = leave the scene untouched
+     # (the gripper, which is already cheap).
+     grasp_geom_substr: tuple[str, ...] = ()
+-    # fingertip bodies (for the eval vector's per-finger distance / contact count). Empty =
+-    # gripper default (the two pad bodies). A fingertip "touches" within `contact_eps`.
++    # fingertip bodies (for the eval vector's per-finger DISTANCE term only). Empty =
++    # gripper default (the two pad bodies).
+     fingertip_bodies: tuple[str, ...] = ()
+     contact_eps: float = 0.03
++    # A hand region counts as "in contact" (for the eval vector's n_contacts) when its
++    # measured normal contact force with the object exceeds this floor (N). Set just above
++    # solver noise so a genuine light touch registers but free air / joint-limit load does not.
++    contact_force_floor: float = 0.05
+     # reward weights (builtin reward only; ignored when a compiled reward spec is attached)
+     w_reach: float = 1.0
+     w_close: float = 0.25
+@@ -158,6 +162,46 @@ class EnvConfig:
+     w_success: float = 5.0
+     lift_target: float = 0.10         # metres above start counted as full lift reward
+     success_height: float = 0.05      # metres above start = task success
++    # contact gating (anti-fling). Interaction rewards (close/lift/success) only pay out when the
++    # fingers are actually touching the object and it has not been batted sideways. This removes
++    # the non-prehensile "fling" optimum (lifting with zero contact), which is a sim-physics
++    # artifact that does not transfer to hardware. All gate signals (n_contacts, obj_xy_disp) are
++    # observable on a real robot. See policy_bias_lab notes / SOTA contact-gated reward design.
++    w_contact: float = 0.5            # dense reward for maintaining fingertip contact
++    contact_target: float = 2.0       # contacts for full gate (thumb + >=1 finger ~ a cage)
++    fling_xy_thresh: float = 0.08     # object lateral drift (m) above which a lift is a fling
++    # Approach-to-contact gradient. Rewarding only palm_obj_dist drives a palm-down hover that
++    # splays the fingertips AWAY from the object, so contact is never made. w_finger adds an
++    # ungated pull on the *fingertips* (min_finger_dist) -- the gradient to the FIRST touch -- and
++    # closure is gated by fingertip nearness (not palm nearness, which caused air-closure), so the
++    # hand only curls when the fingertips are actually at the object. Neither is flingable
++    # (flinging raises obj_xy and does not reduce fingertip distance to a held object).
++    w_finger: float = 1.0             # ungated reward for bringing fingertips to the object
++    close_near_scale: float = 0.05    # fingertip-distance scale (m) for the closure gate
++    # The approach terms (reach/finger) use POTENTIAL-BASED shaping F = gamma*Phi(s') - Phi(s)
++    # with Phi = -distance (Ng/Harada/Russell 1999). Raw distance penalties accumulate to ~-50
++    # per episode and drown the sparse contact reward; the potential form telescopes (bounded
++    # total ~ initial distance), so it still guides approach but lets the contact/grasp reward
++    # dominate -- and it's provably policy-invariant (cannot introduce a new exploit). Use the
++    # same gamma as the PPO discount for the invariance guarantee.
++    pbrs_gamma: float = 0.99
++    # Grasp-to-lift terms. The policy was over-closing into a fist that slides off the cube
++    # (closure -> 0.9 while contact -> 0), then never raising the hand. Fixes: (1) the closure
++    # reward fades as contact forms (no reward for fisting PAST the object); (2) w_hold rewards
++    # SUSTAINED contact (a held grip, not a brief touch); (3) w_lift_pot is a contact-gated
++    # potential on object height -- a continuous upward gradient that only pays while the grip is
++    # held, so "raise the held object" is reinforced from the current behavior.
++    w_hold: float = 0.5               # reward for contact maintained across consecutive steps
++    w_lift_pot: float = 20.0          # contact-gated potential on object height (lift progress)
++    # Lift-conditioned grasp value. Diagnosis (shaped3_liftfix run): contact+hold paid ~1.0/step
++    # regardless of height, forming a flat high plateau the policy settles on -- it grasps the cube
++    # on the table and ABANDONS the lifting it had at warm-start (grasp 0.10->0.95 while
++    # lift_reached 0.22->0.01). Fix: scale contact/hold from a low floor on the table up to full
++    # value when the cube is lifted, so a static on-table grasp is no longer the high optimum; and
++    # add a sustained-aloft reward (the held-lift analog of w_hold) that pays for KEEPING the
++    # object raised across consecutive steps -- directly reinforcing the measured 'sustained success'.
++    contact_lift_floor: float = 0.3   # fraction of contact/hold reward paid when cube is on the table
++    w_lift_hold: float = 3.0          # contact-gated reward for sustaining the object aloft
+ 
+ 
+ def load_model(xml_path: Path = GRIPPER_XML, cfg: "EnvConfig | None" = None) -> mujoco.MjModel:
+@@ -324,11 +368,51 @@ class MjxEnv:
+         self._open_hand = self.ctrl_open[jp.asarray(self.hand_act_ids)]
+         self._close_dir = (self.ctrl_close - self.ctrl_open)[jp.asarray(self.hand_act_ids)]
+ 
+-        # Fingertip bodies for the eval vector (per-finger distance / contact count).
++        # Fingertip bodies for the eval vector's per-finger DISTANCE term.
+         ft = self.cfg.fingertip_bodies or ("g_left_finger", "g_right_finger")
+         self.fingertip_bids = jp.asarray(
+             [int(m.body(n).id) for n in ft if self._has_body(m, n)], dtype=jp.int32)
+ 
++        # World-frame position of EVERY robot body (all bodies except `world` and `object` -- the
++        # object is already exposed as obj_pos). Placed in the observation so the prior AND the
++        # policy can read where each part (fingertips, palm, links, base carriage) sits in space.
++        # This tuple order defines the obs layout for the body-position block (see _observe).
++        self.body_pos_names = tuple(m.body(i).name for i in range(m.nbody)
++                                    if m.body(i).name not in ("world", "object"))
++        self.body_pos_bids = jp.asarray([int(m.body(n).id) for n in self.body_pos_names],
++                                        dtype=jp.int32)
++
++        # --- Real per-region contact force (replaces the qfrc_constraint proxy) ---------------
++        # Every collidable geom is tagged as the object, a hand REGION (finger/palm), or non-object
++        # environment geometry. The observed object-contact signal is object-vs-region NORMAL force
++        # from the constraint solver -- true ground truth: zero in free air AND zero when a joint
++        # merely loads its own limit (unlike qfrc_constraint, which sums contact and limit reaction
++        # into one per-DOF number). The environment-contact signal mirrors it for hand-region vs
++        # non-object/non-hand collidable geometry.
++        self.contact_groups = ("thumb", "index", "middle", "ring", "little", "palm")
++        self.env_contact_groups = self.contact_groups
++        obj_geoms = []
++        env_geoms = []
++        geom_region = np.full(int(m.ngeom), -1, np.int32)
++        for gid in range(int(m.ngeom)):
++            if not (m.geom_contype[gid] or m.geom_conaffinity[gid]):
++                continue
++            bid = int(m.geom_bodyid[gid])
++            if bid == self.object_bid:
++                obj_geoms.append(gid)
++                continue
++            reg = self._contact_region(m.body(bid).name)
++            if reg is not None:
++                geom_region[gid] = self.contact_groups.index(reg)
++            else:
++                env_geoms.append(gid)
++        self._obj_geoms = jp.asarray(obj_geoms, dtype=jp.int32)
++        self._env_geoms = jp.asarray(env_geoms, dtype=jp.int32)
++        self._geom_region = jp.asarray(geom_region)
++        # Pyramidal-cone rows per contact = 2*(condim-1); condim<=6 -> a fixed 10-wide window
++        # keeps the per-contact normal-force extraction vmap/jit-safe.
++        self._contact_rows = 10
++
+         # Optional compiled reward spec (eval_vec, stage) -> scalar. None = builtin reward.
+         self.reward_fn = None
+ 
+@@ -343,6 +427,78 @@ class MjxEnv:
+         except KeyError:
+             return False
+ 
++    @staticmethod
++    def _contact_region(bname: str) -> str | None:
++        """Map a hand body name to a contact region (finger/palm), or None if not a hand body.
++        Mirrors the actuator semantic grouping so per-actuator `c_self` lines up with a region."""
++        b = bname.lower()
++        table = (
++            ("thumb",  ("thdistal", "thmiddle", "thproximal", "thhub", "thbase", "thmetacarpal")),
++            ("index",  ("ffdistal", "ffmiddle", "ffproximal", "ffknuckle")),
++            ("middle", ("mfdistal", "mfmiddle", "mfproximal", "mfknuckle")),
++            ("ring",   ("rfdistal", "rfmiddle", "rfproximal", "rfknuckle")),
++            ("little", ("lfdistal", "lfmiddle", "lfproximal", "lfknuckle", "lfmetacarpal")),
++            ("palm",   ("palm", "wrist", "forearm")),
++        )
++        for reg, keys in table:
++            if any(k in b for k in keys):
++                return reg
++        return None
++
++    def _contact_forces(self, dx: mjx.Data) -> jp.ndarray:
++        """Per-region normal contact force with the object (N), order = self.contact_groups.
++
++        Zero in free air and zero when a joint loads its own limit -- the force is read only from
++        contacts whose two geoms are (a hand region, the object). Hand-hand self-collision is
++        disabled in the model, so no hand-hand pair can leak in."""
++        c = dx._impl.contact
++        efc = dx._impl.efc_force
++        rows = self._contact_rows
++
++        def normal(efc_address, dim):  # pyramidal: normal = sum of the 2*(dim-1) pyramid rows
++            win = jax.lax.dynamic_slice(efc, (jp.maximum(efc_address, 0),), (rows,))
++            nrows = jp.where(dim == 1, 1, 2 * (dim - 1))
++            keep = jp.arange(rows) < nrows
++            return jp.where(efc_address >= 0, jp.sum(jp.where(keep, win, 0.0)), 0.0)
++
++        fn = jax.vmap(normal)(c.efc_address, c.dim)                 # [ncon] normal force
++        obj1 = jp.isin(c.geom1, self._obj_geoms)
++        obj2 = jp.isin(c.geom2, self._obj_geoms)
++        reg1 = self._geom_region[c.geom1]
++        reg2 = self._geom_region[c.geom2]
++        region = jp.where(obj1, reg2, reg1)                        # the hand side of the pair
++        is_obj_hand = (obj1 & (reg2 >= 0)) | (obj2 & (reg1 >= 0))
++        fn = jp.where(is_obj_hand, fn, 0.0)
++        region = jp.where(is_obj_hand, region, 0)
++        return jp.zeros(len(self.contact_groups)).at[region].add(fn)
++
++    def _env_contact_forces(self, dx: mjx.Data) -> jp.ndarray:
++        """Per-region normal contact force with non-object environment geometry (N).
++
++        This is separate from object contact: it rises only for hand-region contacts whose other
++        geom is collidable but neither the task object nor another hand region.
++        """
++        c = dx._impl.contact
++        efc = dx._impl.efc_force
++        rows = self._contact_rows
++
++        def normal(efc_address, dim):
++            win = jax.lax.dynamic_slice(efc, (jp.maximum(efc_address, 0),), (rows,))
++            nrows = jp.where(dim == 1, 1, 2 * (dim - 1))
++            keep = jp.arange(rows) < nrows
++            return jp.where(efc_address >= 0, jp.sum(jp.where(keep, win, 0.0)), 0.0)
++
++        fn = jax.vmap(normal)(c.efc_address, c.dim)
++        env1 = jp.isin(c.geom1, self._env_geoms)
++        env2 = jp.isin(c.geom2, self._env_geoms)
++        reg1 = self._geom_region[c.geom1]
++        reg2 = self._geom_region[c.geom2]
++        region = jp.where(env1, reg2, reg1)
++        is_env_hand = (env1 & (reg2 >= 0)) | (env2 & (reg1 >= 0))
++        fn = jp.where(is_env_hand, fn, 0.0)
++        region = jp.where(is_env_hand, region, 0)
++        return jp.zeros(len(self.env_contact_groups)).at[region].add(fn)
++
+     def set_reward_fn(self, reward_fn) -> None:
+         """Attach an `(eval_vec, stage) -> scalar` reward (from `reward_spec.compile_*`)."""
+         self.reward_fn = reward_fn
+@@ -426,13 +582,26 @@ class MjxEnv:
+         base_v = jp.asarray([dx.qvel[a] for a in self.base_vadr])
+         hand_q = jp.asarray([dx.qpos[a] for a in self.hand_qadr]) if self.hand_qadr else jp.zeros(0)
+         hand_v = jp.asarray([dx.qvel[a] for a in self.hand_vadr]) if self.hand_vadr else jp.zeros(0)
++        # Per-region CONTACT force: the true normal force each hand region (finger/palm) exchanges
++        # with the object this step -- exactly zero in free air AND zero when a joint merely loads
++        # its own limit (it reads the constraint solver only on object<->hand contacts). Real-robot
++        # analog: fingertip force / tactile sensing. The environment-contact block is the same
++        # measurement for non-object environment geometry. Both are placed between body positions and
++        # obj_pos so the trailing [obj_*, palm, obj_rel, ctrl] layout stays valid.
++        env_contact = self._env_contact_forces(dx)
++        contact = self._contact_forces(dx)
++        # World-frame xyz of every robot body, flattened [b0_x,b0_y,b0_z, b1_x,...]. Placed BEFORE
++        # the contact block so the trailing [obj_*, palm, obj_rel, ctrl] tail stays the last
++        # (12 + nu) elements (n_pre = obs_size - 12 - action_dim) and contact stays immediately
++        # before obj_pos -- every existing name->index mapping is preserved.
++        body_pos = dx.xpos[self.body_pos_bids].reshape(-1)
+         obj_pos = dx.xpos[self.object_bid]
+         obj_vel = dx.cvel[self.object_bid, 3:6]  # linear part of spatial velocity
+         palm_pos = dx.xpos[self.palm_bid]
+         grasp_pos = dx.site_xpos[self.grasp_sid]
+         obj_rel = obj_pos - grasp_pos
+         return jp.concatenate([
+-            base_q, base_v, hand_q, hand_v,
++            base_q, base_v, hand_q, hand_v, body_pos, env_contact, contact,
+             obj_pos, obj_vel, palm_pos, obj_rel, dx.ctrl,
+         ])
+ 
+@@ -449,37 +618,96 @@ class MjxEnv:
+         tip_pos = dx.xpos[self.fingertip_bids]                 # [n_fingers, 3]
+         tip_d = jp.linalg.norm(tip_pos - obj_pos[None, :], axis=-1)
+         min_finger_dist = tip_d.min()
+-        n_contacts = jp.sum((tip_d < self.cfg.contact_eps).astype(jp.float32))
++        # Real contact: count hand regions bearing normal force above the floor (was fingertip
++        # geometric proximity, which paid out for a hand hovering near but never touching).
++        cforce = self._contact_forces(dx)
++        n_contacts = jp.sum((cforce > self.cfg.contact_force_floor).astype(jp.float32))
+         closure = self._closure(dx)
+         lift = obj_pos[2] - start["obj_start_z"]
+         obj_xy_disp = jp.linalg.norm(obj_pos[:2] - start["obj_start_xy"])
+         return jp.asarray([palm_obj_dist, min_finger_dist, n_contacts, closure, lift, obj_xy_disp])
+ 
+-    def _builtin_reward(self, dx: mjx.Data, e: jp.ndarray) -> jp.ndarray:
++    def _builtin_reward(self, dx: mjx.Data, e: jp.ndarray, prev_e: jp.ndarray) -> jp.ndarray:
+         reach_d = e[EM.FIELD_INDEX["palm_obj_dist"]]
+         lift = e[EM.FIELD_INDEX["lift"]]
+-        r_reach = -self.cfg.w_reach * reach_d
+-        near = jp.exp(-(reach_d / 0.05) ** 2)
++        n_contacts = e[EM.FIELD_INDEX["n_contacts"]]
++        obj_xy = e[EM.FIELD_INDEX["obj_xy_disp"]]
++        # Contact gate (smooth 0->1 over fingertip contacts) and an anti-fling factor. Interaction
++        # rewards are multiplied by these so the only way to earn lift/grasp reward is an actual
++        # in-hand grasp. The approach terms are potential-based (below), giving a natural curriculum:
++        # approach -> (contact unlocks) -> close/lift/hold, without a penalty that drowns the grasp.
++        min_finger_dist = e[EM.FIELD_INDEX["min_finger_dist"]]
++        prev_reach = prev_e[EM.FIELD_INDEX["palm_obj_dist"]]
++        prev_finger = prev_e[EM.FIELD_INDEX["min_finger_dist"]]
++        prev_contacts = prev_e[EM.FIELD_INDEX["n_contacts"]]
++        prev_lift = prev_e[EM.FIELD_INDEX["lift"]]
++        contact_gate = jp.clip(n_contacts / self.cfg.contact_target, 0.0, 1.0)
++        prev_contact_gate = jp.clip(prev_contacts / self.cfg.contact_target, 0.0, 1.0)
++        in_contact = (n_contacts >= 1.0).astype(jp.float32)
++        not_flung = jp.clip(
++            (self.cfg.fling_xy_thresh - obj_xy) / (0.5 * self.cfg.fling_xy_thresh + 1e-6), 0.0, 1.0)
++        # Smooth fingertip-nearness gate (~1 when a fingertip is within ~close_near_scale of the
++        # object, decaying with distance) -- gates closure so the hand curls only as the fingertips
++        # arrive at the object, producing contact rather than empty-hand "air-closure".
++        finger_near = jp.exp(-(min_finger_dist / self.cfg.close_near_scale) ** 2)
++        # Potential-based approach shaping (Phi = -distance): F = gamma*Phi(s') - Phi(s) =
++        # prev_dist - gamma*cur_dist. Rewards progress toward the object, telescopes over the
++        # episode (bounded total ~ initial distance), does NOT penalize being far (so the policy is
++        # not pushed to retreat), and is policy-invariant -- letting the contact/grasp reward dominate.
++        g = self.cfg.pbrs_gamma
++        r_reach = self.cfg.w_reach * (prev_reach - g * reach_d)
++        r_finger = self.cfg.w_finger * (prev_finger - g * min_finger_dist)
++        # Lift fraction (0 on the table, 1 at/above success height). Scales the contact/hold rewards
++        # so a grip on the table pays only `contact_lift_floor` of full value and a raised grip pays
++        # full: this removes the flat high plateau (grasp-on-table) the policy was settling on and
++        # makes "raise the held cube" strictly more valuable than holding it grounded.
++        lift_frac = jp.clip(lift / self.cfg.success_height, 0.0, 1.0)
++        prev_lift_frac = jp.clip(prev_lift / self.cfg.success_height, 0.0, 1.0)
++        lift_scale = self.cfg.contact_lift_floor + (1.0 - self.cfg.contact_lift_floor) * lift_frac
++        r_contact = self.cfg.w_contact * contact_gate * lift_scale
++        # Sustained-contact (hold) reward: pays only when contact is held across consecutive steps,
++        # so the policy is rewarded for KEEPING a grip rather than a one-frame touch.
++        r_hold = self.cfg.w_hold * contact_gate * prev_contact_gate * lift_scale
++        # Closure reward FADES as contact forms (the (1 - contact_gate) factor): the hand is paid to
++        # curl toward contact, but NOT to keep closing once it grips -- removing the incentive to
++        # fist past the cube and lose it. Once gripping, r_hold (above) takes over.
+         if self._use_pose_grasp:
+-            r_close = self.cfg.w_close * e[EM.FIELD_INDEX["closure"]] * near
++            r_close = self.cfg.w_close * e[EM.FIELD_INDEX["closure"]] * finger_near * (1.0 - contact_gate)
+         else:
+             sep = jp.sum(jp.asarray([dx.ctrl[i] for i in range(self.nu)
+                                      if self.model.actuator(i).name in ("g_left", "g_right")]))
+-            r_close = -self.cfg.w_close * sep * near
+-        r_lift = self.cfg.w_lift * jp.clip(lift, 0.0, self.cfg.lift_target)
+-        r_success = self.cfg.w_success * jp.where(lift > self.cfg.success_height, 1.0, 0.0)
+-        return r_reach + r_close + r_lift + r_success
++            r_close = -self.cfg.w_close * sep * finger_near * (1.0 - contact_gate)
++        # Contact-gated height potential (Phi = object height): F = gamma*Phi(s') - Phi(s), gated by
++        # contact -- a continuous upward gradient that only pays while a grip is held, so raising the
++        # held object is reinforced (and dropping it penalized) instead of only at the 5cm threshold.
++        r_lift_pot = self.cfg.w_lift_pot * contact_gate * not_flung * (g * lift - prev_lift)
++        r_lift = self.cfg.w_lift * jp.clip(lift, 0.0, self.cfg.lift_target) * contact_gate * not_flung
++        # Sustained-aloft reward: the held-lift analog of r_hold. Pays only when the cube is BOTH
++        # currently and previously raised (lift_frac * prev_lift_frac) while gripped and not flung --
++        # a dense incentive to KEEP the object up across consecutive steps, not just bounce it.
++        r_lift_hold = self.cfg.w_lift_hold * contact_gate * not_flung * lift_frac * prev_lift_frac
++        r_success = self.cfg.w_success * jp.where(lift > self.cfg.success_height, 1.0, 0.0) * in_contact * not_flung
++        return (r_reach + r_finger + r_contact + r_hold + r_close
++                + r_lift_pot + r_lift + r_lift_hold + r_success)
+ 
+     def _reward(self, dx: mjx.Data, prev: dict[str, jp.ndarray],
+                 stage: jp.ndarray) -> tuple[jp.ndarray, dict]:
+         start = {"obj_start_z": prev["obj_start_z"], "obj_start_xy": prev["obj_start_xy"]}
+         e = self._eval(dx, start)
++        prev_e = prev["eval"]  # previous-step eval, for potential-based approach shaping
+         lift = e[EM.FIELD_INDEX["lift"]]
+         if self.reward_fn is not None:
+             reward = self.reward_fn(e, stage)            # LLM/curriculum reward spec
+         else:
+-            reward = self._builtin_reward(dx, e)
+-        success = jp.where(lift > self.cfg.success_height, 1.0, 0.0)
++            reward = self._builtin_reward(dx, e, prev_e)
++        # Contact-gated success: a real grasp-lift (lifted, touching, not flung) -- mirrors the
++        # reward gate so instant/sustained success and best-checkpoint selection cannot be gamed
++        # by flinging the object up with no contact.
++        n_contacts = e[EM.FIELD_INDEX["n_contacts"]]
++        obj_xy = e[EM.FIELD_INDEX["obj_xy_disp"]]
++        success = jp.where(
++            (lift > self.cfg.success_height) & (n_contacts >= 1.0) & (obj_xy < self.cfg.fling_xy_thresh),
++            1.0, 0.0)
+         metrics = dict(prev)
+         metrics.update(lift=lift, success=success, reach=e[EM.FIELD_INDEX["palm_obj_dist"]], eval=e)
+         return reward, metrics

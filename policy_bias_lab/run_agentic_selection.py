@@ -2,7 +2,7 @@
 
 Runs Stage-0 context -> diverse seeds -> explore/refine under a rollout budget (see
 AGENTIC_PRIOR_SELECTION.md and agentic_orchestrator.py), writes the winning prior program, and
-prints how to hand it to the slim PPO runner.
+prints how to hand it to the default PPO runner.
 
 Example:
   python -m policy_bias_lab.run_agentic_selection --out runs/agentic1 --rep freeform --budget 20
@@ -48,13 +48,14 @@ def main() -> int:
                     "for freeform_staged runs with a stage report).")
     ap.add_argument("--eps", type=float, default=1e-3, help="improvement tolerance.")
     ap.add_argument("--human-analogy", action="store_true", help="enable the optional C4 context.")
-    ap.add_argument("--arbiter", choices=["short_ppo", "prior_only", "open_loop"],
-                    default="short_ppo",
-                    help="short_ppo (default): rank on TRAINED contact-gated success (the real "
-                    "objective); open_loop: the cheap blind rollout score (prefilter-grade).")
+    ap.add_argument("--arbiter", choices=["ppo", "short_ppo", "prior_only", "open_loop"],
+                    default="ppo",
+                    help="ppo (default): rank on TRAINED contact-gated success using the default "
+                    "fragmented-stage trainer; short_ppo is accepted for old checkpoints; "
+                    "open_loop is the cheap blind rollout score (prefilter-grade).")
     ap.add_argument("--ppo-task", default="lift", help="task key for the PPO arbiter.")
     ap.add_argument("--ppo-train-seconds", type=float, default=180.0,
-                    help="short-PPO budget per candidate (the per-iteration cost).")
+                    help="PPO budget per candidate (the per-iteration cost).")
     ap.add_argument("--ppo-train-envs", type=int, default=256)
     ap.add_argument("--ppo-eval-envs", type=int, default=256)
     ap.add_argument("--eval-batches", type=int, default=1,
@@ -64,14 +65,19 @@ def main() -> int:
                     help="env episode length / rollout budget (horizon = episode_seconds / control_dt); "
                          "the stage-timing fit check budgets against this value.")
     ap.add_argument("--terminate-on-success", type=float, default=None, metavar="SECONDS",
-                    help="early termination for credit assignment: once the per-step success "
-                         "metric holds this long, later steps carry no reward/value/loss.")
+                    help="legacy short-rollout PPO option; ignored by the default fragmented trainer.")
     ap.add_argument("--terminate-on-failure", type=float, default=None, metavar="SECONDS",
-                    help="failure termination (the mirror): once the task's failure signal holds "
-                         "this long, later steps carry no reward/value/loss -- the mistake's cost "
-                         "lands on the actions that caused it, not the chase after it.")
+                    help="legacy short-rollout PPO option; ignored by the default fragmented trainer.")
     ap.add_argument("--score-envs", type=int, default=128, help="open_loop arbiter only.")
     ap.add_argument("--score-seed", type=int, default=0)
+    ap.add_argument("--final-frontier-objective-frac", type=float, default=0.5,
+                    help="final selection prefers the deepest ordered stage frontier among "
+                         "candidates whose objective is at least this fraction of the best "
+                         "objective; default 0.5. Set 1.0 for best-objective-only behavior.")
+    ap.add_argument("--frontier-completion-frac", type=float, default=0.25,
+                    help="ordered frontier threshold: stage 0 must be entered at this rate and "
+                         "each previous stage hand-off must occur at this rate before a later "
+                         "stage counts as reached; default 0.25.")
     ap.add_argument("--resume", action="store_true",
                     help="resume from <out>/checkpoint.pkl (written after every evaluation). "
                     "Config is restored from the checkpoint; any flag you pass EXPLICITLY on the "
@@ -115,6 +121,8 @@ def main() -> int:
         ppo_eval_envs=args.ppo_eval_envs, ppo_terminate_on_success=args.terminate_on_success,
         ppo_terminate_on_failure=args.terminate_on_failure,
         score_envs=args.score_envs, score_seed=args.score_seed,
+        final_frontier_objective_frac=args.final_frontier_objective_frac,
+        frontier_completion_frac=args.frontier_completion_frac,
         min_hours=args.min_hours, plateau_hours=args.plateau_hours,
         success_stop=args.success_stop, write_dash=args.dashboard,
     )

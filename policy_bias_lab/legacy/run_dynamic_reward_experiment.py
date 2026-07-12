@@ -35,11 +35,11 @@ from policy_bias_lab.legacy.dynamic_rewards import DynamicRewardCoach, DynamicRe
 from policy_bias_lab.es import BIAS_ARMS
 from policy_bias_lab.llm_bias import load_bias_spec
 from policy_bias_lab.legacy.phase_controller import load_phase_teacher
-from policy_bias_lab.ppo_bias import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
+from policy_bias_lab.legacy.short_rollout_ppo import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
 from policy_bias_lab.report_utils import summarize, write_csv
 from policy_bias_lab.tasks import task_metadata
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 

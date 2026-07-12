@@ -8,12 +8,12 @@ For each rep, with a fixed Stage-0 context:
            after r revisions. The marginal value of the r-th revision is best(r) - best(r-1).
 Repeat over `reps` independent samplings and average; the spread shows how reliable each lever is.
 
-Each evaluation is one arbiter call (default short-PPO == one short training run), so total cost ~
+Each evaluation is one arbiter call (default PPO == one fragmented-stage training run), so total cost ~
 reps * (K + R) PPO runs. Keep K/R/reps modest. Uses the orchestrator's own primitives so the
 ablation matches the real selection pipeline exactly.
 
   python -m policy_bias_lab.run_marginal_value --out runs/mv1 --k-seeds 6 --r-depth 6 --reps 3 \
-      --arbiter short_ppo --ppo-train-seconds 180
+      --arbiter ppo --ppo-train-seconds 180
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def main() -> int:
     ap.add_argument("--k-seeds", type=int, default=6, help="breadth: seeds generated/evaluated.")
     ap.add_argument("--r-depth", type=int, default=6, help="depth: refinement iters on the best seed.")
     ap.add_argument("--reps", type=int, default=3, help="independent samplings to average over.")
-    ap.add_argument("--arbiter", choices=["short_ppo", "open_loop"], default="short_ppo")
+    ap.add_argument("--arbiter", choices=["ppo", "short_ppo", "open_loop"], default="ppo")
     ap.add_argument("--ppo-task", default="lift")
     ap.add_argument("--ppo-train-seconds", type=float, default=180.0)
     ap.add_argument("--ppo-train-envs", type=int, default=256)

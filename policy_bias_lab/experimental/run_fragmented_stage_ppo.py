@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 from policy_bias_lab.bias import compile_bias
-from policy_bias_lab.experimental.fragmented_stage_ppo import (
+from policy_bias_lab.ppo_bias import (
     FragmentedStagePPOConfig,
     evaluate_fragmented_policy,
     train_fragmented_stage_ppo,
@@ -148,10 +148,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--residual-action-scale", type=float, default=1.0)
     p.add_argument("--no-action-prior", action="store_true")
     p.add_argument("--no-learn-prior-scale", action="store_true")
-    p.add_argument("--prior-scale-mode", choices=["scalar", "group", "per_joint"], default="scalar",
-                   help="Granularity of the learned prior-strength control: one knob for the whole "
-                        "prior (scalar), one per semantic actuator group (group: base_xy/base_z/"
-                        "wrist/thumb/index/...), or one per actuator (per_joint). All start at 1.0.")
+    p.add_argument("--prior-scale-mode", choices=["scalar", "group", "per_joint"], default="group",
+                   help="Granularity of the learned prior-strength control: one per robot semantic "
+                        "actuator group by default, one knob for the whole prior (scalar), or one "
+                        "per actuator (per_joint). All start at 1.0.")
     p.add_argument("--prior-scale-bias", type=float, default=1.0,
                    help="Prior strength scalar = clip(bias + gain*out, 0, 1). Defaults bias=gain=1 "
                         "start it at 1.0 (full prior) when the extra policy output is ~0, and the "

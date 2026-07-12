@@ -6,7 +6,7 @@ default path:
 
 * PPO updates on short fragments while carrying simulator state across fragments.
 * Dense stage-objective rewards authored by the prior program's per-stage ``success`` expressions.
-* A learned scalar in the policy output that gates how much of the action prior is applied.
+* Learned scale outputs in the policy head that gate how much of the action prior is applied.
 
 The dense stage rewards stay task-agnostic: the only "objective" content is the LLM-authored
 ``stage.success`` expression evaluated over the same raw/authored signal vocabulary as the prior.
@@ -63,12 +63,12 @@ class FragmentedStagePPOConfig:
     residual_action_scale: float = 1.0
     use_action_prior: bool = True
     learn_prior_scale: bool = True
-    # How finely the controller may tune the prior STRENGTH. "scalar": one [0,1] knob for the whole
-    # prior (original behaviour). "group": one knob per semantic actuator group (base_xy, base_z,
-    # wrist, thumb, index, ...) -- lets the policy hold the prior on the fingers while releasing it
-    # on base-z to lift, without dissolving the prior into per-joint noise. "per_joint": one knob per
-    # actuator (most expressive, weakest prior). All modes start at exactly 1.0 (full prior) at init.
-    prior_scale_mode: str = "scalar"
+    # How finely the controller may tune the prior STRENGTH. "group": one knob per semantic actuator
+    # group (robot-structure-derived, e.g. base/wrist/digit groups for this robot class) so the
+    # learned residual can release a problematic group without disabling the whole prior. "scalar"
+    # is kept as an explicit compatibility option; "per_joint" is most expressive and weakest-prior.
+    # All modes start at exactly 1.0 (full prior) at init.
+    prior_scale_mode: str = "group"
     prior_scale_bias: float = 1.0
     prior_scale_gain: float = 1.0
     stage_reward_weight: float = 1.0

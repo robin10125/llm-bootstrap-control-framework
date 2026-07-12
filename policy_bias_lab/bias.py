@@ -55,6 +55,7 @@ class CompiledBias:
     # prior is this compiled stateless fn(obs, weights) instead of the legacy rule sum. See
     # EXPERIMENT_situation_dependent_priors.md.
     prior_fn: Any = None
+    prior_step_fn: Any = None
     prior_default_weights: Any = None
     prior_info: dict[str, Any] | None = None
 
@@ -147,10 +148,14 @@ def compile_bias(spec: dict[str, Any], env: Any) -> CompiledBias:
         base_world_sgn = (float(sgn[0]), float(sgn[1]), float(sgn[2]))
     base_pos_obs_idx = tuple(int(i) for i in getattr(env, "base_pos_obs_idx", (0, 1, 2)))
     action_scale = float(getattr(getattr(env, "cfg", None), "action_scale", 0.05)) or 0.05
-    prior_fn = prior_default_weights = prior_info = None
+    prior_fn = prior_step_fn = prior_default_weights = prior_info = None
     if spec.get("prior_program"):
         from policy_bias_lab.composed_priors import make_composed_prior_fn
         prior_fn, prior_default_weights, prior_info = make_composed_prior_fn(env, spec["prior_program"])
+        if str(spec["prior_program"].get("mode")) == "freeform_staged":
+            from policy_bias_lab.freeform_priors import make_freeform_staged_step_fn
+            prior_step_fn, _dw, step_info = make_freeform_staged_step_fn(env, spec["prior_program"])
+            prior_info = {**(prior_info or {}), **step_info}
     return CompiledBias(
         spec=spec,
         reward_terms=_sanitize_reward_terms(spec.get("reward_terms", [])),
@@ -166,6 +171,7 @@ def compile_bias(spec: dict[str, Any], env: Any) -> CompiledBias:
         base_pos_obs_idx=base_pos_obs_idx,
         action_scale=action_scale,
         prior_fn=prior_fn,
+        prior_step_fn=prior_step_fn,
         prior_default_weights=prior_default_weights,
         prior_info=prior_info,
     )

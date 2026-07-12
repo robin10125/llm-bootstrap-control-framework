@@ -69,11 +69,12 @@ Concretely, when working on this code:
   regression -- the model authors its own tests, so unguarded eval-selection is self-grading.
   Do not loosen this guard.
 - **The ONE sanctioned prose exception** (user-approved 2026-07-04; extended with user approval
-  2026-07-05): the dexterity-conditional gentleness principle in
+  2026-07-05 and 2026-07-08): the dexterity-conditional gentleness principle in
   `prompts/framework_freeform_staged.md` AND mirrored in `prompts/revise_candidate.md` -- *if the
   model judges the task to be dexterous manipulation*: first contact at near-zero relative speed,
   a ceiling on contact force, only the minimum force each interaction needs, no displacing items,
-  budgets expressed as explicit signal/gate conditions. The applicability judgment stays with the
+  hard speed limits for translating body motion, non-oscillating positioning stages, budgets
+  expressed as explicit signal/gate/channel conditions. The applicability judgment stays with the
   model. Do not extend it further, add task nouns to it, or add other behavioral advice of this
   kind without explicit user approval. (The applied-force law itself -- servo_gain * (ctrl - q) --
   is injected robot data in `robot_spec`, not prose.)

@@ -71,9 +71,10 @@ def validate_program(env: Any, cand: dict, rep: str,
                 errors.append(f"candidate {cand.get('name')!r}: no 'stages' list")
             return None
         # Blend is NOT author-selectable: HARD one-stage selection (clip to [0,1] + argmax, exactly
-        # one stage active) is the only gate semantics -- chosen for strict no-overlap sequencing
-        # (orient-before-move). `temperature` is carried but vestigial (no longer softens selection).
-        prog = {"mode": "freeform_staged", "stages": stages}
+        # one stage active) is the only gate semantics. Stage progression defaults to a monotone
+        # cursor so completed ordinary stages do not reopen from current-signal drift.
+        prog = {"mode": "freeform_staged", "stages": stages,
+                "stage_progression": str(cand.get("stage_progression", "monotone"))}
         # LLM-authored derived signals (the only derived vocabulary; raw observables otherwise).
         # A candidate WITH `signals` compiles strictly against raw + its own names; compile
         # failures below reject it.
@@ -141,19 +142,29 @@ def _get_rollout(env: Any, prog: dict, envs: int) -> Callable:
     fn = _ROLLOUT_CACHE.get(key)
     if fn is not None:
         return fn
-    pf, dw, _ = make_composed_prior_fn(env, prog)
+    pf, dw, info = make_composed_prior_fn(env, prog)
+    step_prior = None
+    if str(prog.get("mode")) == "freeform_staged":
+        from policy_bias_lab.freeform_priors import make_freeform_staged_step_fn
+        step_prior, dw, info = make_freeform_staged_step_fn(env, prog)
     reset = jax.jit(lambda k: jax.vmap(env.reset)(k))
     step = jax.vmap(env.step)
 
     def rollout(rng):
         st = reset(jax.random.split(rng, envs))
+        stage_idx = jp.zeros((envs,), dtype=jp.int32)
 
-        def body(s, _):
-            a = jax.vmap(lambda o: pf(o, dw))(s.obs)
+        def body(carry, _):
+            s, cursor = carry
+            if step_prior is not None:
+                a, next_cursor = jax.vmap(lambda o, c: step_prior(o, dw, c))(s.obs, cursor)
+            else:
+                a = jax.vmap(lambda o: pf(o, dw))(s.obs)
+                next_cursor = cursor
             ns = step(s, a)
-            return ns, ns.metrics["eval"]
+            return (ns, next_cursor), ns.metrics["eval"]
 
-        _s, ev = jax.lax.scan(body, st, None, length=env.horizon)
+        (_s, _cursor), ev = jax.lax.scan(body, (st, stage_idx), None, length=env.horizon)
         return ev
 
     fn = jax.jit(rollout)

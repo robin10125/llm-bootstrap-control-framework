@@ -185,8 +185,12 @@ loop now:
 - **adopts** a revision as the new base when the objective improves OR the frontier advances. An
   unlock resets the chain's patience window (and the global one), giving the newly unlocked stage its
   own round of iterative improvement; `chain.best_obj` keeps the high-water mark so the objective
-  ratchet stays honest, and `finish()` still returns the best candidate by objective — a failed unlock
-  line cannot win the run;
+  ratchet stays honest. The frontier is an ordered chain measure: stage 0 must be dwell-entered and
+  every previous stage hand-off must clear `--frontier-completion-frac` (default 0.25) before a
+  later stage counts, so skipped stages or coincidental late-stage blips do not advance it.
+  `finish()` then selects the deepest-frontier candidate whose objective is still within the
+  configured floor of the best objective (`--final-frontier-objective-frac`, default 0.5), and
+  records the pure objective winner in the report for comparison;
 - feeds **rejected revisions** (`prior_failed_revisions`: name + objective, cleared on each accepted
   base) back into the revise diagnostics, with a prompt instruction not to re-propose them.
 For LONG training runs, raise `--ppo-train-seconds`: `training_convergence` then returns `converged`

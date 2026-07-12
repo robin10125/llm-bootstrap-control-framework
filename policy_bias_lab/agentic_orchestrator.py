@@ -200,6 +200,8 @@ def _framework_doc(rep: str) -> str:
 def _output_item(rep: str) -> str:
     if rep == "freeform_staged":
         return ("ir_version:1, "
+                "stage_progression:'monotone' (default; use 'reactive' only for explicit legacy "
+                "current-gate experiments), "
                 "signals:{'<name>':'<expr over observables or earlier signals>'} "
                 "(your derived-signal definitions), "
                 "parameters:{'<name>':{init:<number>, range:[lo,hi]}} (optional tunable scalar "
@@ -289,7 +291,7 @@ def _eval_battery_delta(old_diag: dict, new_diag: dict,
     return desc, solved
 
 
-def _frontier(diagnostics: dict) -> int:
+def _frontier(diagnostics: dict, completion_frac: float = 0.25) -> int:
     """Stage-progress depth of a candidate: the deepest stage entered through an ORDERED chain of
     dwell-qualified hand-offs (n_stages when the full chain completes). -1 when there is no staged
     report. Lets refinement value UNLOCKING a deeper stage even when the scalar objective
@@ -300,30 +302,70 @@ def _frontier(diagnostics: dict) -> int:
     spawn can be argmax-dominant from step 0, so "reaches_terminal"/stall alone certify gate
     arithmetic, not progress -- a candidate that idled in its default terminal stage jumped the
     frontier 3->6 and two objective regressions were adopted for it. A hand-off only counts here
-    if the ordered i -> i+1 transition (stage_transition_stats) fires in >= 5% of episodes."""
+    if every previous ordered i -> i+1 transition clears the completion threshold."""
     sr = (diagnostics or {}).get("stage_report") if isinstance(diagnostics, dict) else None
     if not isinstance(sr, dict) or not sr.get("stage_names"):
         return -1
     n = len(sr["stage_names"])
+    threshold = max(0.0, min(1.0, float(completion_frac)))
     entered = sr.get("entered_frac")
     handoff = sr.get("handoff_frac")
     if entered and handoff and len(entered) == n:
-        start = next((i for i, e in enumerate(entered) if e is not None and e >= 0.1), None)
-        if start is None:
+        if not entered or entered[0] is None or float(entered[0]) < threshold:
             return 0
-        d = start
-        while d < n - 1 and d < len(handoff) and handoff[d] is not None and handoff[d] >= 0.05:
+        d = 0
+        while (d < n - 1 and d < len(handoff) and handoff[d] is not None
+               and float(handoff[d]) >= threshold):
             d += 1
-        if d == start:
-            # No ordered hand-off fired anywhere. A deep `start` here is default-dominance
-            # (only that stage's gate ever wins, e.g. a terminal gate true at spawn), not depth.
-            return 0
         return n if d == n - 1 else d
     # legacy reports without transition stats: the old dominance-based rule
     if sr.get("reaches_terminal"):
         return len(sr["stage_names"])
     s = sr.get("stall_stage")
     return -1 if s is None else int(s)
+
+
+def _objective_floor(best_obj: float, keep_frac: float) -> float:
+    """Minimum objective for frontier-preferred final selection.
+
+    For the usual nonnegative graded objectives, keep_frac=0.5 means "at least 50% of the best
+    objective." The fallback handles legacy/objectives that can be <=0 without making every
+    negative score ineligible.
+    """
+    f = max(0.0, min(1.0, float(keep_frac)))
+    b = float(best_obj)
+    if b > 0.0:
+        return f * b
+    return b - (1.0 - f) * max(abs(b), 1.0)
+
+
+def _select_final_candidate(records: list[dict], keep_frac: float,
+                            completion_frac: float = 0.25) -> tuple[dict, dict]:
+    """Prefer structural frontier among candidates close enough to the best objective."""
+    objective_best = max(records, key=lambda r: r["objective"])
+    floor = _objective_floor(float(objective_best["objective"]), keep_frac)
+    eligible = [r for r in records if float(r["objective"]) >= floor]
+    selected = max(eligible, key=lambda r: (_frontier(r.get("diagnostics") or {}, completion_frac),
+                                           float(r["objective"])))
+    selected_frontier = _frontier(selected.get("diagnostics") or {}, completion_frac)
+    objective_frontier = _frontier(objective_best.get("diagnostics") or {}, completion_frac)
+    reason = "best_objective"
+    if selected is not objective_best:
+        reason = "best_frontier_within_objective_floor"
+    return selected, {
+        "reason": reason,
+        "objective_floor_fraction": max(0.0, min(1.0, float(keep_frac))),
+        "objective_floor": round(float(floor), 6),
+        "frontier_completion_fraction": max(0.0, min(1.0, float(completion_frac))),
+        "selected_frontier": selected_frontier,
+        "best_objective_frontier": objective_frontier,
+        "best_objective": {
+            "name": objective_best.get("name"),
+            "source": objective_best.get("source"),
+            "objective": objective_best.get("objective"),
+            "frontier": objective_frontier,
+        },
+    }
 
 
 @dataclass
@@ -347,7 +389,7 @@ class AgenticOrchestrator:
     eps: float = 1e-3                # improvement tolerance
     use_human_analogy: bool = False  # deprecated no-op: Stage-0 now always starts with a generic
                                      # comprehensive body-action account
-    arbiter: str = "short_ppo"       # "short_ppo" (trained-success, the real objective) |
+    arbiter: str = "ppo"             # "ppo" (trained-success, the real objective) |
                                      # "prior_only" (untrained, one rollout batch -- pure prior
                                      # quality, no training/reward confound) | "open_loop" (legacy)
     refine_top: int = 2              # max chains kept for refinement (2nd+ only if competitive)
@@ -360,6 +402,10 @@ class AgenticOrchestrator:
     eval_batches: int = 1            # rollout batches per prior_only evaluation (variance control)
     score_envs: int = 128            # open-loop arbiter only
     score_seed: int = 0
+    final_frontier_objective_frac: float = 0.5  # final selection: deepest frontier among candidates
+                                               # within this fraction of the best objective
+    frontier_completion_frac: float = 0.25      # ordered frontier threshold: stage 0 entered and
+                                               # every previous hand-off must clear this rate
     stop_after: int | None = None    # pause (checkpoint + exit) after this many evals THIS SESSION
     # Wall-clock termination (long runs). Setting plateau_hours switches the loop into wall-clock
     # mode: iteration-count plateau stops and chain deactivation are DISABLED, and the run ends
@@ -378,7 +424,9 @@ class AgenticOrchestrator:
                    "arbiter", "ppo_task", "ppo_train_seconds", "ppo_train_envs", "ppo_eval_envs",
                    "ppo_terminate_on_success", "ppo_terminate_on_failure",
                    "refine_top", "eval_batches", "score_envs",
-                   "score_seed", "min_hours", "plateau_hours", "success_stop", "write_dash")
+                   "score_seed", "final_frontier_objective_frac",
+                   "frontier_completion_frac",
+                   "min_hours", "plateau_hours", "success_stop", "write_dash")
     # Mutable progress restored verbatim on resume.
     STATE_KEYS = ("iters", "evaluated", "since_improve_global", "best_obj_global", "log",
                   "context_block", "seeds", "chains", "chosen_idx", "rr", "next_seed",
@@ -676,7 +724,7 @@ class AgenticOrchestrator:
     # -- evaluation (one budget iteration) -----------------------------------------------------
     def _eval(self, raw_cand: dict, source: str,
               errors: list[str] | None = None) -> dict | None:
-        # Cheap compile-check + DOF accounting BEFORE spending a (short-PPO) iteration on it.
+        # Cheap compile-check + DOF accounting BEFORE spending a (PPO) iteration on it.
         # A validation reject consumes NO budget iteration; `errors` (when given) collects the
         # reject reason so the caller can feed it back to the LLM instead of losing it.
         prog = validate_program(self.env, raw_cand, self.rep, errors=errors)
@@ -684,8 +732,8 @@ class AgenticOrchestrator:
             return None
         acc = accounting(self.env, prog, self.rep, raw_cand)
         best_params = None
-        if self.arbiter == "short_ppo":
-            # The real arbiter: train a short PPO, rank on TRAINED contact-gated success, and read
+        if self.arbiter in {"ppo", "short_ppo"}:
+            # The real arbiter: train PPO, rank on TRAINED contact-gated success, and read
             # the policy's actual behavior for the feedback loop. See ppo_arbiter (why open-loop
             # is not trusted as the arbiter).
             res = evaluate_candidate_ppo(
@@ -704,7 +752,7 @@ class AgenticOrchestrator:
             best_params = res["best_params"]
         elif self.arbiter == "prior_only":
             # No training: one rollout batch of the prior at PPO iteration 0. Pure prior quality,
-            # free of the reward/training confound (and ~100x cheaper than short_ppo).
+            # free of the reward/training confound (and cheaper than PPO training).
             res = evaluate_candidate_prior_only(
                 self.env, prog, task=self.ppo_task, seed=self.score_seed,
                 eval_envs=self.ppo_eval_envs, n_batches=self.eval_batches)
@@ -774,7 +822,9 @@ class AgenticOrchestrator:
                         _Chain(name=str(cand.get("name") or f"seed{len(self.chains)}"),
                                raw_cand=cand, program=rec["program"],
                                diagnostics=rec["diagnostics"], best_obj=rec["objective"],
-                               history=[rec["objective"]], frontier=_frontier(rec["diagnostics"])))
+                               history=[rec["objective"]],
+                               frontier=_frontier(rec["diagnostics"],
+                                                  self.frontier_completion_frac)))
                 self.save_checkpoint()
                 reason = self._wall_stop()
                 if reason and self.success_stop is not None and "success criterion" in reason:
@@ -897,7 +947,7 @@ class AgenticOrchestrator:
             revise_fail_streak = 0
             chain.history.append(rec["objective"])
             improved = rec["objective"] > chain.best_obj + self.eps
-            new_frontier = _frontier(rec["diagnostics"])
+            new_frontier = _frontier(rec["diagnostics"], self.frontier_completion_frac)
             unlocked = new_frontier > chain.frontier
             # Authored-eval tie-break (partial selection): a revision whose objective stays within
             # the measured noise band may be adopted on a strict improvement of the SHARED authored
@@ -954,9 +1004,10 @@ class AgenticOrchestrator:
         return self.finish()
 
     def finish(self) -> dict:
-        best = max(self.evaluated, key=lambda r: r["objective"])
+        best, selection = _select_final_candidate(
+            self.evaluated, self.final_frontier_objective_frac, self.frontier_completion_frac)
         (self.out_dir / "best_program.json").write_text(json.dumps(best["program"], indent=2) + "\n")
-        # Save the winner's trained weights (short-PPO arbiter) so they can be reused / extended.
+        # Save the winner's trained weights (PPO arbiter) so they can be reused / extended.
         if best.get("best_params") is not None:
             import pickle
             with (self.out_dir / "best_params.pkl").open("wb") as f:
@@ -965,18 +1016,27 @@ class AgenticOrchestrator:
             "task": self.task, "representation": self.rep, "dof_mode": self.dof_mode,
             "arbiter": self.arbiter, "budget": self.budget, "iters_used": self.iters,
             "n_seeds": self.n_seeds, "wall_hours": round(self._elapsed() / 3600.0, 3),
+            "selection": selection,
             "best": {"name": best["name"], "source": best["source"],
                      "objective": best["objective"], "accounting": best["accounting"],
                      "diagnostics": best["diagnostics"], "full": best["full"]},
             "trajectory": [{"iter": r["iter"], "source": r["source"], "name": r["name"],
                             "objective": r["objective"], "wrist_driven": r["accounting"].get("wrist_driven"),
-                            "n_driven": r["accounting"].get("n_driven")}
+                            "n_driven": r["accounting"].get("n_driven"),
+                            "frontier": _frontier(r.get("diagnostics") or {},
+                                                  self.frontier_completion_frac)}
                            for r in self.evaluated],
             "explore": self.log.get("explore"), "refining": self.log.get("refining"),
         }
         (self.out_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(f"[done] best obj={best['objective']:+.4f} ({best['source']} '{best['name']}') "
-              f"after {self.iters} iters -> {self.out_dir / 'best_program.json'}")
+        extra = ""
+        if selection["reason"] != "best_objective":
+            bo = selection["best_objective"]
+            extra = (f" [frontier-selected over best objective {bo['objective']:+.4f} "
+                     f"frontier={bo['frontier']}]")
+        print(f"[done] selected obj={best['objective']:+.4f} frontier={selection['selected_frontier']} "
+              f"({best['source']} '{best['name']}'){extra} after {self.iters} iters "
+              f"-> {self.out_dir / 'best_program.json'}")
         return report
 
 
@@ -1029,21 +1089,24 @@ def _directive(rep: dict, k: int, focus_side: str | None) -> str:
     names = rep["stage_names"]
     entered = rep.get("entered_frac") or []
     nxt = names[k + 1] if k + 1 < len(names) else "?"
+    frontier = (f"The frontier target is the hand-off stage {k} -> stage {k + 1}; "
+                f"a useful revision makes stage {k + 1} dwell-enter reliably without breaking "
+                f"earlier stages or reducing the objective.")
     entry_valid = k < len(entered) and entered[k] is not None and entered[k] >= 0.1
     if focus_side == "entry" and entry_valid:
         return (f"FOCUS = ENTRY side of the hand-off: revise ONLY stage {k + 1} ('{nxt}') -- its "
                 f"GATE (this hand-off's entry condition) and/or its channels -- so it takes over "
                 f"in the states stage {k} actually produces (see the signal table below). Return "
-                f"every OTHER stage byte-identical to the input.")
+                f"every OTHER stage byte-identical to the input. {frontier}")
     if focus_side == "exit":
         return (f"FOCUS = EXIT side of the hand-off: the entry side (stage {k + 1}) was already "
                 f"tried and rejected -- see prior_failed_revisions in the diagnostics. Now revise "
                 f"ONLY stage {k} -- change WHAT IT DELIVERS: its channels (move the signals into "
                 f"the next gate's region) and/or its own gate (yield earlier or elsewhere). "
-                f"Return every OTHER stage byte-identical to the input.")
+                f"Return every OTHER stage byte-identical to the input. {frontier}")
     return (f"Revise ONLY stage {k} -- its gate (its exit/hand-off condition) and/or its "
             f"channels -- so the policy can make the transition. Return every OTHER stage "
-            f"byte-identical to the input.")
+            f"byte-identical to the input. {frontier}")
 
 
 def _select_focus(rep: dict) -> tuple[str, int | None]:
@@ -1189,6 +1252,41 @@ def _ev_signal_trend(rep: dict, diag: dict, k: int) -> str | None:
             f"of the episode: {rows}.")
 
 
+def _ev_contact_forces(rep: dict, diag: dict, k: int) -> str | None:
+    cf = rep.get("contact_forces")
+    if not isinstance(cf, dict):
+        return None
+
+    def row(kind: str) -> dict | None:
+        block = cf.get(kind) or {}
+        rows = block.get("per_stage") or []
+        return rows[k] if k < len(rows) and isinstance(rows[k], dict) else None
+
+    def summarize(r: dict | None) -> str | None:
+        if not r:
+            return None
+        vals = []
+        for reg, v in r.items():
+            if reg in ("stage", "max_any_region") or not isinstance(v, dict):
+                continue
+            mx = v.get("max")
+            mean = v.get("mean")
+            if mx is not None and (mx > 0.0 or (mean is not None and mean > 0.0)):
+                vals.append((reg, mean, mx))
+        if not vals:
+            return "none"
+        vals.sort(key=lambda x: (x[2] if x[2] is not None else 0.0), reverse=True)
+        return ", ".join(f"{reg} mean {mean} max {mx}" for reg, mean, mx in vals[:4])
+
+    obj = summarize(row("object_contact"))
+    env = summarize(row("environment_contact"))
+    if obj is None and env is None:
+        return None
+    return (f"CONTACT FORCES while stage {k} is active (N): object-contact by region: "
+            f"{obj or 'unreported'}; environment-contact by region: {env or 'unreported'}. "
+            "These are separate sensed quantities.")
+
+
 def _ev_intent_execution(rep: dict, diag: dict, k: int) -> str | None:
     ie = [r for r in (rep.get("intent_execution") or []) if r.get("gap", 0) >= 0.05]
     if not ie:
@@ -1320,8 +1418,8 @@ def _ev_edit_menu(rep: dict, diag: dict, k: int) -> str | None:
 
 # Evidence renderers, applied in this fixed order (the order matters for the rendered prompt).
 _EVIDENCE = (_ev_timing, _ev_discrepancy, _ev_failure_attribution, _ev_skipped, _ev_pretrain,
-             _ev_signal_trend, _ev_intent_execution, _ev_tracking, _ev_probes, _ev_next_gate,
-             _ev_self_lock, _ev_edit_menu)
+             _ev_signal_trend, _ev_contact_forces, _ev_intent_execution, _ev_tracking, _ev_probes,
+             _ev_next_gate, _ev_self_lock, _ev_edit_menu)
 
 
 def _stage_focus(diagnostics: dict, focus_side: str | None = None) -> str:
