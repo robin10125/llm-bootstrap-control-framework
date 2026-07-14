@@ -22,10 +22,9 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(".xla_cache").resolv
 import jax
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 from policy_bias_lab.bias import compile_bias
-from policy_bias_lab.ppo_bias import (
+from policy_bias_lab.training.fragmented_ppo import (
     FragmentedStagePPOConfig,
     evaluate_fragmented_policy,
     train_fragmented_stage_ppo,
@@ -34,9 +33,7 @@ from policy_bias_lab.ppo_bias import (
 
 def main() -> int:
     args = parse_args()
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     args.out.mkdir(parents=True, exist_ok=True)
     program = json.loads(args.program.read_text())

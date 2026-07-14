@@ -1,7 +1,7 @@
 """Alternative prior-influence methods for PPO (experimental).
 
 Four ways for an LLM-authored action prior to influence training WITHOUT sitting in the final
-policy's action path (contrast with policy_bias_lab.ppo_bias, where env_action =
+policy's action path (contrast with policy_bias_lab.training.fragmented_ppo, where env_action =
 residual + prior_scale * prior):
 
   proposal        -- Prior as EXPLORATION PROPOSAL. The neural policy defines the action
@@ -23,6 +23,11 @@ residual + prior_scale * prior):
                      the critic additionally sees stage-cursor one-hot, the prior's suggested
                      action, its norm, prior-policy disagreement, and stage success margins.
                      The policy interface (actor input/output) is unchanged.
+                     Optional extras: parallel per-stage gate values (all stages, cursor-
+                     independent, so the critic can form its own stage attention instead of
+                     trusting the authored cursor); always-on channel actions of CRITICAL stages
+                     (name-matched, e.g. grasp/lift), fed regardless of cursor position; and
+                     MULTIPLE programs (a feature union), each with its own cursor and blocks.
   kl_prior        -- Prior as a KL-REGULARIZED EXPLORATION DIRECTION. The prior defines a
                      reference distribution (pre-tanh Gaussian centered at atanh(prior) with width
                      kl_sigma_ref); the PPO loss adds beta * KL(pi || pi_ref) per state. The policy
@@ -32,7 +37,7 @@ residual + prior_scale * prior):
                      toward a growing KL budget via kl_target), so the optimal policy is preserved.
 
 All four share the fragmented-PPO skeleton and the arbiter-parity evaluation of
-policy_bias_lab.ppo_bias, so results are directly comparable to the baseline arm.
+policy_bias_lab.training.fragmented_ppo, so results are directly comparable to the baseline arm.
 Task knowledge enters ONLY through the LLM-authored prior program; this module stays
 task-agnostic.
 """
@@ -49,9 +54,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
-if str(BOOTSTRAPPING) not in sys.path:
-    sys.path.insert(0, str(BOOTSTRAPPING))
 
 import flax.linen as nn
 import jax
@@ -59,11 +61,16 @@ import jax.numpy as jp
 import numpy as np
 import optax
 
-import ppo
+from experiment_runtime import ppo
 
 from policy_bias_lab.bias import CompiledBias
-from policy_bias_lab.freeform_priors import compile_expr, program_signal_fn
-from policy_bias_lab.ppo_bias import (
+from policy_bias_lab.freeform_priors import (
+    _compile_staged_components,
+    compile_expr,
+    make_freeform_staged_step_fn,
+    program_signal_fn,
+)
+from policy_bias_lab.training.fragmented_ppo import (
     _eval_summary,
     _merge_eval_summaries,
     make_stage_reward_fn,
@@ -131,6 +138,9 @@ class AltPPOConfig:
     critic_prior_action: bool = True
     critic_prior_norms: bool = True      # prior action norm + prior-policy disagreement
     critic_success_margins: bool = True
+    critic_gate_values: bool = False     # ALL stages' clip(gate,0,1) in parallel (cursor-free)
+    critic_critical_actions: bool = False  # always-on channel actions of critical stages
+    critical_stage_keywords: tuple[str, ...] = ("grasp", "lift")  # substring match on stage name
 
 
 class Actor(nn.Module):
@@ -183,6 +193,66 @@ def make_success_values_fn(env: Any, program: dict[str, Any]):
     return values, len(compiled)
 
 
+def make_gate_values_fn(env: Any, program: dict[str, Any]):
+    """All stages' clip(gate, 0, 1) values, evaluated in PARALLEL (cursor-independent).
+
+    Unlike the cursor one-hot (which trusts the authored monotone progression), this exposes the
+    raw evidence of every stage's gate at once, so the critic can learn its own stage attention.
+    """
+    if program.get("mode") != "freeform_staged" or not program.get("stages"):
+        def zero(obs):
+            return jp.zeros((0,), dtype=jp.float32)
+        return zero, 0
+    _a, signals, _n, _t, _p, _s, compiled, _names = _compile_staged_components(env, program)
+
+    def gates(obs):
+        sig = signals(obs)
+        return jp.clip(jp.stack([jp.asarray(g(sig), dtype=jp.float32) for g, _ in compiled]),
+                       0.0, 1.0)
+
+    return gates, len(compiled)
+
+
+def make_critical_actions_fn(env: Any, program: dict[str, Any], keywords: tuple[str, ...]):
+    """Channel actions of CRITICAL stages (name contains a keyword), evaluated UNCONDITIONALLY.
+
+    The active-stage prior action only shows the critic what the cursor's stage would do; this
+    feeds the critical stages' suggested actions at EVERY step, so e.g. "what would the grasp
+    controller do here" is visible before/after the cursor thinks grasping is happening.
+    """
+    if program.get("mode") != "freeform_staged" or not program.get("stages"):
+        def zero(obs):
+            return jp.zeros((0,), dtype=jp.float32)
+        return zero, []
+    action_dim, signals, _n, _t, _p, _s, compiled, names = _compile_staged_components(env, program)
+    kws = tuple(k.strip().lower() for k in keywords if k.strip())
+    crit = [i for i, nm in enumerate(names) if any(k in nm.lower() for k in kws)]
+
+    def acts(obs):
+        sig = signals(obs)
+        outs = []
+        for i in crit:
+            out = jp.zeros((action_dim,), dtype=jp.float32)
+            for idx, ev in compiled[i][1]:
+                out = out.at[idx].add(jp.clip(ev(obs, sig), -1.0, 1.0))
+            outs.append(jp.clip(out, -1.0, 1.0))
+        return (jp.concatenate(outs) if outs
+                else jp.zeros((0,), dtype=jp.float32))
+
+    return acts, [names[i] for i in crit]
+
+
+def _compile_program_features(env: Any, cfg: AltPPOConfig, program: dict[str, Any]) -> dict:
+    """Compiled critic-feature pieces for ONE program (a union member gets one of these each)."""
+    n_stages = len(program.get("stages", [])) if program.get("mode") == "freeform_staged" else 0
+    succ_fn, n_succ = make_success_values_fn(env, program)
+    gate_fn, _ng = make_gate_values_fn(env, program) if cfg.critic_gate_values else (None, 0)
+    crit_fn, crit_names = (make_critical_actions_fn(env, program, cfg.critical_stage_keywords)
+                           if cfg.critic_critical_actions else (None, []))
+    return {"n_stages": n_stages, "succ_fn": succ_fn, "n_succ": n_succ,
+            "gate_fn": gate_fn, "crit_fn": crit_fn, "crit_names": list(crit_names)}
+
+
 def _anneal(init: float, final: float, it: int, anneal_iters: int) -> float:
     if anneal_iters <= 0:
         return final
@@ -190,19 +260,24 @@ def _anneal(init: float, final: float, it: int, anneal_iters: int) -> float:
     return float(init + (final - init) * frac)
 
 
-def _critic_feature_dim(cfg: AltPPOConfig, n_stages: int, action_dim: int, n_succ: int) -> int:
+def _critic_feature_dim(cfg: AltPPOConfig, action_dim: int, specs: list[dict]) -> int:
     # Minimum width 1 (a constant zero column) so [T*E, F] reshapes stay well-defined.
     dim = 1
     if cfg.method != "critic_features":
         return dim
-    if cfg.critic_stage_onehot:
-        dim += n_stages
-    if cfg.critic_prior_action:
-        dim += action_dim
-    if cfg.critic_prior_norms:
-        dim += 2
-    if cfg.critic_success_margins:
-        dim += n_succ
+    for sp in specs:
+        if cfg.critic_stage_onehot:
+            dim += sp["n_stages"]
+        if cfg.critic_prior_action:
+            dim += action_dim
+        if cfg.critic_prior_norms:
+            dim += 2
+        if cfg.critic_success_margins:
+            dim += sp["n_succ"]
+        if cfg.critic_gate_values:
+            dim += sp["n_stages"]
+        if cfg.critic_critical_actions:
+            dim += len(sp["crit_names"]) * action_dim
     return dim
 
 
@@ -215,11 +290,16 @@ def make_alt_collect(
     program: dict[str, Any],
     cfg: AltPPOConfig,
     deterministic: bool,
+    extra_programs: list[dict[str, Any]] | None = None,
 ):
     """Fragment collector shared by all four methods.
 
     collect(params, state, cursor, warmup_target, step_offset, knobs, key, action_prior_weights)
       -> (state, cursor, traj, last_value, eval_summary)
+
+    cursor is [E, P] int32, one column per program (P = 1 + len(extra_programs); column 0 is the
+    primary program, whose prior also serves the action-path methods). Extra programs are
+    critic_features-only: each contributes its own cursor and feature blocks (a feature UNION).
 
     knobs = jp.array([proposal_prob]) traced scalars so annealing does not retrigger compilation.
     Traj layout (each [T, E, ...]):
@@ -228,10 +308,15 @@ def make_alt_collect(
     """
     step_fn = jax.vmap(env.step)
     action_dim = int(env.action_size)
-    n_stages = len(program.get("stages", [])) if program.get("mode") == "freeform_staged" else 0
     succ_values, n_succ = make_success_values_fn(env, program)
     temp = max(float(cfg.stage_success_temperature), 1e-6)
     pot_temp = max(float(cfg.potential_temp), 1e-6)
+
+    extras = list(extra_programs or [])
+    if extras and cfg.method != "critic_features":
+        raise ValueError("extra programs are only supported for method=critic_features")
+    specs = [_compile_program_features(env, cfg, p) for p in [program] + extras]
+    extra_step_fns = [make_freeform_staged_step_fn(env, p)[0] for p in extras]
 
     if cfg.method == "value_shaping":
         stage_reward_fn, _n = make_stage_reward_fn(env, program, cfg)
@@ -243,28 +328,47 @@ def make_alt_collect(
             return jp.float32(0.0)
         return jp.mean(jax.nn.sigmoid(succ_values(obs) / pot_temp))
 
-    def prior_step(obs, cursor, action_prior_weights):
+    def prior_step(obs, cursor0, action_prior_weights):
         if bias.prior_step_fn is not None:
-            return jax.vmap(lambda o, c: bias.prior_step_fn(o, action_prior_weights, c))(obs, cursor)
+            return jax.vmap(lambda o, c: bias.prior_step_fn(o, action_prior_weights, c))(obs,
+                                                                                         cursor0)
         if bias.prior_fn is not None:
             prior = jax.vmap(lambda o: bias.prior_fn(o, action_prior_weights))(obs)
-            return prior, cursor
-        return jp.zeros((obs.shape[0], action_dim), dtype=jp.float32), cursor
+            return prior, cursor0
+        return jp.zeros((obs.shape[0], action_dim), dtype=jp.float32), cursor0
 
-    def critic_feats(obs, cursor, prior, mean_action):
+    def all_priors(obs, cursors, action_prior_weights):
+        """Every program's active-stage action (clipped) and advanced cursors [E, P]."""
+        prior0, next0 = prior_step(obs, cursors[:, 0], action_prior_weights)
+        priors = [jp.clip(prior0, -1.0, 1.0)]
+        nexts = [next0.astype(jp.int32)]
+        for pi, sfn in enumerate(extra_step_fns, start=1):
+            a, c = jax.vmap(lambda o, cc, _s=sfn: _s(o, None, cc))(obs, cursors[:, pi])
+            priors.append(jp.clip(a, -1.0, 1.0))
+            nexts.append(c.astype(jp.int32))
+        return priors, jp.stack(nexts, axis=1)
+
+    def critic_feats(obs, cursors, priors, mean_action):
         parts = [jp.zeros((obs.shape[0], 1), dtype=jp.float32)]  # keep feature width >= 1
         if cfg.method == "critic_features":
-            if cfg.critic_stage_onehot and n_stages:
-                parts.append(jax.nn.one_hot(cursor, n_stages, dtype=jp.float32))
-            if cfg.critic_prior_action:
-                parts.append(prior)
-            if cfg.critic_prior_norms:
-                scale = 1.0 / jp.sqrt(float(action_dim))
-                parts.append(jp.linalg.norm(prior, axis=-1, keepdims=True) * scale)
-                parts.append(jp.linalg.norm(prior - mean_action, axis=-1, keepdims=True) * scale)
-            if cfg.critic_success_margins and n_succ:
-                margins = jax.vmap(lambda o: jax.nn.sigmoid(succ_values(o) / temp))(obs)
-                parts.append(margins)
+            scale = 1.0 / jp.sqrt(float(action_dim))
+            for pi, sp in enumerate(specs):
+                prior = priors[pi]
+                if cfg.critic_stage_onehot and sp["n_stages"]:
+                    parts.append(jax.nn.one_hot(cursors[:, pi], sp["n_stages"], dtype=jp.float32))
+                if cfg.critic_prior_action:
+                    parts.append(prior)
+                if cfg.critic_prior_norms:
+                    parts.append(jp.linalg.norm(prior, axis=-1, keepdims=True) * scale)
+                    parts.append(jp.linalg.norm(prior - mean_action, axis=-1, keepdims=True)
+                                 * scale)
+                if cfg.critic_success_margins and sp["n_succ"]:
+                    parts.append(jax.vmap(
+                        lambda o, _f=sp["succ_fn"]: jax.nn.sigmoid(_f(o) / temp))(obs))
+                if cfg.critic_gate_values and sp["n_stages"]:
+                    parts.append(jax.vmap(sp["gate_fn"])(obs))
+                if cfg.critic_critical_actions and sp["crit_names"]:
+                    parts.append(jax.vmap(sp["crit_fn"])(obs))
         return jp.concatenate(parts, axis=-1)
 
     def policy_step(params, obs, cursor, warmup_target, t_global, knobs, key,
@@ -277,9 +381,9 @@ def make_alt_collect(
         else:
             pre_action = mean + jp.exp(log_std) * jax.random.normal(pk, mean.shape)
         policy_action = jp.tanh(pre_action)
-        prior, next_cursor = prior_step(obs, cursor, action_prior_weights)
-        prior = jp.clip(prior, -1.0, 1.0)
-        feats = critic_feats(obs, cursor, prior, jp.tanh(mean))
+        priors, next_cursor = all_priors(obs, cursor, action_prior_weights)
+        prior = priors[0]
+        feats = critic_feats(obs, cursor, priors, jp.tanh(mean))
         value, aux = critic.apply(params["critic"], obs, feats)
 
         mask = jp.ones((obs.shape[0],), dtype=jp.float32)
@@ -344,8 +448,8 @@ def make_alt_collect(
         (state, cursor, key), traj = jax.lax.scan(
             body, (state, cursor, key), jp.arange(int(cfg.fragment_steps)))
         mean, log_std = actor.apply(params["actor"], state.obs)
-        prior, _c = prior_step(state.obs, cursor, action_prior_weights)
-        feats = critic_feats(state.obs, cursor, jp.clip(prior, -1.0, 1.0), jp.tanh(mean))
+        priors, _c = all_priors(state.obs, cursor, action_prior_weights)
+        feats = critic_feats(state.obs, cursor, priors, jp.tanh(mean))
         last_value, _aux = critic.apply(params["critic"], state.obs, feats)
         eval_summary = _eval_summary(traj[12])
         return state, cursor, traj, last_value, eval_summary
@@ -484,6 +588,7 @@ def train_alt_ppo(
     seed: int,
     cfg: AltPPOConfig,
     out_dir: Path | None = None,
+    extra_programs: list[dict[str, Any]] | None = None,
 ) -> tuple[Any, list[dict[str, Any]], Any, float, int]:
     """Train one alternative-method PPO arm on fixed-length fragments."""
     if cfg.method not in METHODS:
@@ -495,9 +600,10 @@ def train_alt_ppo(
         out_dir.mkdir(parents=True, exist_ok=True)
 
     action_dim = int(env.action_size)
-    n_stages = len(program.get("stages", [])) if program.get("mode") == "freeform_staged" else 0
-    _sv, n_succ = make_success_values_fn(env, program)
-    feat_dim = _critic_feature_dim(cfg, n_stages, action_dim, n_succ)
+    extras = list(extra_programs or [])
+    n_programs = 1 + len(extras)
+    specs = [_compile_program_features(env, cfg, p) for p in [program] + extras]
+    feat_dim = _critic_feature_dim(cfg, action_dim, specs)
 
     key = jax.random.PRNGKey(seed)
     key, ak, ck = jax.random.split(key, 3)
@@ -512,7 +618,7 @@ def train_alt_ppo(
     opt_state = optimizer.init(params)
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
     collect = make_alt_collect(env=env, actor=actor, critic=critic, bias=bias, program=program,
-                               cfg=cfg, deterministic=False)
+                               cfg=cfg, deterministic=False, extra_programs=extras)
     update = make_alt_update(actor=actor, critic=critic, optimizer=optimizer, cfg=cfg)
     action_prior_weights = bias.default_action_prior_weights()
 
@@ -520,7 +626,7 @@ def train_alt_ppo(
 
     if cfg.warmup_compile:
         state0 = reset(jax.random.split(jax.random.PRNGKey(seed + 99), cfg.envs))
-        cursor0 = jp.zeros((cfg.envs,), dtype=jp.int32)
+        cursor0 = jp.zeros((cfg.envs, n_programs), dtype=jp.int32)
         wt0 = _draw_warmup_target(jax.random.PRNGKey(seed + 98), cfg, int(env.horizon),
                                   cfg.warmup_frac, cfg.envs)
         knobs0 = jp.asarray([cfg.proposal_prob], dtype=jp.float32)
@@ -535,7 +641,7 @@ def train_alt_ppo(
 
     key, rk, wk = jax.random.split(key, 3)
     state = reset(jax.random.split(rk, cfg.envs))
-    cursor = jp.zeros((cfg.envs,), dtype=jp.int32)
+    cursor = jp.zeros((cfg.envs, n_programs), dtype=jp.int32)
     p0, w0 = _knob_values(cfg, 0)
     warmup_target = _draw_warmup_target(wk, cfg, int(env.horizon), w0, cfg.envs)
 
@@ -572,7 +678,7 @@ def train_alt_ppo(
         if fragment_index == fragments_per_episode - 1:
             key, rk, wk = jax.random.split(key, 3)
             state = reset(jax.random.split(rk, cfg.envs))
-            cursor = jp.zeros((cfg.envs,), dtype=jp.int32)
+            cursor = jp.zeros((cfg.envs, n_programs), dtype=jp.int32)
             warmup_target = _draw_warmup_target(wk, cfg, int(env.horizon), warmup_frac, cfg.envs)
 
         row = _training_row(it=it, env_steps=env_steps, fragment_index=fragment_index, task=task,
@@ -583,7 +689,8 @@ def train_alt_ppo(
 
         if cfg.eval_every > 0 and (it == 0 or (it + 1) % int(cfg.eval_every) == 0):
             ev = evaluate_alt_policy(env=env, params=params, bias=bias, program=program,
-                                     task=task, seed=seed + 10_000 + it, cfg=cfg)
+                                     task=task, seed=seed + 10_000 + it, cfg=cfg,
+                                     extra_programs=extras)
             score = float(ev["eval_task_fitness"])
             if score > best_score:
                 best_score = float(score)
@@ -618,6 +725,7 @@ def evaluate_alt_policy(
     task: str,
     seed: int,
     cfg: AltPPOConfig,
+    extra_programs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Full-episode deterministic evaluation of the PURE NEURAL policy.
 
@@ -625,16 +733,17 @@ def evaluate_alt_policy(
     policy does on its own, scored with the SAME eval_summary columns and task_graded_objective
     as the prior_only/short_ppo arbiter and the ppo_bias baseline.
     """
+    extras = list(extra_programs or [])
     eval_cfg = AltPPOConfig(**{**cfg.__dict__, "envs": int(cfg.eval_envs)})
     actor = Actor(action_dim=int(env.action_size), hidden=cfg.hidden)
     critic = Critic(hidden=cfg.hidden,
                     aux_head=(cfg.method == "value_shaping" and float(cfg.aux_coef) > 0.0))
     reset = jax.jit(lambda keys: jax.vmap(env.reset)(keys))
     collect = make_alt_collect(env=env, actor=actor, critic=critic, bias=bias, program=program,
-                               cfg=eval_cfg, deterministic=True)
+                               cfg=eval_cfg, deterministic=True, extra_programs=extras)
     action_prior_weights = bias.default_action_prior_weights()
     state = reset(jax.random.split(jax.random.PRNGKey(seed), eval_cfg.envs))
-    cursor = jp.zeros((eval_cfg.envs,), dtype=jp.int32)
+    cursor = jp.zeros((eval_cfg.envs, 1 + len(extras)), dtype=jp.int32)
     warmup_target = jp.zeros((eval_cfg.envs,), dtype=jp.int32)
     knobs = jp.asarray([0.0], dtype=jp.float32)
     traj_parts = []

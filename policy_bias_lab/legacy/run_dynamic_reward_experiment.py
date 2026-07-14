@@ -32,15 +32,14 @@ from policy_bias_lab.legacy.action_priors import (
 from policy_bias_lab.bias import REWARD_TEMPLATE_NAMES, compile_bias, default_reward_template_weights, reward_template_metadata
 from policy_bias_lab.composed_priors import default_library, prior_program_for_arm
 from policy_bias_lab.legacy.dynamic_rewards import DynamicRewardCoach, DynamicRewardConfig, load_pre_run_reward_analysis
-from policy_bias_lab.es import BIAS_ARMS
-from policy_bias_lab.llm_bias import load_bias_spec
+from policy_bias_lab.arms import BIAS_ARMS
+from policy_bias_lab.legacy.llm_bias import load_bias_spec
 from policy_bias_lab.legacy.phase_controller import load_phase_teacher
 from policy_bias_lab.legacy.short_rollout_ppo import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
-from policy_bias_lab.report_utils import summarize, write_csv
+from policy_bias_lab.reporting import summarize, write_csv
 from policy_bias_lab.tasks import task_metadata
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 def main() -> int:
@@ -55,9 +54,7 @@ def main() -> int:
         args.allow_reward_rewrite = False     # no mid-run recompile / reward rewrite
         args.freeze_reward_shaping = True
         args.cheap_checkup_steps = 1_000_000_000  # checkups never fire (no mid-run LLM calls)
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     if args.out is None:
         args.out = Path("runs") / f"dynamic_reward_combo_{time.strftime('%Y%m%d-%H%M%S')}"
@@ -406,7 +403,7 @@ def main() -> int:
                     # Situation-dependent prior arms: inject the arm's prior program into the
                     # (possibly reward-augmented) spec and recompile. The program is a stateless
                     # fn(obs, weights) and replaces the legacy rule-sum prior. See
-                    # EXPERIMENT_situation_dependent_priors.md.
+                    # reports/situation_dependent_priors.md.
                     arm_prior_program = prior_program_for_arm(arm, library=prior_library)
                     if arm in prior_program_files:  # explicit per-arm program file (overrides)
                         arm_prior_program = json.loads(Path(prior_program_files[arm]).read_text())
@@ -856,7 +853,7 @@ def parse_args() -> argparse.Namespace:
                         help="Fingertip contacts required for a 'lift' to count (anti-fling gate).")
     parser.add_argument("--max-xy-disp", type=float, default=0.08,
                         help="Max object lateral drift for a lift to count as a grasp, not a fling.")
-    # Closed-loop curriculum phase teacher (warm-start). See PHASE_B_curriculum_aware_selection.md.
+    # Closed-loop curriculum phase teacher (warm-start). See docs/curriculum_aware_selection.md.
     parser.add_argument("--phase-teacher", dest="phase_teacher", action="store_true", default=True,
                         help="Use the closed-loop contact->close->lift phase controller as the BC "
                         "warm-start teacher for supervised_init arms.")

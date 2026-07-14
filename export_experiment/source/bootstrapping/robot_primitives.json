@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "description": "Primitive vocabulary for bootstrapping robot-policy experiments. Policies choose a sequence, timing, and input parameters; the same JSON can be emitted by hand-written policies, search, or an LLM.",
+  "state": {
+    "tool": {
+      "x": "metres, workspace x",
+      "y": "metres, workspace y",
+      "z": "metres, tool height"
+    },
+    "gripper": {
+      "width": "metres between fingers",
+      "force": "0..1 normalized closing force"
+    },
+    "cube": {
+      "x": "metres",
+      "y": "metres",
+      "z": "metres"
+    },
+    "grasped": "true when the gripper is centred near the cube, low enough, and closed with enough force"
+  },
+  "primitives": {
+    "move_tool": {
+      "description": "Move the gripper tool centre to a Cartesian target.",
+      "params": {
+        "x": {"type": "number", "min": -0.30, "max": 0.30, "unit": "m"},
+        "y": {"type": "number", "min": -0.30, "max": 0.30, "unit": "m"},
+        "z": {"type": "number", "min": 0.04, "max": 0.35, "unit": "m"}
+      },
+      "duration_s": {"min": 0.05, "max": 5.0}
+    },
+    "open_gripper": {
+      "description": "Open fingers to a target width.",
+      "params": {
+        "width": {"type": "number", "min": 0.02, "max": 0.08, "unit": "m"}
+      },
+      "duration_s": {"min": 0.02, "max": 2.0}
+    },
+    "close_gripper": {
+      "description": "Close fingers with normalized force. The toy runner marks grasped if the tool is centred over the cube, at grasp height, and force is high enough.",
+      "params": {
+        "force": {"type": "number", "min": 0.0, "max": 1.0}
+      },
+      "duration_s": {"min": 0.02, "max": 2.0}
+    },
+    "lift": {
+      "description": "Move vertically to a requested z while preserving x/y.",
+      "params": {
+        "z": {"type": "number", "min": 0.06, "max": 0.35, "unit": "m"}
+      },
+      "duration_s": {"min": 0.05, "max": 5.0}
+    },
+    "wait": {
+      "description": "Let the current state settle without changing commands.",
+      "params": {},
+      "duration_s": {"min": 0.01, "max": 5.0}
+    }
+  }
+}

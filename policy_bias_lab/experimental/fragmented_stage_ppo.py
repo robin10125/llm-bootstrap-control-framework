@@ -1,6 +1,6 @@
 """Experimental PPO for long episodes using short rollout fragments.
 
-This module is intentionally separate from ``policy_bias_lab.ppo_bias``.  It prototypes three
+This module is intentionally separate from ``policy_bias_lab.training.fragmented_ppo``.  It prototypes three
 changes that are useful for 10-20s episodes but still need empirical validation before becoming the
 default path:
 
@@ -26,11 +26,8 @@ import jax.numpy as jp
 import numpy as np
 import optax
 
-BOOTSTRAPPING = Path(__file__).resolve().parents[3] / "bootstrapping"
-if str(BOOTSTRAPPING) not in sys.path:
-    sys.path.insert(0, str(BOOTSTRAPPING))
 
-import ppo
+from experiment_runtime import ppo
 
 from policy_bias_lab.bias import CompiledBias
 from policy_bias_lab.freeform_priors import (
@@ -40,7 +37,7 @@ from policy_bias_lab.freeform_priors import (
     make_stage_weight_fn,
     program_signal_fn,
 )
-from policy_bias_lab.ppo_bias import squashed_gaussian_logp
+from policy_bias_lab.training.fragmented_ppo import squashed_gaussian_logp
 from policy_bias_lab.schema import FIELD_INDEX
 from policy_bias_lab.tasks import task_fitness, task_graded_objective, task_success
 

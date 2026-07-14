@@ -22,7 +22,7 @@ Why this is portable and real-world usable
 
 This module covers Phase A (the controller + staged validator + warm-start dataset). The
 LLM authoring of programs and curriculum-aware selection among candidates is Phase B; see
-PHASE_B_curriculum_aware_selection.md.
+docs/curriculum_aware_selection.md.
 """
 
 from __future__ import annotations

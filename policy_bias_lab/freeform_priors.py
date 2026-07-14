@@ -1,7 +1,7 @@
 """Free-form symbolic action priors + robot-spec extraction + DOF-completeness.
 
 For the preliminary experiment comparing a constrained robot-derived DSL against a free-form
-symbolic representation (see PRELIM_dsl_vs_freeform.md). A free-form candidate gives, per channel
+symbolic representation (see reports/dsl_vs_freeform.md). A free-form candidate gives, per channel
 (a set of named actuators), a symbolic EXPRESSION for the mean-shift over observable signals; a
 restricted AST evaluator compiles it into JAX prior functions. Flat/free-form laws remain stateless;
 staged laws may also expose a rollout-carried stage cursor so normal stage progress is monotone.
@@ -21,6 +21,7 @@ anything but arithmetic over the provided signals.
 from __future__ import annotations
 
 import ast
+import functools
 from typing import Any, Callable
 
 import jax
@@ -424,9 +425,10 @@ def _names_of(env: Any, tokens: list[str]) -> list[str]:
 
 _ALLOWED_FUNCS = {"clip", "sigmoid", "min", "max", "abs", "exp", "sqrt", "tanh", "arrive", "within"}
 # Expected argument count per function; checked at validation so a wrong-arity call is rejected
-# cleanly instead of crashing at eval time.
-_FUNC_ARITY = {"clip": 3, "sigmoid": 1, "min": 2, "max": 2, "abs": 1, "exp": 1, "sqrt": 1,
+# cleanly instead of crashing at eval time. min/max are variadic (>= 2 args).
+_FUNC_ARITY = {"clip": 3, "sigmoid": 1, "abs": 1, "exp": 1, "sqrt": 1,
                "tanh": 1, "arrive": 3, "within": 2}
+_VARIADIC_FUNCS = {"min", "max"}
 
 
 def _validate_ast(node: ast.AST, signals: set[str]) -> None:
@@ -454,6 +456,8 @@ def _validate_ast(node: ast.AST, signals: set[str]) -> None:
         want = _FUNC_ARITY.get(node.func.id)
         if want is not None and len(node.args) != want:
             raise ValueError(f"{node.func.id}() takes {want} args, got {len(node.args)}")
+        if node.func.id in _VARIADIC_FUNCS and len(node.args) < 2:
+            raise ValueError(f"{node.func.id}() takes at least 2 args, got {len(node.args)}")
         for a in node.args:
             _validate_ast(a, signals)
     elif isinstance(node, ast.Compare):
@@ -484,8 +488,8 @@ def _eval_ast(node: ast.AST, sig: dict[str, jp.ndarray]) -> jp.ndarray:
         f = node.func.id; a = [_eval_ast(x, sig) for x in node.args]
         if f == "clip": return jp.clip(a[0], a[1], a[2])
         if f == "sigmoid": return 1.0 / (1.0 + jp.exp(-a[0]))
-        if f == "min": return jp.minimum(a[0], a[1])
-        if f == "max": return jp.maximum(a[0], a[1])
+        if f == "min": return functools.reduce(jp.minimum, a)
+        if f == "max": return functools.reduce(jp.maximum, a)
         if f == "abs": return jp.abs(a[0])
         if f == "sqrt": return jp.sqrt(jp.maximum(a[0], 0.0))
         if f == "tanh": return jp.tanh(a[0])

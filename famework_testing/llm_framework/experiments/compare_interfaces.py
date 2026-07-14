@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from llm_framework.adapters.bootstrapping_env import make_bootstrapping_env
+from llm_framework.adapters.experiment_runtime import make_runtime_env
 from llm_framework.core.metrics import summarize, write_json, write_metrics_csv
 from llm_framework.core.state import RolloutResult, SafetyLimits
 from llm_framework.core.tasks import build_task_context
@@ -30,7 +30,7 @@ def main() -> int:
         env_overrides["episode_seconds"] = args.episode_seconds
     if args.control_dt is not None:
         env_overrides["control_dt"] = args.control_dt
-    env = make_bootstrapping_env(args.env, **env_overrides)
+    env = make_runtime_env(args.env, **env_overrides)
     interfaces = [interface_by_name(name.strip()) for name in args.interfaces.split(",") if name.strip()]
     tasks = [name.strip() for name in args.tasks.split(",") if name.strip()]
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]

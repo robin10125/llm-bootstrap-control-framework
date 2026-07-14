@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from llm_framework.adapters.bootstrapping_env import waypoint_compiler
+from llm_framework.adapters.experiment_runtime import waypoint_compiler
 from llm_framework.core.state import CandidateProgram, CompiledPolicy, SafetyLimits, ValidationResult, WorldState
 from llm_framework.core.tasks import TaskContext
 from llm_framework.runtime.controllers import targets_to_actions

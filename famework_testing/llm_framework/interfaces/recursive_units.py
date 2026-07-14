@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from llm_framework.adapters.bootstrapping_env import call_bootstrapping_llm
+from llm_framework.adapters.experiment_runtime import call_runtime_llm
 from llm_framework.core.state import CandidateProgram, CompiledPolicy, SafetyLimits, ValidationResult, WorldState
 from llm_framework.core.tasks import TaskContext
 from llm_framework.interfaces.script_dsl import ScriptDSLInterface
@@ -375,7 +375,7 @@ def _unit_commands(top_obj: dict[str, Any], units: list[str], goal: str) -> dict
 
 
 def _call_json(backend: str, prompt: str, *, model: str | None, log_dir: Path | None, tag: str) -> LLMCallResult:
-    response = call_bootstrapping_llm(backend, prompt, model=model, log_dir=log_dir, tag=tag)
+    response = call_runtime_llm(backend, prompt, model=model, log_dir=log_dir, tag=tag)
     return LLMCallResult(text=response.text, ok=response.ok, error=response.error, source=response.source)
 
 

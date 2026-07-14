@@ -16,21 +16,18 @@ os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
 from policy_bias_lab.legacy.action_priors import ActionPriorCoach, ActionPriorConfig, load_action_prior_rules
 from policy_bias_lab.bias import compile_bias
 from policy_bias_lab.legacy.dynamic_rewards import load_pre_run_reward_analysis
-from policy_bias_lab.es import BIAS_ARMS
-from policy_bias_lab.llm_bias import load_bias_spec
+from policy_bias_lab.arms import BIAS_ARMS
+from policy_bias_lab.legacy.llm_bias import load_bias_spec
 from policy_bias_lab.legacy.short_rollout_ppo import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
 from policy_bias_lab.tasks import task_metadata
 
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 def main() -> int:
     args = parse_args()
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     if args.out is None:
         args.out = Path("runs") / f"policy_bias_ppo_{time.strftime('%Y%m%d-%H%M%S')}"

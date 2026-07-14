@@ -2,7 +2,7 @@
 
 A *prior program* (a dict spec) is compiled against an environment into a pure JAX function
 ``prior_fn(obs, weights) -> mean_shift`` that is added to the policy's pre-tanh action each
-step. See policy_bias_lab/EXPERIMENT_situation_dependent_priors.md for the design.
+step. See policy_bias_lab/reports/situation_dependent_priors.md for the design.
 
 Modes
 -----

@@ -15,7 +15,6 @@ from policy_bias_lab.schema import ACTION_GROUPS, PRIOR_DIRECTIONS
 from policy_bias_lab.symbolic_control import encode_rules, make_rule_action_fn, sustained_bool
 
 ROOT = Path(__file__).resolve().parents[1]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 @dataclass
@@ -613,9 +612,7 @@ def _candidate_score(score: dict[str, Any]) -> float:
 
 
 def _call_llm(backend: str, prompt: str, *, model: str | None, log_dir: Path, tag: str) -> str:
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from llm_backend import call_llm
+    from experiment_runtime.llm_backend import call_llm
 
     response = call_llm(backend, prompt, model=model, timeout_s=600.0, log_dir=log_dir, tag=tag)
     if not response.ok:

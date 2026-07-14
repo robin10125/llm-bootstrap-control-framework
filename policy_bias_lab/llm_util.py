@@ -10,14 +10,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 def call_llm(backend: str, prompt: str, *, model: str | None, log_dir: Path, tag: str) -> str:
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from llm_backend import call_llm as _backend_call
+    from experiment_runtime.llm_backend import call_llm as _backend_call
 
     response = _backend_call(backend, prompt, model=model, timeout_s=600.0, log_dir=log_dir, tag=tag)
     return response.text if response.ok else ""

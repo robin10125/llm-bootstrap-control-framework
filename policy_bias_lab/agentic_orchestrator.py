@@ -1,4 +1,4 @@
-"""Agentic, robot/task-agnostic action-prior selection (AGENTIC_PRIOR_SELECTION.md).
+"""Agentic, robot/task-agnostic action-prior selection (docs/agentic_prior_selection.md).
 
 Pipeline, all grounded in robot-spec-derived vocabulary (no hardcoded ACTION_GROUPS):
 
@@ -35,9 +35,9 @@ import jax
 
 from policy_bias_lab.freeform_priors import robot_spec
 from policy_bias_lab.llm_util import call_llm as _call_llm
-from policy_bias_lab.ppo_arbiter import evaluate_candidate_ppo, evaluate_candidate_prior_only
+from policy_bias_lab.training.arbiter import evaluate_candidate_ppo, evaluate_candidate_prior_only
 from policy_bias_lab.prior_eval import accounting, score_program, validate_program
-from policy_bias_lab.run_dsl_vs_freeform import OPERATORS, PHASES, fallback, _tmpl
+from policy_bias_lab.prompt_utils import prompt_template as _tmpl
 
 
 # ----------------------------------------------------------------------------------------------
@@ -182,8 +182,10 @@ def _render_procedure(proc: dict) -> str:
 
 
 def _representation_doc(rep: str, rs: dict) -> str:
-    return _tmpl(f"representation_{rep}.md").substitute(
-        groups=json.dumps(list(rs["semantic_groups"])), operators=json.dumps(OPERATORS)).strip()
+    if rep != "freeform_staged":
+        raise ValueError("fixed-phase representations are preserved under policy_bias_lab.legacy")
+    return _tmpl("representation_freeform_staged.md").substitute(
+        groups=json.dumps(list(rs["semantic_groups"]))).strip()
 
 
 def _dof_requirement(dof_mode: str, rs: dict) -> str:
@@ -192,14 +194,16 @@ def _dof_requirement(dof_mode: str, rs: dict) -> str:
 
 
 def _framework_doc(rep: str) -> str:
-    """The framework paragraph, per representation (stacked fixed-phase vs. free-form staged)."""
-    name = "framework_freeform_staged" if rep == "freeform_staged" else "framework_stacked"
-    return _tmpl(f"{name}.md").substitute(phases=", ".join(PHASES)).strip()
+    """Return the task-neutral, model-authored staged framework description."""
+    if rep != "freeform_staged":
+        raise ValueError("fixed-phase representations are preserved under policy_bias_lab.legacy")
+    return _tmpl("framework_freeform_staged.md").substitute().strip()
 
 
 def _output_item(rep: str) -> str:
-    if rep == "freeform_staged":
-        return ("ir_version:1, "
+    if rep != "freeform_staged":
+        raise ValueError("fixed-phase representations are preserved under policy_bias_lab.legacy")
+    return ("ir_version:1, "
                 "stage_progression:'monotone' (default; use 'reactive' only for explicit legacy "
                 "current-gate experiments), "
                 "signals:{'<name>':'<expr over observables or earlier signals>'} "
@@ -212,8 +216,6 @@ def _output_item(rep: str) -> str:
                 "channels:[{actuators:[...], expr:'<expr>'}]}], "
                 "probes:[{name, expr, stage:'<stage name>' (optional)}] (optional, <=8), "
                 "evals:[{name, expr, when:'ever'|'end'}] (optional, <=8)")
-    return (f"subpriors: [{{name, channels:[...]}}] -- one per phase, in order: "
-            f"{', '.join(PHASES)}")
 
 
 def parse_json_obj(txt: str) -> dict | None:
@@ -415,7 +417,7 @@ class AgenticOrchestrator:
     success_stop: float | None = None   # stop when any eval's trained_success (SUSTAINED
                                         # contact-gated hold rate) reaches this
     write_dash: bool = False            # live dashboard.html on each checkpoint (off = paused;
-                                        # regenerate anytime: python -m policy_bias_lab.run_dashboard)
+                                        # regenerate anytime: python -m policy_bias_lab.cli.dashboard)
     log: dict = field(default_factory=dict)
 
     # Everything needed to reconstruct the orchestrator on resume (out_dir/env come from the CLI).
@@ -513,7 +515,7 @@ class AgenticOrchestrator:
         os.replace(tmp, self._ckpt_path)
         if self.write_dash:
             try:  # live metrics page from the same payload; must never take the run down
-                from policy_bias_lab.run_dashboard import write_dashboard
+                from policy_bias_lab.cli.dashboard import write_dashboard
                 write_dashboard(payload, self.out_dir / "dashboard.html")
             except Exception as e:
                 print(f"  [dashboard] update failed (run unaffected): {e}")
@@ -559,7 +561,7 @@ class AgenticOrchestrator:
     def _paused(self) -> dict:
         self.save_checkpoint()
         print(f"[paused] {self.iters}/{self.budget} iterations done, state -> {self._ckpt_path}")
-        print(f"         resume with: python -m policy_bias_lab.run_agentic_selection "
+        print(f"         resume with: python -m policy_bias_lab.cli.agentic_selection "
               f"--out {self.out_dir} --resume")
         return {"paused": True, "iters_used": self.iters, "budget": self.budget,
                 "checkpoint": str(self._ckpt_path)}
@@ -660,8 +662,7 @@ class AgenticOrchestrator:
         obj = parse_json_obj(txt)
         cands = (obj or {}).get("candidates", []) if obj else []
         if not cands:
-            print("  [seeds] LLM produced none -> hand-authored fallback")
-            cands = fallback(self.rep)
+            print("  [seeds] LLM produced no valid candidates")
         return cands[: self.n_seeds]
 
     # -- Stage 4: one revision -----------------------------------------------------------------

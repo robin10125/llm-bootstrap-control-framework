@@ -30,12 +30,11 @@ import jax  # noqa: E402 (must follow the XLA env-var configuration above)
 
 from policy_bias_lab.bias import compile_bias, default_reward_template_weights
 from policy_bias_lab.composed_priors import prior_program_for_arm
-from policy_bias_lab.es import BIAS_ARMS
+from policy_bias_lab.arms import BIAS_ARMS
 from policy_bias_lab.legacy.short_rollout_ppo import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
-from policy_bias_lab.report_utils import summarize, write_csv
+from policy_bias_lab.reporting import summarize, write_csv
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 def _zeros_like_weights(w):
@@ -44,9 +43,7 @@ def _zeros_like_weights(w):
 
 def main() -> int:
     args = parse_args()
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     if args.out is None:
         args.out = Path("runs") / f"prior_ppo_{time.strftime('%Y%m%d-%H%M%S')}"

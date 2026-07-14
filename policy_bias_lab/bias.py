@@ -53,7 +53,7 @@ class CompiledBias:
     action_scale: float = 0.05
     # Optional situation-dependent prior program (composed_priors). When present, the action
     # prior is this compiled stateless fn(obs, weights) instead of the legacy rule sum. See
-    # EXPERIMENT_situation_dependent_priors.md.
+    # reports/situation_dependent_priors.md.
     prior_fn: Any = None
     prior_step_fn: Any = None
     prior_default_weights: Any = None

@@ -39,9 +39,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
-if str(BOOTSTRAPPING) not in sys.path:
-    sys.path.insert(0, str(BOOTSTRAPPING))
 
 import flax.linen as nn
 import jax
@@ -49,7 +46,7 @@ import jax.numpy as jp
 import numpy as np
 import optax
 
-import ppo
+from experiment_runtime import ppo
 
 from policy_bias_lab.freeform_priors import (
     _compile_channel,
@@ -57,7 +54,7 @@ from policy_bias_lab.freeform_priors import (
     program_signal_fn,
     raw_obs_entries,
 )
-from policy_bias_lab.ppo_bias import (
+from policy_bias_lab.training.fragmented_ppo import (
     _eval_summary,
     _merge_eval_summaries,
     squashed_gaussian_logp,

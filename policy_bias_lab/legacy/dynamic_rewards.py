@@ -20,7 +20,6 @@ from policy_bias_lab.bias import (
 from policy_bias_lab.schema import EVAL_FIELDS
 
 ROOT = Path(__file__).resolve().parents[1]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 @dataclass
@@ -75,9 +74,7 @@ def load_pre_run_reward_analysis(
         analysis = _fallback_pre_run_reward_analysis(task, env_summary, previous_run_context)
         (log_dir / "pre_run_reward_analysis_fixture.json").write_text(json.dumps(analysis, indent=2) + "\n")
         return analysis
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from llm_backend import call_llm
+    from experiment_runtime.llm_backend import call_llm
 
     response = call_llm(
         llm_backend,
@@ -248,9 +245,7 @@ class DynamicRewardCoach:
         parsed: dict[str, Any] | None = None
         backend_record: dict[str, Any] = {"backend": self.cfg.llm_backend}
         if self.cfg.llm_backend not in {"none", "mock", "fixture", "fake"}:
-            if str(BOOTSTRAPPING) not in sys.path:
-                sys.path.insert(0, str(BOOTSTRAPPING))
-            from llm_backend import call_llm
+            from experiment_runtime.llm_backend import call_llm
 
             response = call_llm(
                 self.cfg.llm_backend,
@@ -316,9 +311,7 @@ class DynamicRewardCoach:
         parsed: dict[str, Any] | None = None
         backend_record: dict[str, Any] = {"backend": self.cfg.llm_backend}
         if self.cfg.llm_backend not in {"none", "mock", "fixture", "fake"}:
-            if str(BOOTSTRAPPING) not in sys.path:
-                sys.path.insert(0, str(BOOTSTRAPPING))
-            from llm_backend import call_llm
+            from experiment_runtime.llm_backend import call_llm
 
             response = call_llm(
                 self.cfg.llm_backend,
@@ -425,9 +418,7 @@ class DynamicRewardCoach:
             }
             self._write_record(record)
             return
-        if str(BOOTSTRAPPING) not in sys.path:
-            sys.path.insert(0, str(BOOTSTRAPPING))
-        from llm_backend import call_llm
+        from experiment_runtime.llm_backend import call_llm
 
         response = call_llm(
             self.cfg.llm_backend,

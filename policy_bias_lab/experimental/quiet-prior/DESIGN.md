@@ -373,9 +373,9 @@ policy_bias_lab/
 Integration points:
 
 - `bias.py`: compile authored intervention proposals but do not expose them as additive mean shifts.
-- `ppo_bias.py`: factor action log probabilities, collect ownership traces, and dispatch to the new
+- `policy_bias_lab/training/fragmented_ppo.py`: factor action log probabilities, collect ownership traces, and dispatch to the new
   trainer behind an explicit mode until validated.
-- `ppo_arbiter.py`: add policy-only, assisted, and randomized audit evaluation.
+- `policy_bias_lab/training/arbiter.py`: add policy-only, assisted, and randomized audit evaluation.
 - `agentic_orchestrator.py`: use the guarded selection rule and feed intervention evidence to
   revisions.
 - `prior_ir.py`: keep version 1 replay intact; route IR version 2 to `intervention_ir.py`.

@@ -10,10 +10,10 @@ from __future__ import annotations
 import os
 import sys
 
-# Standalone-runnable (pytest not installed in this venv): put policy_bias_lab + bootstrapping on path.
+# Standalone-runnable: put the repository packages on the import path.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LLMFW = os.path.abspath(os.path.join(_HERE, "..", ".."))
-for p in (_LLMFW, os.path.join(_LLMFW, "..", "bootstrapping")):
+for p in (_LLMFW,):
     if p not in sys.path:
         sys.path.insert(0, p)
 

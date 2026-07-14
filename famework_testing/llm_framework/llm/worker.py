@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llm_framework.adapters.bootstrapping_env import call_bootstrapping_llm
+from llm_framework.adapters.experiment_runtime import call_runtime_llm
 from llm_framework.core.state import WorldState
 from llm_framework.core.tasks import TaskContext
 from llm_framework.interfaces.base import ControlInterface
@@ -30,7 +30,7 @@ def complete_for_interface(
             source="mock",
         )
     prompt = interface.build_prompt(ctx, state)
-    response = call_bootstrapping_llm(backend, prompt, model=model, log_dir=log_dir, tag=tag)
+    response = call_runtime_llm(backend, prompt, model=model, log_dir=log_dir, tag=tag)
     return LLMCallResult(
         text=response.text,
         ok=response.ok,

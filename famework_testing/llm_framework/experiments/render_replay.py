@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from llm_framework.adapters.bootstrapping_env import make_bootstrapping_env
+from llm_framework.adapters.experiment_runtime import make_runtime_env
 
 
 def main() -> int:
@@ -23,7 +23,7 @@ def main() -> int:
 
     record = json.loads(result_path.read_text())
     seed = int(record.get("seed", args.seed))
-    env = make_bootstrapping_env(
+    env = make_runtime_env(
         "shadow",
         **{k: v for k, v in {
             "episode_seconds": args.episode_seconds,

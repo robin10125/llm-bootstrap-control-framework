@@ -87,7 +87,7 @@ prefilter-grade only — do not route its labeled fields into prompts).
 
 - Python: use `.venv/bin/python`. Env init takes ~4 min (JAX/XLA); run env-touching scripts in the
   background. One GPU (8 GB) — run PPO jobs sequentially.
-- `../bootstrapping/mjx_env.py` is shared and read-only from this project's perspective; env-side
-  reward/eval changes belong there only with explicit approval.
-- Long PPO runs: `run_long_ppo.py` (resumable); selection runs: `run_agentic_selection.py`
+- `experiment_runtime/environment.py` is the repository-owned environment boundary; env-side
+  reward/eval changes still require explicit approval.
+- Long PPO runs: `policy_bias_lab.cli.long_ppo`; selection runs: `policy_bias_lab.cli.agentic_selection`
   (checkpointed, resumable). Both handle SIGINT/SIGTERM by finishing the in-flight step and saving.

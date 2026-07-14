@@ -34,22 +34,26 @@ ROOT = HERE.parents[2]
 for p in (str(HERE), str(ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
-if str(BOOTSTRAPPING) not in sys.path:
-    sys.path.insert(0, str(BOOTSTRAPPING))
 
 import jax
 
-from alt_methods_ppo import METHODS, AltPPOConfig, evaluate_alt_policy, train_alt_ppo
+from alt_methods_ppo import (
+    METHODS,
+    AltPPOConfig,
+    evaluate_alt_policy,
+    make_critical_actions_fn,
+    train_alt_ppo,
+)
 from policy_bias_lab.bias import compile_bias
 
 
 def main() -> int:
     args = parse_args()
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     args.out.mkdir(parents=True, exist_ok=True)
-    program = json.loads(args.program.read_text())
+    programs = [json.loads(p.read_text()) for p in args.program]
+    program, extra_programs = programs[0], programs[1:]
     env = make_env("shadow", control_dt=args.control_dt, episode_seconds=args.episode_seconds,
                    physics_dt=args.physics_dt, obj_xy_range=args.obj_xy_range)
     if env.horizon % args.fragment_steps != 0:
@@ -97,6 +101,10 @@ def main() -> int:
         critic_prior_action=not args.no_critic_prior_action,
         critic_prior_norms=not args.no_critic_prior_norms,
         critic_success_margins=not args.no_critic_success_margins,
+        critic_gate_values=args.critic_gate_values,
+        critic_critical_actions=args.critic_critical_actions,
+        critical_stage_keywords=tuple(
+            k.strip().lower() for k in args.critical_stages.split(",") if k.strip()),
         kl_coef=args.kl_coef,
         kl_coef_final=args.kl_coef_final,
         kl_anneal_iters=args.kl_anneal_iters,
@@ -105,12 +113,19 @@ def main() -> int:
         kl_target=args.kl_target,
         kl_target_final=args.kl_target_final,
     )
+    critical_stages = None
+    if args.critic_critical_actions:
+        critical_stages = [make_critical_actions_fn(env, p, cfg.critical_stage_keywords)[1]
+                           for p in programs]
+        print(f"[critical stages] {critical_stages}")
     (args.out / "config.json").write_text(json.dumps({
         "learner": "experimental_alt_method_ppo",
         "method": args.method,
         "task": args.task,
         "seed": args.seed,
-        "program": str(args.program),
+        "program": str(args.program[0]),
+        "extra_programs": [str(p) for p in args.program[1:]],
+        "critical_stages": critical_stages,
         "env": {
             "horizon": int(env.horizon),
             "control_dt": args.control_dt,
@@ -121,16 +136,19 @@ def main() -> int:
         "ppo": cfg.__dict__,
     }, indent=2, default=str) + "\n")
     (args.out / "prior_program.json").write_text(json.dumps(program, indent=2) + "\n")
+    for i, p in enumerate(extra_programs, start=1):
+        (args.out / f"prior_program_extra{i}.json").write_text(json.dumps(p, indent=2) + "\n")
 
     params, rows, best_params, best_score, best_iter = train_alt_ppo(
         env=env, bias=bias, program=program, task=args.task, seed=args.seed, cfg=cfg,
-        out_dir=args.out)
+        out_dir=args.out, extra_programs=extra_programs)
     with (args.out / "params_final.pkl").open("wb") as f:
         pickle.dump(jax.device_get(params), f)
     with (args.out / "best_params.pkl").open("wb") as f:
         pickle.dump(jax.device_get(best_params), f)
     ev = evaluate_alt_policy(env=env, params=best_params, bias=bias, program=program,
-                             task=args.task, seed=args.seed + 20_000, cfg=cfg)
+                             task=args.task, seed=args.seed + 20_000, cfg=cfg,
+                             extra_programs=extra_programs)
     report = {
         "method": args.method,
         "iters": len(rows),
@@ -156,7 +174,10 @@ def parse_args() -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--method", choices=list(METHODS), required=True)
     p.add_argument("--out", type=Path, required=True)
-    p.add_argument("--program", type=Path, required=True)
+    p.add_argument("--program", type=Path, required=True, nargs="+",
+                   help="Prior program(s). The first is the PRIMARY program (drives the "
+                        "action-path methods); extras are critic_features-only feature-union "
+                        "members, each contributing its own cursor and feature blocks.")
     p.add_argument("--task", default="lift")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iters", type=int, default=2000)
@@ -222,6 +243,14 @@ def parse_args() -> argparse.Namespace:
     g4.add_argument("--no-critic-prior-action", action="store_true")
     g4.add_argument("--no-critic-prior-norms", action="store_true")
     g4.add_argument("--no-critic-success-margins", action="store_true")
+    g4.add_argument("--critic-gate-values", action="store_true",
+                    help="Feed ALL stages' clip(gate,0,1) values in parallel (cursor-free stage "
+                         "evidence; the critic forms its own stage attention).")
+    g4.add_argument("--critic-critical-actions", action="store_true",
+                    help="Feed the channel actions of critical stages (name matched by "
+                         "--critical-stages) at EVERY step, regardless of the cursor.")
+    g4.add_argument("--critical-stages", default="grasp,lift",
+                    help="Comma-separated keywords; a stage whose name contains one is critical.")
 
     g5 = p.add_argument_group("method=kl_prior")
     g5.add_argument("--kl-coef", type=float, default=1.0,

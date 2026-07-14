@@ -18,8 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
-for p in (str(HERE), str(ROOT), str(BOOTSTRAPPING)):
+for p in (str(HERE), str(ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -40,7 +39,7 @@ from clocked_paths_ppo import (
 
 def main() -> int:
     args = parse_args()
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     args.out.mkdir(parents=True, exist_ok=True)
     program = json.loads(args.program.read_text())

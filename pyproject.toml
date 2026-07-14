@@ -1,16 +1,33 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "llm-framework"
 version = "0.1.0"
-description = "Task-agnostic LLM action interface experiments for dexterous robot control."
+description = "Task-agnostic LLM action-interface experiments for robot control."
 requires-python = ">=3.11"
 dependencies = [
-  "numpy",
+  "numpy>=1.26",
+  "jax",
+  "mujoco>=3.0",
+  "mujoco-mjx",
+  "flax",
+  "optax",
 ]
 
 [project.optional-dependencies]
+llm = ["anthropic>=0.40.0"]
 test = ["pytest"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+[tool.setuptools.packages.find]
+where = [".", "famework_testing"]
+include = ["experiment_runtime*", "llm_framework*", "policy_bias_lab*"]
 
+[tool.setuptools.package-data]
+experiment_runtime = ["assets/**/*"]
+policy_bias_lab = ["prompts/**/*.md", "example_priors/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["famework_testing/tests"]
+pythonpath = [".", "famework_testing"]

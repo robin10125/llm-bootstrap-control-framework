@@ -1,0 +1,113 @@
+# MuJoCo hand — simulation state dump
+# written 2026-06-08 16:24:47
+
+## GOAL
+Make the gripper grab the red cube and lift it at least 10 cm off the table, keeping it
+gripped. Success end state: grasped('cube') is True AND obj_pos('cube')[2] >= 0.12.
+
+## RESET
+cube_pos = [0.0, 0.0] (default, centred)
+(Re-run `inject run` with the same --cube-pos so the script sees this exact state.)
+
+## CURRENT OBSERVATION
+```json
+{
+  "t": 0,
+  "palm": {
+    "pos": [
+      0.0,
+      0.0,
+      0.2476
+    ],
+    "height": 0.248
+  },
+  "fingers": {
+    "left": 0.05,
+    "right": 0.05,
+    "opening": 0.05
+  },
+  "cube": {
+    "pos": [
+      0.0,
+      0.0,
+      0.02
+    ],
+    "z": 0.02,
+    "vel": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "grasped": false,
+  "actuators": {
+    "slide_x": 0.0,
+    "slide_y": 0.0,
+    "slide_z": 0.3,
+    "left_finger": 0.05,
+    "right_finger": 0.05
+  },
+  "contacts": [
+    [
+      "cube",
+      "table"
+    ]
+  ]
+}
+```
+
+## MODEL FACTS
+Actuators (name: ctrlrange):
+  slide_x: [-0.300, 0.300]
+  slide_y: [-0.300, 0.300]
+  slide_z: [0.060, 0.450]
+  left_finger: [0.000, 0.050]
+  right_finger: [0.000, 0.050]
+Cube: box half-extents [0.02, 0.02, 0.02] (a 4 cm cube).
+Table surface is at z=0; the cube rests with its centre at z≈0.02.
+Fingers hang below the palm; palm height ≈ slide_z. A palm height around
+0.11–0.13 puts the fingers straddling a cube on the table (lower jams them
+into the table). Commanding fingers toward 0.0 squeezes; the cube blocks
+them and that creates the grip force needed to lift it.
+
+## CONTROL API (the script is the BODY of a Python function; these are in scope)
+You write the BODY of a Python `def` (do NOT include the signature). The robot is a
+floating parallel-jaw gripper over a table. You control it by commanding actuator TARGETS
+and then stepping physics so it moves toward them — nothing happens until you `step`.
+
+The following are already in scope:
+
+  // actuation (set a target, then step to let it take effect)
+  set_ctrl(name, value)        # name in: 'slide_x','slide_y','slide_z',
+                               #          'left_finger','right_finger'
+        # slide_x/y in [-0.30,0.30] (palm horizontal position, metres)
+        # slide_z   in [ 0.06,0.45] (palm height; ~0.12 puts fingers around a table cube)
+        # *_finger  in [ 0.00,0.05] (0.05 = open, 0.0 = fully closed/squeezing)
+  step(n=1) -> steps_used      # advance physics n steps (timestep 0.002s). Use a few
+                               # hundred steps after a move so it settles. Budget-limited.
+  get_ctrl(name) -> float
+
+  // sensing (all positions are [x,y,z] in metres)
+  obj_pos('cube') -> [x,y,z]   # the red cube's centre
+  palm_pos() -> [x,y,z]
+  obj_vel('cube') -> [vx,vy,vz]
+  joint_qpos(name) -> float    # e.g. 'slide_z', 'left_finger'
+  finger_opening() -> float    # mean finger position (0 closed .. 0.05 open)
+  grasped('cube') -> bool      # True when BOTH fingers contact the cube
+  contact_pairs() -> [(g1,g2)] # current geom-geom contacts by name
+  obs() -> dict                # the full observation dict (same shape you were given)
+
+  // misc
+  log(...)   # record a debug line returned in feedback; use it to explain your steps
+  np         # numpy
+
+Rules:
+- Use only the names above; no import (np is provided), no network, no fs.
+- Command a target THEN step — e.g. set_ctrl('slide_z',0.12); step(500). A bare set_ctrl
+  with no following step does nothing.
+- To grasp: open fingers, centre over the object, descend to graspable height, command
+  fingers CLOSED (toward 0.0 — the object blocks them and that creates grip force), then
+  lift. Don't drive fingers into the table.
+- Make it robust: read obj_pos/grasped before & after, and return when the goal is reached.
+- Keep it focused on THIS goal. Return a short string summary at the end.
+

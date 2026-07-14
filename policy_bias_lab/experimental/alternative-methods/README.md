@@ -1,7 +1,7 @@
 # Alternative prior-influence methods
 
 Five experimental ways for an LLM-authored prior program to influence PPO **without sitting in
-the final policy's action path**. The baseline (`policy_bias_lab.ppo_bias`) composes
+the final policy's action path**. The baseline (`policy_bias_lab.training.fragmented_ppo`) composes
 `env_action = residual + prior_scale * prior`; every method here trains a **pure neural policy**
 (the deterministic evaluation runs the network alone, prior fully off), and the prior enters only
 through exploration, state visitation, reward, or the critic.

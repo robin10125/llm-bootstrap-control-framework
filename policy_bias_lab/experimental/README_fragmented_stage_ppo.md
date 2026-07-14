@@ -26,5 +26,5 @@ Run example:
 800 steps, so 50, 80, 100, 160, 200, and 400 are valid fragment sizes.
 
 The main experiment code is not changed. If this works, the integration path is to move the
-fragment collector, stage-success reward function, and prior-scale actor head into `ppo_bias.py`
+fragment collector, stage-success reward function, and prior-scale actor head into `policy_bias_lab/training/fragmented_ppo.py`
 behind explicit config flags.

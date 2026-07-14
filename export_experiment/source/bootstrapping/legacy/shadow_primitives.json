@@ -1,0 +1,95 @@
+{
+  "version": 2,
+  "description": "Primitive vocabulary for manipulation bootstrapping in MuJoCo. Policies choose base targets (absolute, relative, or object-centric), hand poses or continuous closure, dwell times, sensor-conditioned step termination, and success checks.",
+  "runtime": {
+    "python": "../hand-manipulation/harness/.venv/bin/python",
+    "runner": "shadow_policy_runner.py",
+    "model": "../hand-manipulation/env/models/shadow_hand/scene_cube.xml"
+  },
+  "state": {
+    "base": {
+      "x": "slide_x qpos, metres",
+      "y": "slide_y qpos, metres",
+      "z": "slide_z qpos, metres; positive lowers the palm in the current palm-down scene"
+    },
+    "hand_pose": "last named keyframe pose or closure command",
+    "object": {
+      "x": "metres",
+      "y": "metres",
+      "z": "metres"
+    },
+    "contacts": {
+      "hand_object_bodies": "hand bodies currently touching the object"
+    }
+  },
+  "step_fields": {
+    "until": "optional list of {metric, op, value} checks; the step ends as soon as they all hold, with duration_s as the timeout. Use to make steps reactive, e.g. close until contacts.hand_object_count >= 2.",
+    "assert": "optional list of {metric, op, value} checks evaluated after the step; failure aborts the schedule."
+  },
+  "primitives": {
+    "set_base": {
+      "description": "Command the floating base position actuators to absolute targets.",
+      "params": {
+        "x": {"type": "number", "min": -0.30, "max": 0.30, "unit": "m"},
+        "y": {"type": "number", "min": -0.30, "max": 0.30, "unit": "m"},
+        "z": {"type": "number", "min": -0.15, "max": 0.20, "unit": "m"}
+      },
+      "duration_s": {"min": 0.01, "max": 10.0}
+    },
+    "move_delta": {
+      "description": "Shift the current base targets by a relative offset. Result is clipped to base ranges.",
+      "params": {
+        "dx": {"type": "number", "min": -0.12, "max": 0.12, "unit": "m"},
+        "dy": {"type": "number", "min": -0.12, "max": 0.12, "unit": "m"},
+        "dz": {"type": "number", "min": -0.12, "max": 0.12, "unit": "m"}
+      },
+      "duration_s": {"min": 0.01, "max": 10.0}
+    },
+    "approach_object": {
+      "description": "Set base x/y targets relative to the object's position at command time (object-centric), and base z to an absolute target. In the palm-down scene an x offset near -0.035 centres the grasp site over the object.",
+      "params": {
+        "ox": {"type": "number", "min": -0.12, "max": 0.12, "unit": "m"},
+        "oy": {"type": "number", "min": -0.12, "max": 0.12, "unit": "m"},
+        "z": {"type": "number", "min": -0.15, "max": 0.20, "unit": "m"}
+      },
+      "duration_s": {"min": 0.01, "max": 10.0}
+    },
+    "hand_pose": {
+      "description": "Command all hand actuators toward a named keyframe pose (macro).",
+      "params": {
+        "name": {
+          "type": "string",
+          "enum": [
+            "open hand",
+            "pre grasp",
+            "grasp soft",
+            "grasp hard",
+            "grasp sphere",
+            "two finger pinch",
+            "three finger pinch",
+            "close hand"
+          ]
+        }
+      },
+      "duration_s": {"min": 0.01, "max": 10.0}
+    },
+    "grasp": {
+      "description": "Continuous closure: interpolate all hand actuators between open hand (0.0) and grasp hard (1.0).",
+      "params": {
+        "closure": {"type": "number", "min": 0.0, "max": 1.0}
+      },
+      "duration_s": {"min": 0.01, "max": 10.0}
+    },
+    "wait": {
+      "description": "Step the physics without changing current targets.",
+      "params": {},
+      "duration_s": {"min": 0.01, "max": 10.0}
+    }
+  },
+  "setup_fields": {
+    "object_pos": "[x, y, z] initial object position; z should be the object's half height",
+    "object": "optional {shape: box|sphere|cylinder, size: [..], mass?, friction?} variation",
+    "perturb": "optional {time_s, velocity: [vx, vy, vz]} mid-episode velocity kick to the object",
+    "embodiment": "optional 'gripper' to run on the parallel-jaw gripper scene instead of the Shadow Hand"
+  }
+}

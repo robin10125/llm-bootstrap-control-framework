@@ -12,14 +12,11 @@ import jax.numpy as jp
 import numpy as np
 import optax
 
-BOOTSTRAPPING = Path(__file__).resolve().parents[3] / "bootstrapping"
-if str(BOOTSTRAPPING) not in sys.path:
-    sys.path.insert(0, str(BOOTSTRAPPING))
 
-import ppo
+from experiment_runtime import ppo
 
 from policy_bias_lab.bias import CompiledBias, REWARD_TEMPLATE_COUNT, default_reward_template_weights
-from policy_bias_lab.es import BIAS_ARMS
+from policy_bias_lab.arms import BIAS_ARMS
 from policy_bias_lab.tasks import task_failure_signal
 
 
@@ -565,7 +562,7 @@ def make_collect(
             reward_contrib = jp.zeros((base_reward.shape[0], REWARD_TEMPLATE_COUNT), dtype=jp.float32)
             if use_reward_bias:
                 if shaping_fn is not None:
-                    # Experimental reward mode (reward_modes.py): replaces the template shaping;
+                    # Experimental reward mode (policy_bias_lab/legacy/reward_modes.py): replaces the template shaping;
                     # sees obs so terms can be gated by the prior program's own stage weights.
                     shaped, reward_contrib = jax.vmap(shaping_fn)(
                         prev_eval, nstate.metrics["eval"], state.obs)

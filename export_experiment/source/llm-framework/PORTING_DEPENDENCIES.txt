@@ -1,0 +1,270 @@
+llm-framework portability / dependency inventory
+================================================
+
+EXECUTIVE SUMMARY
+-----------------
+
+You can install the Python dependencies as a normal user inside a virtual
+environment. You do not need administrator privileges for the repository,
+Python packages, or a user-local FFmpeg binary.
+
+You need an administrator (or a machine that already provides these) for:
+
+- A compatible NVIDIA kernel driver if you want GPU/JAX-CUDA runs.
+- System EGL/OpenGL/Mesa support if headless MuJoCo rendering does not already
+  work on the machine.
+- A compiler/build toolchain only if pip cannot find wheels for the chosen
+  Python/platform; this is usually avoidable on a standard Linux machine.
+- Network/firewall permissions if the machine blocks package downloads or live
+  LLM API access.
+
+You must also obtain/copy two sibling source/data trees, which are not pip
+packages: `bootstrapping/` and `hand-manipulation/`. The framework imports the
+first and loads MuJoCo XML/assets from the second.
+
+Fastest CPU-only start (no admin required):
+
+    python3.11 -m venv .venv
+    . .venv/bin/activate
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install numpy pytest jax mujoco mujoco-mjx flax optax pyyaml anthropic
+
+Then follow “Getting started” below. GPU installation is different: use the
+CUDA JAX extra matching the installed driver, and confirm the driver before
+installing it.
+
+Scope
+-----
+This inventory covers the Python modules, tests, active experiments, legacy
+experiments, and experimental scripts currently present in this repository.
+It is intentionally conservative: install the core set first, then add the
+optional sets for the workflows you actually run. Exact versions should be
+captured from a working machine with `python -m pip freeze` because this
+repository currently declares no pinned versions.
+
+Python
+------
+- Python 3.11 or newer (the pyproject requires >=3.11).
+- A virtual environment created with `python -m venv .venv`.
+- pip and setuptools inside that environment.
+
+Installable Python packages
+---------------------------
+
+Core runtime (declared by this repository):
+
+    python -m pip install numpy
+
+Tests:
+
+    python -m pip install pytest
+
+Confirmed external simulation/PPO dependencies (from
+`../bootstrapping/README.md`):
+
+    python -m pip install "jax[cuda12]" mujoco mujoco-mjx flax optax
+
+Use the JAX extra matching the destination machine's supported CUDA version;
+for CPU-only execution use `python -m pip install jax mujoco` instead. Do not
+blindly install both CUDA and CPU JAX variants in one environment.
+
+For CPU-only installation, also install the MJX compatibility package if the
+bootstrapping checkout requires it:
+
+    python -m pip install mujoco-mjx
+
+The in-tree replay and PPO code requires JAX and MuJoCo; the bootstrapping PPO
+implementation specifically imports Flax and Optax.
+
+The external bootstrapping project is the source of the PPO trainer and may
+have additional imports not visible from this repository. Install the
+dependencies specified by that project's own pyproject/requirements files,
+or, if it provides one, install its package into the same venv. At minimum,
+the code here expects the following importable modules from bootstrapping:
+
+    mjx_env
+    ppo
+    eval_metrics
+    llm_backend
+
+The bootstrapping checkout currently imports no `distrax`, `chex`, or
+`orbax-checkpoint` in its main path. Install them only if a future/legacy file
+you explicitly run requires them.
+
+Shadow-hand harness dependencies (confirmed by
+`../hand-manipulation/harness/requirements.txt`):
+
+    python -m pip install "mujoco>=3.0" "numpy>=1.26" "pyyaml>=6.0" "anthropic>=0.40.0"
+
+`pyyaml` is needed by the hand harness task loader. `anthropic` is needed for
+its Anthropic backend; mock mode does not need a live API, although installing
+the package keeps all harness entry points importable.
+
+Optional Python packages by workflow
+------------------------------------
+- `pytest`: repository tests (already included in the quick-start command).
+- `anthropic`: live Anthropic calls; fixture/mock backends can omit it.
+- `matplotlib`, `pandas`, `imageio`, or `imageio-ffmpeg`: not required by the
+  confirmed main paths; install only if a particular future/legacy analysis
+  script imports them. The in-tree video writers invoke the `ffmpeg`
+  executable directly.
+
+Before installing optional packages, check the destination checkout with:
+
+    rg -n "^(from|import) " ../bootstrapping --glob '*.py'
+
+and install only the third-party imports found there. Standard-library names
+such as argparse, dataclasses, json, pathlib, pickle, subprocess, sys, and
+typing do not need installation.
+
+Non-Python dependencies and assets
+----------------------------------
+
+1. External source checkout: `../bootstrapping/`
+
+   This repository directly imports its environment/trainer/LLM backend from
+   that sibling checkout. Copy or clone it on the destination machine, or
+   change the path handling/import setup. A venv alone is not sufficient.
+
+2. Shadow Hand asset checkout: `../hand-manipulation/`
+
+   The simulation expects the MuJoCo XML and related model assets, including
+   `env/models/shadow_hand/scene_cube.xml`. Copy the asset checkout with the
+   same relative layout or update the configured asset path. These are data
+   files, not pip packages.
+
+3. FFmpeg executable
+
+   `render_replay.py` and checkpoint video rendering call a program named
+   `ffmpeg` through PATH. If it is not already installed system-wide, use a
+   user-local/static FFmpeg binary and add its `bin` directory to PATH; no
+   administrator privileges are required for that approach. The Python
+   package `imageio-ffmpeg` is not automatically used by these scripts.
+
+4. GPU driver / CUDA runtime (GPU runs only)
+
+   A usable NVIDIA driver is required for CUDA execution. The driver is a
+   machine-level component and normally cannot be installed in a venv. CUDA
+   user-space libraries may be supplied by the JAX CUDA wheel, but the kernel
+   driver must already be installed and compatible. Without admin rights,
+   ask the machine owner for a working driver or run CPU-only.
+
+5. OpenGL/EGL and display libraries (rendering)
+
+   Rendering sets `MUJOCO_GL=egl` in some scripts and needs a functioning EGL
+   software/GPU stack. These libraries/drivers are machine-level. Headless
+   rendering may work with an existing Mesa/EGL installation; otherwise a
+   user-local Mesa stack or administrator help is needed. GUI display is not
+   required when using EGL.
+
+6. System build tools
+
+   A C/C++ compiler and basic build tooling may be needed if pip cannot use a
+   prebuilt wheel for a dependency. A user-local toolchain can work, but an
+   admin-installed compiler is the normal setup. Prefer wheels to avoid this.
+
+7. LLM backend credentials/tools (LLM-backed runs only)
+
+   The `codex`/other live backends are supplied by the external bootstrapping
+   `llm_backend` integration. They may require network access, credentials,
+   and/or a separately installed CLI. Fixture/mock backends do not require a
+   live LLM service. These requirements are configuration/service dependencies,
+   not Python packages in this repository.
+
+Suggested no-admin setup
+------------------------
+
+    python3.11 -m venv .venv
+    . .venv/bin/activate
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install numpy pytest jax mujoco mujoco-mjx flax optax pyyaml anthropic
+    export PYTHONPATH=/path/to/bootstrapping:/path/to/llm-framework/famework_testing:$PYTHONPATH
+    export PATH=/path/to/user-local/ffmpeg/bin:$PATH
+
+For an NVIDIA machine, replace `jax` with the CUDA-specific JAX wheel/extra
+appropriate to the installed driver. For a CPU-only test machine, keep plain
+`jax` and reduce environment counts/experiment sizes substantially.
+
+Validation checklist
+--------------------
+
+    python -c "import numpy, jax, mujoco; print('core imports OK')"
+    python -c "import mjx_env, ppo, eval_metrics, llm_backend; print('bootstrapping imports OK')"
+    ffmpeg -version
+    python -m pytest
+
+If the second import command fails, the missing item belongs to the
+bootstrapping checkout or its dependency set, not to this repository's
+pyproject metadata.
+
+Getting started on the destination machine
+-------------------------------------------
+
+1. Copy/clone this repository, `bootstrapping/`, and `hand-manipulation/` so
+   the layout is:
+
+       parent/
+         llm-framework/
+         bootstrapping/
+         hand-manipulation/
+
+   The current code uses those sibling paths. If you choose another layout,
+   update the path logic or use equivalent symlinks.
+
+2. Check the machine before choosing GPU mode:
+
+       nvidia-smi
+
+   If that command is unavailable or fails, start with CPU JAX. If it works,
+   check the reported driver against the JAX CUDA wheel you plan to use.
+
+3. Create and activate a venv in this repository:
+
+       python3.11 -m venv .venv
+       . .venv/bin/activate
+       python -m pip install --upgrade pip setuptools wheel
+
+4. Install the packages from the quick-start command above. For a CUDA run,
+   replace plain `jax` with the compatible CUDA extra, for example:
+
+       python -m pip install "jax[cuda12]"
+
+   Do not install the CPU and CUDA variants as competing manual installs.
+
+5. Make both the framework package directory and bootstrapping importable:
+
+       export PYTHONPATH="$PWD/famework_testing:$PWD/../bootstrapping:${PYTHONPATH:-}"
+
+   This is necessary because the framework source is under the historical
+   `famework_testing/` directory and the external modules are plain files in
+   `bootstrapping/`.
+
+6. If rendering videos, verify `ffmpeg` is on PATH. Without admin access,
+   unpack a static/user-local build under your home directory and run:
+
+       export PATH="$HOME/opt/ffmpeg/bin:$PATH"
+
+7. Run the import checks and tests. Then use the smallest fixture/mock smoke
+   experiment before starting PPO:
+
+       python -c "import numpy, jax, mujoco, flax, optax; print('Python stack OK')"
+       python -c "import mjx_env, ppo, eval_metrics, llm_backend; print('bootstrapping OK')"
+       python -m pytest
+
+   The exact smoke commands are in `README.md` and
+   `policy_bias_lab/README.md`. Start with their low-env/low-iteration examples
+   on CPU.
+
+8. For live LLM runs, configure the backend expected by `bootstrapping/llm_backend.py`
+   and provide its credentials/CLI. Fixture/mock runs avoid that external
+   service requirement.
+
+Admin request to send to IT
+----------------------------
+
+“Please provide a user account with Python 3.11+, outbound access to the
+Python package index (or a wheel mirror), and either (a) a compatible NVIDIA
+driver/CUDA-capable runtime for JAX GPU workloads or (b) a supported CPU-only
+environment. For headless MuJoCo rendering, please ensure EGL/Mesa/OpenGL
+libraries are available. I will install packages in my own venv and can use a
+user-local FFmpeg binary; I do not need system-wide pip installs.”

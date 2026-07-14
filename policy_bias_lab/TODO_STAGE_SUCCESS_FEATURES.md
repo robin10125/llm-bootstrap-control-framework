@@ -37,7 +37,7 @@ DISCREPANCY line in `_stage_focus`. Features 5 and 7 remain planned.
   squeeze post-condition) and terminal `entered_without_success` (runs without `lift-0.05` holding
   -- honest: trained_success=0.0). Entry->exit ROLLBACK never triggered live (unlocks kept
   resetting focus before 2 consecutive rejections accrued) -- covered by unit tests; watch for it
-  in longer runs. Companion to AGENTIC_PRIOR_SELECTION.md ("Stage
+  in longer runs. Companion to docs/agentic_prior_selection.md ("Stage
 localization" and follow-on sections), which documents what is already built: stage occupancy +
 stall localization, stall-direction evidence (signal/gate trends, self-lock), training-convergence
 verdicts, frontier-aware refinement, and `--per-stage-iters`.
@@ -65,7 +65,7 @@ Key code to build on:
   machinery), `compile_expr` (restricted AST), `freeform_signal_fn`.
 - `agentic_orchestrator.py` — `_Chain` (frontier/failed/patience), `_stage_focus()` directive
   rendering, `revise()`, frontier-unlock acceptance, `per_stage_iters` budget resize.
-- `ppo_arbiter.py` — `evaluate_candidate_ppo` diagnostics attachment, `training_convergence`.
+- `policy_bias_lab/training/arbiter.py` — `evaluate_candidate_ppo` diagnostics attachment, `training_convergence`.
 - `prior_eval.py::validate_program` — passes `stages` through untouched (extra per-stage keys like
   `success` survive validation; `make_freeform_staged_prior_fn` reads only `gate`/`channels`).
 - `prompts/` — `revise_candidate.md`, `framework_freeform_staged.md`, `seed_candidates.md`.
@@ -281,7 +281,7 @@ than requiring it be authored up front.
 
 Files touched: `freeform_priors.py`, `agentic_orchestrator.py`, `prompts/revise_candidate.md`,
 `prompts/framework_freeform_staged.md`, `prompts/seed_candidates.md`, new
-`prompts/decompose_stage.md` (feature 7). `ppo_arbiter.py` unchanged (everything flows through
+`prompts/decompose_stage.md` (feature 7). `policy_bias_lab/training/arbiter.py` unchanged (everything flows through
 diagnostics).
 
 ## Verification per increment
@@ -298,3 +298,149 @@ diagnostics).
   targets follow the focus.
 - **Full loop (hours):** `--per-stage-iters 4 --ppo-train-seconds 420+`; success = frontier advances
   past stage 2, or a clean converged plateau with localized evidence at every step.
+
+##Future Feature - Vision feedback
+(expand on this)
+
+##Future Feature - Prevent action prior from fighting neural policy
+
+Maybe focus on softer biases that work within neural policy system.  Use neural policy interface as the same interface as the prior/align prior interface with neural policy interface.
+
+Potential avenues of expoloration:
+  1. Prior As Exploration Proposal
+  Use the prior to bias sampling, not final policy semantics.
+
+  The neural policy still defines the learned action distribution, but rollout collection sometimes samples candidate
+  actions near the prior suggestion. The stored PPO action/log-prob must correspond to the actual neural distribution or be
+  handled as off-policy data.
+
+  Useful variants:
+
+  - mixture sampling: sometimes sample from policy, sometimes from prior-neighborhood proposals,
+  - prior-centered exploration noise early in training,
+  - anneal prior proposal probability to zero,
+  - use prior only in low-confidence states.
+
+  This helps discover useful regions without permanently constraining the final policy.
+
+  2. Prior As Curriculum / State-Visitation Shaper
+  Use the prior to bring the agent into informative states, then train the neural policy there.
+
+  Examples:
+
+  - rollout reset/state collection via prior-driven episodes,
+  - prior-assisted warmup episodes whose visited states seed PPO batches,
+  - fragment training where the prior helps reach later-stage states, but the policy learns from those states independently,
+  - staged curriculum based on authored stage.success expressions.
+
+  This avoids “copy this action” and instead says “make sure training sees the relevant parts of the task.”
+
+  3. Prior As Value Shaping
+  Convert prior structure into value/reward information, not action commands.
+
+  Examples:
+
+  - reward progress on authored stage success expressions,
+  - reward reduction in authored constraint violations,
+  - reward reaching states where future task success is more likely,
+  - add a critic auxiliary target estimating prior-defined progress.
+
+  This is probably the cleanest fit for your stated goal: the policy can choose any action, including holding still, but it
+  receives denser information about which states are promising.
+
+  4. Prior As Advantage Baseline Or Critic Feature
+  Feed prior diagnostics into the critic, not the actor action path.
+
+  Examples:
+
+  - active stage id/weights,
+  - prior suggested action norm,
+  - prior-policy disagreement magnitude,
+  - stage success margin,
+  - authored constraint margins.
+
+  The critic can learn that some states are valuable because the prior sees structure there, while the actor remains
+  expressive.
+
+  Important constraint: if these become observation features for the neural policy, they change the policy interface. That
+  can be good, but it should be explicit.
+
+  5. Prior As Auxiliary Prediction Task
+  Train the network to understand the prior without forcing it to obey.
+
+  Auxiliary losses:
+
+  - predict active stage,
+  - predict prior-suggested action,
+  - predict next-stage success margin,
+  - predict whether a prior channel would be saturated/blocked,
+  - predict authored probe outcomes.
+
+  This shapes representation learning. The actor head can still ignore the prior when task reward says otherwise.
+
+  6. Prior As Regularizer, Not Target
+  Instead of supervised imitation, use a weak, conditional regularizer.
+
+  Examples:
+
+  - penalize disagreement only when the prior has high confidence,
+  - penalize disagreement only early in training,
+  - penalize disagreement only for selected actuator groups,
+  - penalize large disagreement in value-equivalent states, not all states,
+  - use KL-to-prior as an annealed exploration prior, not a permanent constraint.
+
+  This is safer than hard action bias, but still risks teaching cancellation if too strong.
+
+  7. Prior As Action-Ranking Hint
+  Rather than adding a vector to the action, use the prior to rank sampled candidates.
+
+  Flow:
+
+  1. Neural policy proposes several candidate actions.
+  2. Prior scores them structurally.
+  3. Environment executes the selected neural-proposed action.
+  4. PPO trains on the chosen action with correct sampling accounting.
+
+  This keeps executed actions inside the policy’s support and lets the prior guide selection rather than override.
+
+  8. Prior As Safety / Constraint Critic
+  Use authored constraints as penalties or diagnostics, not hard action projection.
+
+  Examples:
+
+  - contact-force budget violations,
+  - commanded-vs-measured gap budgets,
+  - speed/oscillation budgets,
+  - stage-local constraint margins.
+
+  The policy learns that some action/state transitions are costly. It can still violate them if the real task objective
+  justifies it, unless you intentionally make them hard constraints.
+
+  9. Prior As Teacher For “What To Attend To”
+  Use prior signals, probes, and stages to decide what diagnostics to collect and what failures to explain.
+
+  Examples:
+
+  - stage occupancy,
+  - prior-policy disagreement by actuator group,
+  - success-expression trend,
+  - constraint violation trend,
+  - which authored channels would have fired in failed states.
+
+  This guides revision and analysis without touching action selection.
+
+  10. Prior As Search Space For Learned Options
+  Instead of executing prior channels directly, use them to define latent option labels or skill regions.
+
+  Examples:
+
+  - stage-conditioned policy heads,
+  - option-conditioned value functions,
+  - learned latent conditioned on prior stage,
+  - policy learns continuous skills corresponding to prior-authored phases.
+
+  This is more invasive, but can make long-horizon learning easier without requiring the prior vector to be canceled joint-
+  by-joint.
+
+  My recommendation: make the default advisor_only stack use three mechanisms first: stage-success reward shaping, critic/
+  diagnostic features, and prior-guided state visitation. Keep action bias and residual-scaled prior only as ablations.

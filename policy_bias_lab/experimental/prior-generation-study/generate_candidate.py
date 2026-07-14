@@ -8,7 +8,9 @@ identical across arms. Only the experiment's manipulated prompt content varies:
   --use-info     replace the seed prompt's (now-inaccurate) "weak per-step mean-shift" usage
                  description with an ACCURATE account of how the consuming framework uses the
                  program (kl_prior: KL reference guidance; clocked: clocked segments with a
-                 learned switch). Mechanism only -- no task content.
+                 learned switch; critic_features: critic-only observation features). Mechanism
+                 only -- no task content. DEFAULT for ALL frameworks: the prompt always tells
+                 the LLM how its prior is used. --no-use-info opts out (legacy ablation only).
   --complexity   append a design-emphasis block: 'simple' (fewest viable stages) or 'complex'
                  (fine-grained many-stage decomposition).
 
@@ -25,9 +27,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 CLOCKED_DIR = ROOT / "policy_bias_lab" / "experimental" / "policy-clocked-paths"
-for p in (str(ROOT), str(BOOTSTRAPPING), str(CLOCKED_DIR)):
+for p in (str(ROOT), str(CLOCKED_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
@@ -44,7 +45,7 @@ from policy_bias_lab.agentic_orchestrator import (
 from policy_bias_lab.freeform_priors import compile_expr, raw_obs_entries, robot_spec
 from policy_bias_lab.llm_util import call_llm
 from policy_bias_lab.prior_eval import validate_program
-from policy_bias_lab.run_dsl_vs_freeform import _tmpl
+from policy_bias_lab.prompt_utils import prompt_template as _tmpl
 
 # The static usage paragraph at the top of seed_candidates.md (the OLD additive-mean-shift
 # account). --use-info replaces exactly this text; if the template changes, fail loudly.
@@ -85,6 +86,26 @@ USE_INFO = {
         "your success tests still drive diagnostics. Channels, gates, and success tests are pure "
         "expressions over the current observation and your authored signals; stage progress is "
         "monotone."),
+    "critic_features": (
+        "Design action priors as MEASUREMENT INSTRUMENTS for a reinforcement-learning value "
+        "function: your program will NOT drive the robot and adds NO reward. A separate neural "
+        "policy is trained with PPO on the task reward alone; at every step, quantities derived "
+        "from your program are fed to the CRITIC (the learned value predictor) as extra input "
+        "features: (1) which of your stages the rollout is currently in (via the framework's "
+        "monotone cursor over your gates), (2) the action your channels would have taken, (3) "
+        "how far the policy's action deviates from yours, and (4) the numeric margins of your "
+        "per-stage success tests. A critic that can see task progress learns accurate values "
+        "faster, which sharpens the policy gradient. Design implications: (1) your value is "
+        "INFORMATION, not control -- author stages whose boundaries separate genuinely "
+        "different-value situations, so 'which stage' is itself a strong progress indicator; "
+        "(2) make gate and success expressions SMOOTH GRADED MARGINS that grow as the stage's "
+        "job nears completion -- they are consumed as continuous numbers, and a graded margin "
+        "predicts value where a binary flag cannot; (3) author a success test for EVERY stage, "
+        "measuring accomplishment (not just the entry condition of the next stage); (4) "
+        "channels still matter: suggest the action a competent controller would take, because "
+        "the policy-vs-yours deviation feature is only informative if your suggestion is "
+        "sensible. Channels, gates, and success tests are pure expressions over the current "
+        "observation and your authored signals."),
 }
 
 COMPLEXITY = {
@@ -172,17 +193,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--study-dir", type=Path, required=True)
     ap.add_argument("--arm", required=True, help="output subdirectory name for this arm")
-    ap.add_argument("--framework", choices=["kl_prior", "clocked"], required=True)
-    ap.add_argument("--use-info", action="store_true",
-                    help="replace the usage paragraph with the consuming framework's real usage")
+    ap.add_argument("--framework", choices=["kl_prior", "clocked", "critic_features"],
+                    required=True)
+    ap.add_argument("--use-info", action=argparse.BooleanOptionalAction, default=None,
+                    help="replace the usage paragraph with the consuming framework's real usage "
+                         "(default: ALWAYS on; --no-use-info opts out for legacy ablations)")
     ap.add_argument("--complexity", choices=["none", "simple", "complex"], default="none")
     ap.add_argument("--task", default="grasp and lift a 5cm cube off the table")
     ap.add_argument("--llm-backend", default="codex")
     ap.add_argument("--llm-model", default=None)
     ap.add_argument("--episode-seconds", type=float, default=20.0)
     args = ap.parse_args()
+    if args.use_info is None:
+        args.use_info = True
 
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
     env = make_env("shadow", control_dt=0.025, episode_seconds=args.episode_seconds,
                    physics_dt=0.01, obj_xy_range=0.04)
     rs = robot_spec(env)
@@ -233,7 +258,10 @@ def main() -> int:
             cand = cands[0]
             break
         note = ("NOTE: your previous candidate failed validation; fix these and resend JSON "
-                "only:\n- " + "\n- ".join(errors[:6]))
+                "only:\n- " + "\n- ".join(errors[:6])
+                + "\nAuthoring tip: min/max accept ANY number of args -- write flat "
+                  "min(a,b,c,d) instead of nested min(a,min(b,...)) chains, which are "
+                  "parenthesis-error-prone.")
         print(f"[gen] attempt {attempt + 1}/3 rejected: {errors[:2]}")
 
     (arm_dir / "completion.txt").write_text(completion)

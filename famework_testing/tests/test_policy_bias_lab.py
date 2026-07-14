@@ -7,8 +7,8 @@ import jax.numpy as jp
 import numpy as np
 
 from policy_bias_lab.bias import compile_bias
-from policy_bias_lab.es import BIAS_ARMS, ESConfig, rollout_policy, train_arm
-from policy_bias_lab.policy import init_params
+from policy_bias_lab.legacy.es import BIAS_ARMS, ESConfig, rollout_policy, train_arm
+from policy_bias_lab.legacy.policy import init_params
 from policy_bias_lab.schema import default_bias_spec, validate_bias_spec
 
 

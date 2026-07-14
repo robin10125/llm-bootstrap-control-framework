@@ -1,0 +1,9 @@
+name: lift_cube
+goal: "Pick up the red cube and lift it at least 10 cm off the table, keeping it gripped."
+setup:
+  cube_pos: [0.0, 0.0]   # [x, y] on the table; z rests on the surface
+max_iterations: 5
+success:
+  # World-state predicate over the observation: cube clearly lifted AND still gripped.
+  expr: "obs['cube']['z'] > 0.12 and obs['grasped']"
+  llm_judge: null

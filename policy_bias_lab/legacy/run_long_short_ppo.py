@@ -19,7 +19,7 @@ wall-clock criteria. `resume.pkl` is also refreshed every --save-every-iters as 
 Per-iteration metrics append to metrics.jsonl across sessions.
 
 Typical use, after a selection run:
-  python -m policy_bias_lab.run_long_ppo --out runs/long1 \
+  python -m policy_bias_lab.cli.long_ppo --out runs/long1 \
       --program runs/<selection>/best_program.json \
       --min-hours 8 --plateau-hours 2 --success-stop 0.8
   # optional warm start from the selection arbiter's trained weights:
@@ -43,7 +43,6 @@ os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", str(Path(".xla_cache").resolv
 import jax  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-BOOTSTRAPPING = ROOT.parent / "bootstrapping"
 
 
 class RunController:
@@ -149,12 +148,10 @@ class RunController:
 
 def main() -> int:
     args = parse_args()
-    if str(BOOTSTRAPPING) not in sys.path:
-        sys.path.insert(0, str(BOOTSTRAPPING))
-    from mjx_env import make_env
+    from experiment_runtime.environment import make_env
 
     from policy_bias_lab.bias import compile_bias, default_reward_template_weights
-    from policy_bias_lab.es import BIAS_ARMS
+    from policy_bias_lab.arms import BIAS_ARMS
     from policy_bias_lab.legacy.short_rollout_ppo import PPOBiasConfig, evaluate_ppo_policy, train_ppo_arm
 
     args.out.mkdir(parents=True, exist_ok=True)
@@ -170,7 +167,7 @@ def main() -> int:
               f"{resume_state['wall_elapsed'] / 3600.0:.2f}h run time, "
               f"best metric {resume_state['best_score']:.6f}")
 
-    from policy_bias_lab.reward_modes import CONTRIB_NAMES, ENV_OVERRIDES, build_shaping_fn
+    from policy_bias_lab.legacy.reward_modes import CONTRIB_NAMES, ENV_OVERRIDES, build_shaping_fn
 
     program = json.loads(Path(args.program).read_text())
     (args.out / "prior_program.json").write_text(json.dumps(program, indent=2) + "\n")
@@ -257,7 +254,7 @@ def main() -> int:
         print(f"[paused] at iter {ctrl._last_info['iter'] if ctrl._last_info else iter_offset}, "
               f"{ctrl.total_elapsed(ctrl._last_info['elapsed_seconds']) / 3600.0:.2f}h run time "
               f"-> {args.out / 'resume.pkl'}")
-        print(f"         resume with: python -m policy_bias_lab.run_long_ppo --out {args.out} "
+        print(f"         resume with: python -m policy_bias_lab.cli.long_ppo --out {args.out} "
               f"--program {args.program} --resume")
         return 0
 
@@ -300,7 +297,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true", help="continue from <out>/resume.pkl")
     p.add_argument("--reward-mode", choices=["default", "lift_only", "adjusted", "stage_gated"],
                    default="default",
-                   help="experimental reward arms (reward_modes.py): lift_only = env pays only "
+                   help="experimental reward arms (policy_bias_lab/legacy/reward_modes.py): lift_only = env pays only "
                    "contact-gated lift/sustained-lift/success; adjusted = progress-based closure/"
                    "contact + empty-squeeze penalty (the air-closure exploit fixes); stage_gated = "
                    "adjusted terms gated by the prior program's own stage weights. On --resume, "
