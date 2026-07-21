@@ -141,6 +141,8 @@ class AltPPOConfig:
     critic_gate_values: bool = False     # ALL stages' clip(gate,0,1) in parallel (cursor-free)
     critic_critical_actions: bool = False  # always-on channel actions of critical stages
     critical_stage_keywords: tuple[str, ...] = ("grasp", "lift")  # substring match on stage name
+    critic_noise: bool = False           # CONTROL: N(0,1) noise of the same width instead of the
+                                         # program-derived features (programs set width only)
 
 
 class Actor(nn.Module):
@@ -317,6 +319,7 @@ def make_alt_collect(
         raise ValueError("extra programs are only supported for method=critic_features")
     specs = [_compile_program_features(env, cfg, p) for p in [program] + extras]
     extra_step_fns = [make_freeform_staged_step_fn(env, p)[0] for p in extras]
+    feat_dim = _critic_feature_dim(cfg, action_dim, specs)
 
     if cfg.method == "value_shaping":
         stage_reward_fn, _n = make_stage_reward_fn(env, program, cfg)
@@ -348,7 +351,12 @@ def make_alt_collect(
             nexts.append(c.astype(jp.int32))
         return priors, jp.stack(nexts, axis=1)
 
-    def critic_feats(obs, cursors, priors, mean_action):
+    def critic_feats(obs, cursors, priors, mean_action, noise_key=None):
+        if cfg.method == "critic_features" and cfg.critic_noise:
+            # Control arm: same feature WIDTH, zero information. Fixed key at the fragment-tail
+            # bootstrap call is fine -- any sample is equivalent in distribution.
+            k = noise_key if noise_key is not None else jax.random.PRNGKey(0)
+            return jax.random.normal(k, (obs.shape[0], feat_dim), dtype=jp.float32)
         parts = [jp.zeros((obs.shape[0], 1), dtype=jp.float32)]  # keep feature width >= 1
         if cfg.method == "critic_features":
             scale = 1.0 / jp.sqrt(float(action_dim))
@@ -383,7 +391,8 @@ def make_alt_collect(
         policy_action = jp.tanh(pre_action)
         priors, next_cursor = all_priors(obs, cursor, action_prior_weights)
         prior = priors[0]
-        feats = critic_feats(obs, cursor, priors, jp.tanh(mean))
+        feats = critic_feats(obs, cursor, priors, jp.tanh(mean),
+                             noise_key=nk if cfg.critic_noise else None)
         value, aux = critic.apply(params["critic"], obs, feats)
 
         mask = jp.ones((obs.shape[0],), dtype=jp.float32)
@@ -465,9 +474,14 @@ def make_alt_update(*, actor: Actor, critic: Critic, optimizer: Any, cfg: AltPPO
     def _atanh(x):
         return 0.5 * (jp.log1p(x) - jp.log1p(-x))
 
+    def _masked_var(x, mask, denom):
+        m = (x * mask).sum() / denom
+        return ((x - m) ** 2 * mask).sum() / denom
+
     def loss_fn(params, batch, kl_coef):
         obs, feats, action, old_logp, adv, ret, mask, phi, prior = batch
         denom = jp.maximum(mask.sum(), 1.0)
+        adv_raw = adv
         m_mean = (adv * mask).sum() / denom
         m_std = jp.sqrt(((adv - m_mean) ** 2 * mask).sum() / denom)
         adv = (adv - m_mean) / (m_std + 1e-8)
@@ -481,6 +495,12 @@ def make_alt_update(*, actor: Actor, critic: Critic, optimizer: Any, cfg: AltPPO
         value, aux = critic.apply(params["critic"], obs, feats)
         v_loss = 0.5 * (((value - ret) ** 2) * mask).sum() / denom
         aux_loss = (((aux - phi) ** 2) * mask).sum() / denom
+        # Explained variance of the value function against the GAE-bootstrap returns:
+        # ret = adv_raw + value_old exactly (ppo.compute_gae), so ret-value_old == adv_raw --
+        # ev_pre needs no extra plumbing. ev_post reuses this update's fresh critic forward pass.
+        ret_var = _masked_var(ret, mask, denom)
+        ev_pre = 1.0 - _masked_var(adv_raw, mask, denom) / (ret_var + 1e-8)
+        ev_post = 1.0 - _masked_var(ret - value, mask, denom) / (ret_var + 1e-8)
         entropy = ent.mean()
         # KL(pi || pi_ref) in pre-tanh space (exact for the squashed pair, tanh is a bijection):
         # the reference is a Gaussian centered on the instruction with fixed width sigma_ref.
@@ -498,6 +518,8 @@ def make_alt_update(*, actor: Actor, critic: Critic, optimizer: Any, cfg: AltPPO
             "entropy": entropy,
             "approx_kl": ((old_logp - logp) * mask).sum() / denom,
             "prior_kl": prior_kl,
+            "ev_pre": ev_pre,
+            "ev_post": ev_post,
         }
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
@@ -807,6 +829,8 @@ def _training_row(*, it, env_steps, fragment_index, task, traj, eval_summary, me
         "aux_loss": round(float(metrics["aux_loss"]), 6),
         "entropy": round(float(metrics["entropy"]), 6),
         "approx_kl": round(float(metrics["approx_kl"]), 6),
+        "ev_pre": round(float(metrics["ev_pre"]), 6),
+        "ev_post": round(float(metrics["ev_post"]), 6),
         "elapsed_seconds": round(float(elapsed), 3),
     }
     row["prior_kl"] = round(float(metrics["prior_kl"]), 6)

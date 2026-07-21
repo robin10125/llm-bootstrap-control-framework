@@ -1,0 +1,42 @@
+# Pre Run Failure Action Prior Codex
+
+- **Run directory:** [`runs/pre_run_failure_action_prior_codex_20260621-202352`](../runs/pre_run_failure_action_prior_codex_20260621-202352)
+- **Date:** 2026-06-21 20:23:52 (directory timestamp)
+- **Status:** artifact-only or generation-only; no terminal evaluation recorded
+- **Experiment class:** PPO bias/reward/prior experiment
+- **Recorded task:** not explicitly recorded at the run root
+- **Training metric rows recovered:** 0
+
+## Abstract
+
+This entry reconstructs `pre_run_failure_action_prior_codex_20260621-202352`, a PPO bias/reward/prior experiment. The account is based only on artifacts that survive in the repository: machine-readable configuration, candidate programs, selection diagnostics, training metrics, evaluations, reports, and logs. The run targeted not explicitly recorded at the run root. Its purpose and comparisons are inferred from the recorded arm names and configuration where no authored abstract survives; those inferences are identified by this provenance-first framing rather than presented as new experimental facts.
+
+## Experimental structure
+
+No machine-readable configuration file survives at the run root. Structure below is reconstructed from reports, result files, subdirectory names, and logs.
+### Arms and sub-runs represented by directories
+
+`llm_action_prior_with_failure_analysis`, `pre_run_reward_analysis`
+
+## Results
+
+No decodable run-level result JSON or non-empty training metric stream survives.
+
+## What the results mean and major discoveries
+
+- The surviving artifacts document the attempted structure but do not contain enough terminal quantitative evidence for a strong result claim. Treat this entry as provenance and negative/unfinished evidence.
+
+## Limitations and reading guidance
+
+- Metrics are reported under the names used by the historical environment and runner. Similar-looking metrics from different generations of the code are not assumed to be numerically interchangeable.
+- A maximum observed in training is not treated as held-out performance. Terminal evaluation values are preferred whenever present.
+- Missing summaries, empty metric streams, failed retries, and incomplete arms are preserved as negative evidence rather than silently dropped.
+- Candidate names and stage names are LLM-authored run artifacts. Interpretations in this historical log do not alter framework prompts, defaults, diagnostics, or task logic.
+
+## Artifact provenance
+
+| Artifact type | Count |
+|---|---|
+| .json | 6 |
+| .md | 2 |
+| .txt | 2 |

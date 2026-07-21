@@ -102,6 +102,7 @@ def main() -> int:
         critic_prior_norms=not args.no_critic_prior_norms,
         critic_success_margins=not args.no_critic_success_margins,
         critic_gate_values=args.critic_gate_values,
+        critic_noise=args.critic_noise,
         critic_critical_actions=args.critic_critical_actions,
         critical_stage_keywords=tuple(
             k.strip().lower() for k in args.critical_stages.split(",") if k.strip()),
@@ -251,6 +252,9 @@ def parse_args() -> argparse.Namespace:
                          "--critical-stages) at EVERY step, regardless of the cursor.")
     g4.add_argument("--critical-stages", default="grasp,lift",
                     help="Comma-separated keywords; a stage whose name contains one is critical.")
+    g4.add_argument("--critic-noise", action="store_true",
+                    help="CONTROL: feed N(0,1) noise of the same width as the program-derived "
+                         "features (the given programs determine the width only).")
 
     g5 = p.add_argument_group("method=kl_prior")
     g5.add_argument("--kl-coef", type=float, default=1.0,

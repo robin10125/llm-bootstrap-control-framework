@@ -1,2 +1,0 @@
--r requirements-common.txt
-jax==0.10.2

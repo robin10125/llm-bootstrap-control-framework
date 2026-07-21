@@ -1,9 +1,0 @@
-{
-  "name": "lift_cube",
-  "description": "Pick up the red cube and lift it at least 10 cm off the table, keeping it gripped.",
-  "code": "# Grasp the red cube and lift it clear of the table.\nif grasped('cube') and obj_pos('cube')[2] > 0.12:\n    return 'already lifted'\ncube = obj_pos('cube')\n# 1. open the gripper and centre the palm over the cube, up high.\nset_ctrl('left_finger', 0.05); set_ctrl('right_finger', 0.05)\nset_ctrl('slide_x', cube[0]); set_ctrl('slide_y', cube[1]); set_ctrl('slide_z', 0.30)\nstep(300)\n# 2. descend so the fingers straddle the cube (not so low they jam into the table).\nset_ctrl('slide_z', 0.12)\nstep(500)\n# 3. squeeze: command fingers fully closed \u2014 the cube blocks them, creating grip force.\nset_ctrl('left_finger', 0.0); set_ctrl('right_finger', 0.0)\nstep(400)\nlog('grasped after squeeze:', grasped('cube'))\n# 4. lift straight up and verify.\nset_ctrl('slide_z', 0.30)\nstep(800)\nlog('cube z:', obj_pos('cube')[2])\nreturn 'cube_z=%.3f grasped=%s' % (obj_pos('cube')[2], grasped('cube'))",
-  "task": "lift_cube",
-  "created_at": 1780949948.2381978,
-  "uses": 4,
-  "successes": 4
-}

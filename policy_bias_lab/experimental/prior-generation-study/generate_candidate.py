@@ -199,6 +199,10 @@ def main() -> int:
                     help="replace the usage paragraph with the consuming framework's real usage "
                          "(default: ALWAYS on; --no-use-info opts out for legacy ablations)")
     ap.add_argument("--complexity", choices=["none", "simple", "complex"], default="none")
+    ap.add_argument("--n-candidates", type=int, default=1,
+                    help="ask for this many DIFFERENT valid priors in one response (each with a "
+                         "self-assessed probability field -- a diversity elicitation device); "
+                         "all must validate; saved as program.json, program_2.json, ...")
     ap.add_argument("--task", default="grasp and lift a 5cm cube off the table")
     ap.add_argument("--llm-backend", default="codex")
     ap.add_argument("--llm-model", default=None)
@@ -223,16 +227,25 @@ def main() -> int:
         task=args.task, framework=_framework_doc(rep), spec_block=spec_block,
         representation_doc=_representation_doc(rep, rs),
         dof_requirement=_dof_requirement("consider", rs),
-        context_block=context_block, n_seeds="1", output_item=_output_item(rep))
+        context_block=context_block, n_seeds=str(args.n_candidates),
+        output_item=_output_item(rep))
     if args.use_info:
         if BASE_USE_TEXT not in prompt:
             raise SystemExit("seed_candidates.md usage paragraph changed; update BASE_USE_TEXT")
         prompt = prompt.replace(BASE_USE_TEXT, USE_INFO[args.framework])
     if args.complexity != "none":
         prompt += COMPLEXITY[args.complexity]
+    if args.n_candidates > 1:
+        prompt += (
+            f"\nProduce exactly {args.n_candidates} candidates. They must be GENUINELY DIFFERENT "
+            "priors -- different stage decompositions, signal choices, or strategies, not "
+            "rewordings of one design. Additionally, give each candidate a top-level "
+            '"probability" field: your probability (0-1; they must sum to 1 across candidates) '
+            "that this candidate is the stronger prior for the task.\n")
     (arm_dir / "prompt.md").write_text(prompt)
 
-    program, cand, completion = None, None, ""
+    n_want = max(1, int(args.n_candidates))
+    programs, good_cands, completion = [], [], ""
     note = ""
     for attempt in range(3):
         txt = call_llm(args.llm_backend, prompt if attempt == 0 else prompt + "\n" + note,
@@ -241,41 +254,55 @@ def main() -> int:
         completion = txt or ""
         obj = parse_json_obj(txt)
         cands = (obj or {}).get("candidates", []) if obj else []
-        if not cands:
-            note = "NOTE: previous response had no parseable candidates JSON; resend JSON only."
-            print(f"[gen] attempt {attempt + 1}/3: no candidates")
+        if len(cands) < n_want:
+            note = (f"NOTE: previous response had {len(cands)} parseable candidates; "
+                    f"exactly {n_want} are required. Resend JSON only.")
+            print(f"[gen] attempt {attempt + 1}/3: {len(cands)}/{n_want} candidates")
             continue
         errors: list[str] = []
-        program = validate_program(env, cands[0], rep, errors=errors)
-        if program is not None and args.framework == "clocked":
-            from clocked_paths_ppo import convert_staged_program, validate_clocked_program
-            from clocked_paths_ppo import ClockedPPOConfig  # noqa: F401 (import check)
-            converted = convert_staged_program(program)
-            errors.extend(validate_clocked_program(env, converted))
-            if errors:
-                program = None
-        if program is not None:
-            cand = cands[0]
+        programs, good_cands = [], []
+        for ci, c in enumerate(cands[:n_want]):
+            errs_i: list[str] = []
+            prog = validate_program(env, c, rep, errors=errs_i)
+            if prog is not None and args.framework == "clocked":
+                from clocked_paths_ppo import convert_staged_program, validate_clocked_program
+                from clocked_paths_ppo import ClockedPPOConfig  # noqa: F401 (import check)
+                converted = convert_staged_program(prog)
+                errs_i.extend(validate_clocked_program(env, converted))
+                if errs_i:
+                    prog = None
+            if prog is None:
+                errors.extend(f"candidate {ci + 1}: {e}" for e in errs_i)
+            else:
+                programs.append(prog)
+                good_cands.append(c)
+        if len(programs) == n_want:
             break
-        note = ("NOTE: your previous candidate failed validation; fix these and resend JSON "
-                "only:\n- " + "\n- ".join(errors[:6])
+        note = ("NOTE: your previous candidates failed validation; fix these and resend JSON "
+                "only (all candidates, corrected):\n- " + "\n- ".join(errors[:6])
                 + "\nAuthoring tip: min/max accept ANY number of args -- write flat "
                   "min(a,b,c,d) instead of nested min(a,min(b,...)) chains, which are "
                   "parenthesis-error-prone.")
         print(f"[gen] attempt {attempt + 1}/3 rejected: {errors[:2]}")
 
     (arm_dir / "completion.txt").write_text(completion)
-    if program is None:
-        raise SystemExit(f"[gen] arm {args.arm}: no valid candidate after 3 attempts")
-    (arm_dir / "candidate.json").write_text(json.dumps(cand, indent=2) + "\n")
-    (arm_dir / "program.json").write_text(json.dumps(program, indent=2) + "\n")
+    if len(programs) < n_want:
+        raise SystemExit(f"[gen] arm {args.arm}: {len(programs)}/{n_want} valid candidates "
+                         "after 3 attempts")
+    for i, (prog, c) in enumerate(zip(programs, good_cands)):
+        suffix = "" if i == 0 else f"_{i + 1}"
+        (arm_dir / f"candidate{suffix}.json").write_text(json.dumps(c, indent=2) + "\n")
+        (arm_dir / f"program{suffix}.json").write_text(json.dumps(prog, indent=2) + "\n")
     (arm_dir / "meta.json").write_text(json.dumps({
         "arm": args.arm, "framework": args.framework, "use_info": bool(args.use_info),
         "complexity": args.complexity, "task": args.task, "backend": args.llm_backend,
-        "model": args.llm_model, "n_stages": len(program.get("stages", [])),
-        "n_signals": len(program.get("signals", {}) or {}),
+        "model": args.llm_model, "n_candidates": n_want,
+        "n_stages": [len(p.get("stages", [])) for p in programs],
+        "n_signals": [len(p.get("signals", {}) or {}) for p in programs],
+        "probability": [c.get("probability") for c in good_cands],
     }, indent=2) + "\n")
-    print(f"[gen] arm {args.arm}: OK ({len(program.get('stages', []))} stages) -> "
+    print(f"[gen] arm {args.arm}: OK "
+          f"({', '.join(str(len(p.get('stages', []))) + ' stages' for p in programs)}) -> "
           f"{arm_dir / 'program.json'}")
     return 0
 
